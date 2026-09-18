@@ -13,6 +13,7 @@ const role: RoleDef = {
   owns: ['src/server/**'],
   reads: ['docs/**'],
   model: 'sonnet',
+  maxRetries: 2,
   maxWallTimeMs: 1_800_000,
 };
 

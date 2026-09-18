@@ -8,8 +8,9 @@ function readYaml(filePath: string, label: string): unknown {
   let raw: string;
   try {
     raw = readFileSync(filePath, 'utf8');
-  } catch {
-    throw new Error(`找不到${label}文件：${filePath}`);
+  } catch (error) {
+    // 保留底层 errno 信息：EACCES / EISDIR 等不能一概报成"找不到"
+    throw new Error(`读取${label}文件失败：${filePath} —— ${(error as Error).message}`);
   }
   try {
     return parseYaml(raw);
@@ -44,6 +45,7 @@ export function loadRole(configDir: string, roleId: string): RoleDef {
     owns: file.owns,
     reads: file.reads,
     model: file.model,
+    maxRetries: file.max_retries,
     maxWallTimeMs: file.max_wall_time_ms,
   };
 }

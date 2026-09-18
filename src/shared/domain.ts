@@ -22,6 +22,8 @@ export type RoleDef = {
   reads: string[];
   model: string;
   maxPromptTokens?: number;
+  /** 单节点最大重试次数；超出后节点升级（node.escalated） */
+  maxRetries: number;
   maxWallTimeMs: number;
 };
 

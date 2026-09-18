@@ -56,6 +56,29 @@ describe('loadRole', () => {
     expect(role.outputs).toEqual(['requirement']);
   });
 
+  it('把 YAML 的 max_retries 带成 maxRetries（用非默认值区分真实值与默认值）', () => {
+    const dir = makeConfigDir();
+    // 故意用 1（schema 默认为 2）：若映射遗漏该字段，断言会因 undefined 变红，
+    // 且此值能排除"其实只是读了默认值"的假阳性。
+    writeFileSync(
+      join(dir, 'roles', 'qa.yaml'),
+      [
+        'id: qa',
+        'display_name: 测试工程师',
+        'system_prompt_ref: prompts/pm.md',
+        'inputs: []',
+        'outputs:',
+        '  - test_report',
+        'owns: []',
+        'reads: []',
+        'model: sonnet',
+        'max_retries: 1',
+        'max_wall_time_ms: 1000',
+      ].join('\n'),
+    );
+    expect(loadRole(dir, 'qa').maxRetries).toBe(1);
+  });
+
   it('角色文件不存在时抛出带路径的错误', () => {
     const dir = makeConfigDir();
     expect(() => loadRole(dir, 'nope')).toThrow(/nope\.yaml/);
