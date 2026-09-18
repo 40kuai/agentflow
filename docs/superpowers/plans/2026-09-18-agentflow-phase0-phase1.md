@@ -1070,6 +1070,59 @@ describe('EventStore', () => {
     expect(before.length).toBe(1);
     expect(after.length).toBe(2);
   });
+
+  it('空库时 lastSeq 为 0 且 readAll 为空数组', () => {
+    expect(store.lastSeq()).toBe(0);
+    expect(store.readAll()).toEqual([]);
+  });
+
+  it('readAll 跨任务返回全部事件，按 seq 升序', () => {
+    store.append({ task_id: 't2', type: 'task.created', payload: {}, actor: 'human' });
+    store.append({ task_id: 't1', type: 'task.created', payload: {}, actor: 'human' });
+    store.append({ task_id: 't2', type: 'node.started', payload: {}, actor: 'kernel' });
+    expect(store.readAll().map((e) => [e.seq, e.task_id])).toEqual([
+      [1, 't2'],
+      [2, 't1'],
+      [3, 't2'],
+    ]);
+  });
+
+  it('非法事件不留「幽灵行」，且不会毒化读接口（护栏）', () => {
+    // NewEvent 把 task_id / actor 声明为普通 string，而 KernelEventSchema 要求 .min(1)，
+    // 所以下面这行能通过编译。若 append 先落库后校验，就会留下违反 schema 的残留行，
+    // 使 readAll() 永久抛错——真相库被毒化。本用例是防止该缺陷复现的护栏。
+    expect(() =>
+      store.append({ task_id: '', type: 'task.created', payload: {}, actor: 'human' }),
+    ).toThrow();
+    expect(() =>
+      store.append({ task_id: 't1', type: 'task.created', payload: {}, actor: '' }),
+    ).toThrow();
+
+    // 库里必须一行都没有
+    expect(store.lastSeq()).toBe(0);
+    expect(store.readAll()).toEqual([]);
+    expect(store.readTask('')).toEqual([]);
+
+    // 后续合法写入仍能正常进行，seq 从 1 开始
+    const ok = store.append({ task_id: 't1', type: 'task.created', payload: {}, actor: 'human' });
+    expect(ok.seq).toBe(1);
+    expect(store.readAll()).toHaveLength(1);
+  });
+
+  it('append 的返回值与从库里读出的事件严格相等', () => {
+    // 用含 undefined 的 payload 暴露「入参回显」与「落库重读」的差异：
+    // JSON.stringify 会把 {a: undefined, b: 1} 落成 {"b":1}，
+    // 而 toStrictEqual 把「含 undefined 键」与「缺该键」视为不等。
+    const appended = store.append({
+      task_id: 't1',
+      type: 'artifact.created',
+      payload: { a: undefined, b: 1 },
+      actor: 'kernel',
+    });
+    expect(appended.payload).toStrictEqual({ b: 1 });
+    const [read] = store.readTask('t1');
+    expect(appended).toStrictEqual(read);
+  });
 });
 ```
 
@@ -1149,20 +1202,29 @@ export function createEventStore(dbPath: string): EventStore {
 
   return {
     append(event: NewEvent): KernelEvent {
-      const row = {
+      const candidate = {
         event_id: newId('evt'),
         task_id: event.task_id,
         type: event.type,
-        payload: JSON.stringify(event.payload),
+        payload: event.payload,
         actor: event.actor,
         created_at: Date.now(),
       };
-      const info = insertStmt.run(row);
-      return KernelEventSchema.parse({
-        seq: Number(info.lastInsertRowid),
-        ...row,
-        payload: event.payload,
-      });
+
+      // 关键：先校验再落库。
+      // 若反过来先 INSERT 再 parse，非法输入（例如 task_id 为空串——NewEvent 把它声明为普通
+      // string，而 schema 要求 .min(1)，所以这行能通过编译）会留下"幽灵行"：
+      // 调用方以为写入失败、库里已有一行，且该行违反 schema，导致之后 readAll() 解析它时
+      // 永久抛错——真相库被毒化成不可读。先用占位 seq 走一遍 schema 即可杜绝。
+      KernelEventSchema.parse({ seq: 0, ...candidate });
+
+      const payload = JSON.stringify(candidate.payload);
+      const info = insertStmt.run({ ...candidate, payload });
+
+      // 返回值走 rowToEvent（与 readTask 同一条解析路径），
+      // 保证「append 返回的事件」与「之后从库里读出的事件」严格相等。
+      // 若直接把入参 payload 回显出去，{a: undefined} 这类值会与落库后的 {} 不一致。
+      return rowToEvent({ seq: Number(info.lastInsertRowid), ...candidate, payload });
     },
 
     readTask(taskId: string): KernelEvent[] {
@@ -1187,7 +1249,7 @@ export function createEventStore(dbPath: string): EventStore {
 - [ ] **Step 4: 运行测试，确认通过**
 
 Run: `npx vitest run src/kernel/event-store.test.ts`
-Expected: 5 个测试 PASS
+Expected: 9 个测试 PASS
 
 - [ ] **Step 5: 提交**
 
