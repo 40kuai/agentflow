@@ -66,20 +66,21 @@ export function createEventStore(dbPath: string): EventStore {
 
   return {
     append(event: NewEvent): KernelEvent {
-      const row = {
+      const candidate = {
         event_id: newId('evt'),
         task_id: event.task_id,
         type: event.type,
-        payload: JSON.stringify(event.payload),
+        payload: event.payload,
         actor: event.actor,
         created_at: Date.now(),
       };
-      const info = insertStmt.run(row);
-      return KernelEventSchema.parse({
-        seq: Number(info.lastInsertRowid),
-        ...row,
-        payload: event.payload,
-      });
+      // 先校验再落库：校验失败则抛错且不写库，避免留下会毒化读接口的残留行（seq 用占位 0）
+      KernelEventSchema.parse({ seq: 0, ...candidate });
+
+      // payload 以落库后的重读值为准，保证返回值与 readTask/readAll 读出的同一事件严格一致
+      const payload = JSON.stringify(candidate.payload);
+      const info = insertStmt.run({ ...candidate, payload });
+      return rowToEvent({ seq: Number(info.lastInsertRowid), ...candidate, payload });
     },
 
     readTask(taskId: string): KernelEvent[] {

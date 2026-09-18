@@ -62,4 +62,54 @@ describe('EventStore', () => {
     expect(before.length).toBe(1);
     expect(after.length).toBe(2);
   });
+
+  it('空库时 lastSeq() 返回 0', () => {
+    expect(store.lastSeq()).toBe(0);
+    expect(store.readAll()).toEqual([]);
+  });
+
+  it('readAll() 跨任务返回全部事件，且按 seq 升序', () => {
+    store.append({ task_id: 't2', type: 'task.created', payload: {}, actor: 'human' });
+    store.append({ task_id: 't1', type: 'task.created', payload: {}, actor: 'human' });
+    store.append({ task_id: 't2', type: 'node.started', payload: {}, actor: 'kernel' });
+
+    const all = store.readAll();
+    expect(all.map((e) => [e.seq, e.task_id, e.type])).toEqual([
+      [1, 't2', 'task.created'],
+      [2, 't1', 'task.created'],
+      [3, 't2', 'node.started'],
+    ]);
+  });
+
+  it('非法 task_id（空串）时 append 抛错，且库中不留下任何行', () => {
+    expect(() =>
+      store.append({ task_id: '', type: 'task.created', payload: {}, actor: 'human' }),
+    ).toThrow();
+    expect(() =>
+      store.append({ task_id: 't1', type: 'task.created', payload: {}, actor: '' }),
+    ).toThrow();
+
+    // 库中无残留：seq 未推进、行数为 0，读接口未被毒化
+    expect(store.lastSeq()).toBe(0);
+    expect(store.readAll()).toEqual([]);
+    expect(store.readTask('')).toEqual([]);
+
+    // 后续合法写入仍可用，且 seq 从 1 开始
+    const ok = store.append({ task_id: 't1', type: 'task.created', payload: {}, actor: 'human' });
+    expect(ok.seq).toBe(1);
+    expect(store.readAll().map((e) => e.seq)).toEqual([1]);
+  });
+
+  it('append 的返回值与 readTask 读出的同一事件严格一致（含 undefined 键）', () => {
+    const appended = store.append({
+      task_id: 't1',
+      type: 'artifact.created',
+      payload: { a: undefined, b: 1 },
+      actor: 'human',
+    });
+    const [loaded] = store.readTask('t1');
+    expect(loaded).toStrictEqual(appended);
+    // 返回值的 payload 是落库后的重读值：JSON 往返会丢掉 undefined 键
+    expect(appended.payload).toStrictEqual({ b: 1 });
+  });
 });
