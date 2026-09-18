@@ -1798,6 +1798,44 @@ describe('evaluateExpression', () => {
     expect(() => evaluateExpression('process.exit(1)', facts)).toThrow(ExpressionError);
     expect(() => evaluateExpression("require('fs')", facts)).toThrow(ExpressionError);
   });
+
+  it('白名单外的函数名在解析期就被拒（而非靠注册表查空兜住）', () => {
+    // 这条用例专门钉住解析期的函数白名单。若只用 process.exit(1) 去验证，
+    // 是测不出白名单是否还存在：删掉白名单后，facts.__functions['process.exit']
+    // 为 undefined，仍会因「未注册的函数」抛错，用例照样通过。
+    // 所以这里用一个**注册表里已经存在**的名字：只有白名单能拦住它。
+    const custom: Facts = {
+      wp: { id: 'wp1' },
+      __functions: {
+        customFn: () => true,
+      },
+    };
+    expect(() => evaluateExpression('customFn(1)', custom)).toThrow(/不允许调用函数/);
+    // 反证：白名单内的名字若没注册，报的是另一种错，两者文案可区分
+    expect(() => evaluateExpression('deps(wp)', { wp: { id: 'wp1' } })).toThrow(/未注册的函数/);
+  });
+
+  it('数组元素的字段缺失时抛错，而不是静默变成 undefined', () => {
+    // 防的是一类危险情形：若把缺失字段静默映射为 undefined，
+    // 在 any(...) / count(...) == 0 / not 这些形态下会翻到「放行」一侧，
+    // 即工作流边可能在本不该走时走。
+    const f: Facts = {
+      wp: { id: 'wp1' },
+      __functions: {
+        deps: () => [{ id: 'wp0' }, { id: 'wpX', status: 'merged' }],
+      },
+    };
+    expect(() => evaluateExpression("all(deps(wp).status == 'merged')", f)).toThrow(ExpressionError);
+    expect(() => evaluateExpression("any(deps(wp).status == 'merged')", f)).toThrow(ExpressionError);
+  });
+
+  it('数组元素字段齐全时正常逐元素比较', () => {
+    const f: Facts = {
+      wp: { id: 'wp1' },
+      __functions: { deps: () => [{ id: 'wp0', status: 'merged' }] },
+    };
+    expect(evaluateExpression("all(deps(wp).status == 'merged')", f)).toBe(true);
+  });
 });
 ```
 
@@ -2028,8 +2066,21 @@ function resolvePath(root: unknown, path: string[]): unknown {
   let current: unknown = root;
   for (const seg of path) {
     if (Array.isArray(current)) {
-      current = current.map((item) => {
-        if (!isPlainObject(item)) return undefined;
+      // 数组分支必须对「非对象元素」与「缺字段」直接抛错，不能静默映射成 undefined。
+      // 否则「路径不存在必抛错」的契约在这里被绕过：deps(x).status 会得到 [undefined]，
+      // 在 all(...) 下后果与抛错相同，但在 any(...) / count(...) == 0 / not 这些形态下
+      // 会翻到「放行」一侧 —— 即工作流边可能在本不该走时走。
+      current = current.map((item, index) => {
+        if (!isPlainObject(item)) {
+          throw new ExpressionError(
+            `路径 "${path.join('.')}" 在数组第 ${index} 个元素处无法继续取值（元素不是对象）`,
+          );
+        }
+        if (!(seg in item)) {
+          throw new ExpressionError(
+            `路径 "${path.join('.')}" 在数组第 ${index} 个元素处缺少字段 "${seg}"`,
+          );
+        }
         return item[seg];
       });
       continue;
@@ -2101,6 +2152,16 @@ function evalValue(ast: Ast, facts: Facts): unknown {
       const r = evalValue(ast.r, facts);
       return compare(ast.op, l, r);
     }
+
+    default: {
+      // 穷尽性守卫。它不是为了兜底，而是为了让「新增 Ast 变体却漏处理」变成编译错误。
+      // 这一点必须显式做：tsconfig 没有 noImplicitReturns，且 evalValue 的返回类型是
+      // unknown，所以漏掉 case 只会静默返回 undefined，tsc 不会报错。
+      // 加了本守卫后，default 分支里的 ast 类型会扣除已处理的变体；若某个变体没被
+      // 任何 case 覆盖，它就必然不是 never，赋给 never 即触发 TS2322。
+      const exhaustive: never = ast;
+      throw new Error(`未处理的 Ast 变体：${JSON.stringify(exhaustive)}`);
+    }
   }
 }
 
@@ -2153,9 +2214,9 @@ export function evaluateExpression(src: string, facts: Facts): boolean {
 - [ ] **Step 4: 运行测试与类型检查，确认通过**
 
 Run: `npx vitest run src/kernel/expression.test.ts && npx tsc --noEmit`
-Expected: 12 个测试 PASS，类型检查无错误
+Expected: 15 个测试 PASS，类型检查无错误
 
-注意：`evalValue` 的 `switch` 必须在 `Ast` 的 4 个变体上穷尽（`lit` / `ref` / `not` / `bin`），否则 `tsc` 会报缺少返回。若报错，说明有变体未处理——**补实现，不要在末尾加 `default` 兜底**。
+注意：`evalValue` 的 `switch` 必须在 `Ast` 的 4 个变体上穷尽（`lit` / `ref` / `not` / `bin`），并靠 `default` 里的 `const exhaustive: never = ast` 守卫把「漏处理变体」变成**编译错误**。**验证方法**：临时删掉 `case 'bin'`，然后跑 `npx tsc --noEmit`——必须报 `TS2322 ... is not assignable to type 'never'`。若删掉后 tsc 仍 exit 0，说明守卫没生效（tsconfig 没有 `noImplicitReturns`，`evalValue` 返回 `unknown`，单靠 switch 是拦不住的）。验证完记得还原。
 
 - [ ] **Step 5: 创建 `src/kernel/facts.ts`**
 
@@ -2268,7 +2329,14 @@ describe('buildFacts', () => {
 
     const facts = buildFacts({ state, workflow, roles: new Map() });
     expect(evaluateExpression("all(artifacts.requirement.status == 'ok')", facts)).toBe(true);
-    expect(evaluateExpression("all(artifacts.code_diff.status == 'ok')", facts)).toBe(false);
+    // 未产出的产物类型：路径不存在，按「不静默返回 undefined」的契约必须抛错，
+    // 而不是返回 false。边匹配的「不匹配」语义由 Task 7 的 edgeMatches 用 try/catch 承担：
+    // 它捕获 ExpressionError 并返回 { matched: false }，效果与「边不放行」一致。
+    // 这里不能期望 false —— 因为若给未产出的类型预置 status: []，all([]) 会因空真而得到
+    // true，那反而会让边在产物尚未产出时就放行，比抛错更危险。
+    expect(() => evaluateExpression("all(artifacts.code_diff.status == 'ok')", facts)).toThrow(
+      ExpressionError,
+    );
     expect(evaluateExpression("node.visit_count == 1", facts)).toBe(true);
   });
 
