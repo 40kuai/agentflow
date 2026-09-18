@@ -3559,7 +3559,7 @@ export function parseStreamLine(line: string): RunnerEvent[] {
     }
 
     // 两条产物通道都读，structured_output 优先（2026-09-18 补跑实测：传了 --json-schema 时
-    // 结构化对象只在 structured_output，result 退化为散文；不传时 JSON 由 prompt 约束进 result）
+    // 结构化对象在 structured_output；result 形状不确定（散文 / ```json 代码块都出现过），故不能只读它）
     const structured = obj['structured_output'];
     if (structured !== null && typeof structured === 'object') {
       events.push({ kind: 'artifact', raw: structured });
@@ -3695,7 +3695,7 @@ export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentR
     },
 
     async *run(req: RunRequest): AsyncIterable<RunnerEvent> {
-      const args = [...buildArgs(req, options.useJsonSchema ?? false), ...(options.extraArgs ?? [])];
+      const args = [...buildArgs(req, options.useJsonSchema ?? true), ...(options.extraArgs ?? [])];
       const logPath = join(options.logDir, `${req.runId}.jsonl`);
       const logStream = createWriteStream(logPath, { flags: 'a' });
 

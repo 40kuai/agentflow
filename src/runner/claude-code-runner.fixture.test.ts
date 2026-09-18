@@ -47,7 +47,8 @@ describe('claude stream-json 契约回归', () => {
 
   it('带 --json-schema 的真实成功样本：artifact 与样本自身的 structured_output 逐字相等', () => {
     // 样本逐字取自 2026-09-18 凭据恢复后的真实调用（createClaudeCodeRunner + useJsonSchema 默认开启），
-    // 这是**生产路径**的形状：result 是人类可读散文，结构化对象在 structured_output。
+    // 这是**生产路径**的形状：结构化对象在 structured_output。本样本的 result 实测是 ```json 代码块
+    // （result 形状不固定，散文/代码块都出现过），故断言只依赖 structured_output。
     const raw = readFileSync(
       resolve(import.meta.dirname, '../../tests/fixtures/claude-stream-structured-sample.jsonl'),
       'utf8',
@@ -63,7 +64,7 @@ describe('claude stream-json 契约回归', () => {
       structured_output: unknown;
       result: unknown;
     };
-    // 前提守卫：样本必须真的是「散文 result + 对象 structured_output」，否则本用例失去意义
+    // 前提守卫：样本须为成功，且 result 为字符串、structured_output 为对象（**不校验 result 是否散文**）
     expect(sample.is_error).toBe(false);
     expect(typeof sample.result).toBe('string');
     expect(typeof sample.structured_output).toBe('object');

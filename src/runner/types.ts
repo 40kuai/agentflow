@@ -7,7 +7,7 @@ export type RunRequest = {
   workdir: string;
   model: string;
   outputSchema?: object;
-  /** 期望产出的 Artifact 类型，runner 用它做载荷校验 */
+  /** 期望产出的 Artifact 类型；runner 只做形状提取，载荷校验由内核侧完成（Phase 1 在 Task 12 的 hasArtifact 判据落地） */
   artifactType: ArtifactType;
   readOnly: boolean;
   budgetCapUsd?: number;

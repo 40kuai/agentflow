@@ -102,7 +102,12 @@ structured_output:b.unknown().optional(),uuid:i2,session_id:b.string()
 即结构化结果字段路径是 **`result.structured_output`**，且它是 `.optional()`：
 `--json-schema` 未给出时该字段**不存在**。失败变体（见第 3 问）里**没有**这个字段。
 
-**运行时从未观测到 `structured_output`**（额度阻断，模型没跑起来），所以字段路径属于静态验证。
+**当前结论（2026-09-18 凭据恢复后补跑）**：`result.structured_output` 已由**运行时实测**确认——
+带 `--json-schema` 的调用 rc=0、7.0s 正常退出，该字段为符合 schema 的已解析对象（详见第 3 问）。
+字段路径本身仍由二进制 schema 静态验证给出，现已被补跑实测佐证。
+
+原记录（凭据耗尽期，情境：请求全部 403）：**运行时从未观测到 `structured_output`**（额度阻断，模型没跑起来），
+故当时把字段路径记为**静态验证**。该条**已被上述补跑取代**，以当前结论为准。
 
 ### 3. `--json-schema` 在有工具调用的场景下是否返回了符合 schema 的结构？
 
@@ -113,7 +118,10 @@ structured_output:b.unknown().optional(),uuid:i2,session_id:b.string()
 
 补跑实测：`-p` + `--output-format stream-json --include-partial-messages --verbose --json-schema <schema>
 --max-budget-usd 0.50 --tools=Read,Grep,Glob` → **rc=0、7.0s 退出**，
-`result.structured_output` 为符合 schema 的已解析对象（`result` 字段则是散文总结）。
+`result.structured_output` 为符合 schema 的已解析对象。
+⚠️ **`result` 字段的形状不确定**：7.0s 那次是散文，而那次的 15.9s Runner 端到端成功样本里
+`result` 是 ```` ```json ```` 代码块（已归档为 `tests/fixtures/claude-stream-structured-sample.jsonl`）。
+**唯一可靠的是 `structured_output`**，不要假设 `result` 一定是散文（详见第 3 问与「gate 已解除」）。
 
 原记录（凭据耗尽期间的实测，**情境：请求全部 403**）：
 
@@ -314,7 +322,8 @@ ERROR: unexpected status 403 Forbidden: 用户额度不足, 剩余额度: ＄-0.
   其余 `"system"`（`subtype` 有 `hook_started` / `hook_response` / `init`）与 `"assistant"` 行按日志处理（**实测**）。
 - **结构化结果的字段路径**：`result.structured_output`（**运行时实测**，2026-09-18 凭据恢复后补跑；
   二进制 schema 原文 `structured_output:b.unknown().optional()`，成功变体才有、失败变体没有）。
-  仅在传 `--json-schema` 时出现；**传了它 `result` 字段就退化为人类可读散文**，见下方「gate 已解除」。
+  仅在传 `--json-schema` 时出现；**`result` 字段的形状不确定**（实测既见过散文，也见过 ```` ```json ```` 代码块），
+  因此**只有 `structured_output` 可靠**，见下方「gate 已解除」。
   ⚠️ 但 `result` 顶层字段（`subtype`/`is_error`/`result`/`usage`/`total_cost_usd`/`session_id`/`num_turns`/
   `duration_ms`/`stop_reason`/`permission_denials`/`uuid`/`modelUsage`）**全部实测存在**。
 - **usage 字段路径**：`usage.input_tokens` / `usage.output_tokens`（**实测**）；
@@ -352,15 +361,25 @@ ERROR: unexpected status 403 Forbidden: 用户额度不足, 剩余额度: ＄-0.
 
   | 路径 | 实测结果 |
   | --- | --- |
-  | 带 `--json-schema` | **rc=0，7.0s 正常退出**；`result` 是**人类可读散文**，结构化对象在 `result.structured_output`（**运行时实测**，不再是静态验证） |
-  | 不带 `--json-schema` | rc=0，`result` 是模型输出的文本；**严格要求时可能直接是 JSON 字符串，但不可靠**——真实端到端跑一次时模型把 JSON 包进 ```json 代码块，`JSON.parse` 失败 → **零 artifact** |
+  | 带 `--json-schema` | **rc=0，7.0s 正常退出**；`result.structured_output` 是符合 schema 的对象（**运行时实测**，不再是静态验证）。⚠️ `result` 形状**不确定**——7.0s 那次是散文，而 15.9s 的 Runner 端到端成功样本里是 ```` ```json ```` 代码块（已归档为 `tests/fixtures/claude-stream-structured-sample.jsonl`），**不能假设 `result` 是散文** |
+  | 不带 `--json-schema` | rc=0，`result` 是模型输出的文本；**可能直接是 JSON 字符串，但不可靠**——真实端到端跑一次时模型把 JSON 包进 ```` ```json ```` 代码块，`JSON.parse` 失败 → **零 artifact**（该次 `result` 行已归档为 `tests/fixtures/claude-stream-plain-sample.jsonl`） |
 
-  补充实测（`createClaudeCodeRunner` 真实调用，同一 prompt，各一次）：
+  补充实测（`createClaudeCodeRunner` 真实调用，同一 prompt，**各跑一次，n=1**）：
 
   | 路径 | 耗时 | artifact | 成本 |
   | --- | --- | --- | --- |
   | 不带 `--json-schema` | 29.3s | ❌ 缺失（代码块包裹） | $0.1159 |
   | 带 `--json-schema` | 15.9s | ✅ 字段齐全（CLI 校验过） | $0.0507 |
+
+  ⚠️ **证据强度不一致，须如实读**：上表两条路径**各只跑了 1 次（n=1）**，且「模型是否用
+  ```` ```json ```` 代码块包裹」**本质是随机行为**，单次结果不代表稳定行为。
+  - 带 `--json-schema` 一侧：有归档 fixture（`tests/fixtures/claude-stream-structured-sample.jsonl`）+ 复现命令，**可复核**；
+  - 不带 `--json-schema` 一侧：原先「零 artifact、$0.1159」**无归档 stdout、无逐字命令**，属不可复核。
+    现已补档——该侧 `result` 行逐字归档为 `tests/fixtures/claude-stream-plain-sample.jsonl`
+    （`is_error:false`、`result` 为 ```` ```json ```` 代码块、无 `structured_output`、`total_cost_usd` 与上表 $0.1159 一致），从此可复核。
+
+  因此「零 artifact」应读作**「该形态真实出现过、不可依赖」，而非「必然发生」**；
+  **带 schema 一侧的结论强度高于不带 schema 一侧**。
 
   结论：
   1. **默认传 `--json-schema`**（`buildArgs` 的第二参数默认值已改为 `true`）；
@@ -368,6 +387,17 @@ ERROR: unexpected status 403 Forbidden: 用户额度不足, 剩余额度: ＄-0.
      （`src/runner/claude-code-runner.ts` 的 `parseStreamLine`）；
   3. **超时 + kill 必须保留**——「永不退出」那条路径依然真实存在，但只出现在**请求持续失败**时
      （stop hook 反复注入 `You MUST call the StructuredOutput tool`）；凭据正常时不复现。
+  4. **反转结论的证据强度**：支撑反转的两条路径**各为 n=1**，「模型是否用 ```` ```json ```` 代码块包裹」
+     本质是**随机行为**。带 schema 侧有 fixture + 复现命令；不带 schema 侧本轮补档后亦可复核。
+     因此反转成立的理由是**「两种形态都真实出现过」**，而非「某形态必然复现」——不要把它当稳定行为预期。
+
+  ⚠️ **已知开放项：`rc=0` + `is_error:false` 但零 artifact（本轮确认，Phase 1 前不会闭合）**。
+  推演：传了 `--json-schema` 但 CLI 没产出 `structured_output`、且 `is_error:false` → 解析层只产出一条 `log`，
+  runner 随后直接 `yield { kind:'exited', code:0 }`。**runner 层没有任何「成功即必须有 artifact」的断言**
+  （`parseArtifactPayload` 在 HEAD **无任何生产调用者**；`src/runner/types.ts` 的 `artifactType` 仅供参考）。
+  该判据**由内核层的 `hasArtifact` 承担，Phase 1 在 Task 12 落地**
+  （见计划文档 `docs/superpowers/plans/2026-09-18-agentflow-phase0-phase1.md` 的 `if (!hasArtifact) node.failed` 段，当前尚未实现）。
+  在 Task 12 落地前，「rc=0 但零 artifact」会作为一次**成功空跑**穿过 runner，须由上层补网。
 
 ## 与简报 Task 10 测试样本（`SAMPLE_RESULT`）的差异
 
@@ -431,7 +461,7 @@ npx tsx spikes/cli-probe/analyze.ts
 | 挂起重试次数 | 16,403 次，计数恒为 `attempt 1/11` | `grep -c '\[ERROR\] API error (attempt 1/11)' ~/.claude/debug/09af1339-eb2a-464c-91a5-7a4f8a3cf448.txt` |
 | codex 两路输出分流 | stdout 0 字节 / stderr 61602 字节（82 行） | `/tmp/codex-out.txt`、`/tmp/codex-err.txt` |
 | 带 `--json-schema` 的正常路径（2026-09-18 补跑） | rc=0 / 7.0s / 含 `structured_output` | 复现方式第 2 条命令 |
-| Runner 两路径真实对比（2026-09-18 补跑） | 不带 schema：29.3s、无 artifact、$0.1159；带 schema：15.9s、有 artifact、$0.0507 | 探针 3 的原始 stdout 落盘于 `/tmp/agentflow-e2e-logs/{plain,schema}/*.jsonl`（临时，未入库）；带 schema 的 result 行已逐字归档为 `tests/fixtures/claude-stream-structured-sample.jsonl` |
+| Runner 两路径真实对比（2026-09-18 补跑，**各 n=1**） | 不带 schema：29.3s、无 artifact、$0.1159；带 schema：15.9s、有 artifact、$0.0507 | 原始 stdout 落盘于 `/tmp/agentflow-e2e-logs/{plain,schema}/*.jsonl`（临时）；**两侧 result 行均已逐字归档**——带 schema：`tests/fixtures/claude-stream-structured-sample.jsonl`；不带 schema：`tests/fixtures/claude-stream-plain-sample.jsonl`（`total_cost_usd`=$0.1159 与表一致） |
 
 ⚠️ **注意**：`probe-claude.ts` / `probe-codex.ts` 只在子进程 `close` 事件写盘（见脚本 `:20-25`），
 进程被 `kill` 就**零产物**——这正是 `out/` 为空、本文件不得不外挂原始片段的原因。

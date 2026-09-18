@@ -48,11 +48,12 @@ export function parseStreamLine(line: string): RunnerEvent[] {
     }
 
     // 两条产物通道都读，且 structured_output 优先：
-    // 开启 --json-schema 时（2026-09-18 凭据恢复后实测），结构化对象只出现在 structured_output，
-    // result 退化为人类可读的散文总结；未开启时由 prompt 约束模型把 JSON 直接放进 result。
+    // 开启 --json-schema 时（2026-09-18 凭据恢复后实测），结构化对象出现在 structured_output；
+    // result 的形状不固定（实测见过散文，也见过 ```json 代码块，无法保证可 JSON.parse），故不能只读它。
     // 只读 result 会让开启 --json-schema 的调用静默不产出 artifact。
     const structured = obj['structured_output'];
-    if (structured !== null && typeof structured === 'object') {
+    // 顶层 schema 是 object，但 typeof [] === 'object' 且非 null，显式排除数组以免误当结构化对象
+    if (structured !== null && typeof structured === 'object' && !Array.isArray(structured)) {
       events.push({ kind: 'artifact', raw: structured });
       return events;
     }
