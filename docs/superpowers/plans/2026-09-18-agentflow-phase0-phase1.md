@@ -3382,7 +3382,7 @@ Task 2 用真实 CLI 实测（含 16,403 次重试的可复核证据）推翻了
 
 | 原假设 | 实测结论 | 本任务必须怎么做 |
 | --- | --- | --- |
-| 用 `--json-schema` 在 CLI 层强制产物格式 | **该参数会让 CLI 永不退出**（空转 13 分钟、16,403 次 `You MUST call the StructuredOutput tool`、CPU 45%~50%） | **默认不传 `--json-schema`**。产物格式靠 prompt 强约束 + JSON 提取 + zod 校验 + 一次重试兜底 |
+| 用 `--json-schema` 在 CLI 层强制产物格式 | 凭据耗尽期间：该参数会让 CLI 永不退出（空转 13 分钟、16,403 次 `You MUST call the StructuredOutput tool`、CPU 45%~50%）。**凭据恢复后补跑（2026-09-18）**：rc=0、7.0s 正常退出，`result.structured_output` 为符合 schema 的对象；而**不传**时模型会把 JSON 包进 ` ```json ` 代码块 → 解析失败 → 零 artifact | **默认传 `--json-schema`**（有 `outputSchema` 时）；解析层 `structured_output` 优先、`result` 内 JSON 字符串兜底。**「永不退出」只在请求持续失败时出现**，故 wall-clock 超时 + 按进程组 kill 仍是必需配套 |
 | 用 `subtype == 'success'` 判成功 | 认证失败时 `subtype` 仍为 `"success"`，而 `is_error` 为 `true`、exit=1 | **只用 `is_error` 判定失败**，绝不看 `subtype` |
 | 事件字段可用白名单校验 | 真实事件字段远多于样本（`duration_ms` / `duration_api_ms` / `num_turns` / `stop_reason` / `modelUsage` / `permission_denials` / `uuid`） | 解析层**不做字段白名单**，只取自己需要的字段 |
 | `RunRequest.wallTimeMs` 是提示性字段 | 存在永不退出的路径 | **必须实现硬性 wall-clock 超时并 kill 子进程**，否则任务会永久挂起 |
@@ -3558,6 +3558,14 @@ export function parseStreamLine(line: string): RunnerEvent[] {
       return events;
     }
 
+    // 两条产物通道都读，structured_output 优先（2026-09-18 补跑实测：传了 --json-schema 时
+    // 结构化对象只在 structured_output，result 退化为散文；不传时 JSON 由 prompt 约束进 result）
+    const structured = obj['structured_output'];
+    if (structured !== null && typeof structured === 'object') {
+      events.push({ kind: 'artifact', raw: structured });
+      return events;
+    }
+
     if (typeof raw === 'string') {
       try {
         events.push({ kind: 'artifact', raw: JSON.parse(raw) as unknown });
@@ -3579,15 +3587,14 @@ export type ClaudeCodeRunnerOptions = {
   /** 追加的额外参数，用于探针阶段调试 */
   extraArgs?: string[];
   /**
-   * 是否启用 CLI 层的结构化输出强制（--json-schema）。
-   * 默认 false —— Task 2 实测该参数会让 CLI 永不退出（16,403 次重试空转）。
-   * 仅在未来 CLI 修好该 bug、且已补跑验证后才可开启。
+   * 是否启用 CLI 层的结构化输出强制（--json-schema）。默认 true（见 Step 5 的 2026-09-18 修订）。
+   * 该参数在请求持续失败时会让 CLI 空转不退出，故 wall-clock 超时 + killTree 是必需配套。
    */
   useJsonSchema?: boolean;
 };
 
 /** 根据角色权限和产出要求拼装 claude 命令行参数 */
-export function buildArgs(req: RunRequest, useJsonSchema = false): string[] {
+export function buildArgs(req: RunRequest, useJsonSchema = true): string[] {
   const args = [
     '-p', req.prompt,
     '--output-format', 'stream-json',
@@ -3600,8 +3607,7 @@ export function buildArgs(req: RunRequest, useJsonSchema = false): string[] {
   if (req.systemPrompt) {
     args.push('--system-prompt', req.systemPrompt);
   }
-  // 默认不传 --json-schema：实测会让进程永不退出。
-  // 产物格式改由 prompt 约束 + 解析层 JSON 提取 + zod 校验兜底。
+  // 默认传 --json-schema（有 outputSchema 时），解析层两通道兼容
   if (useJsonSchema && req.outputSchema) {
     args.push('--json-schema', JSON.stringify(req.outputSchema));
   }
@@ -3809,7 +3815,12 @@ export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentR
 
 - [ ] **Step 5: 补两条针对实测缺陷的回归测试**
 
-这两条测试是 Task 2 最有价值产出的直接防护：一条防止有人把 `--json-schema` 加回来，一条防止 wall-clock 超时被删掉。
+这两条测试是 Task 2 最有价值产出的直接防护：一条把守 `--json-schema` 的默认取值，一条防止 wall-clock 超时被删掉。
+
+⚠️ **2026-09-18 修订（凭据恢复后补跑实测）**：`--json-schema` 的默认值由「不传」**反转为「传」**——
+证据是：不传时模型会把 JSON 包进 ` ```json ` 代码块，真实端到端跑出**零 artifact**；
+传了则 rc=0、15.9s 退出、产物字段齐全且成本更低。下面代码块已按修订后的规则更新
+（实现见 `src/runner/claude-code-runner.ts`，测试见 `src/runner/claude-code-runner.args.test.ts`）。
 
 先写 `src/runner/claude-code-runner.args.test.ts`：
 
@@ -3830,16 +3841,21 @@ const base: RunRequest = {
 };
 
 describe('buildArgs', () => {
-  it('默认不传 --json-schema（实测该参数会让 CLI 永不退出）', () => {
+  it('默认传 --json-schema（实测：不传时模型常把 JSON 包进代码块，导致解析失败、零产物）', () => {
     const args = buildArgs({ ...base, outputSchema: { type: 'object' } });
-    expect(args).not.toContain('--json-schema');
-  });
-
-  it('显式开启 useJsonSchema 时才传 --json-schema', () => {
-    const args = buildArgs({ ...base, outputSchema: { type: 'object' } }, true);
     const idx = args.indexOf('--json-schema');
     expect(idx).toBeGreaterThanOrEqual(0);
     expect(args[idx + 1]).toBe(JSON.stringify({ type: 'object' }));
+  });
+
+  it('没有 outputSchema 时不传 --json-schema', () => {
+    const args = buildArgs(base);
+    expect(args).not.toContain('--json-schema');
+  });
+
+  it('显式关闭 useJsonSchema 时不传 --json-schema', () => {
+    const args = buildArgs({ ...base, outputSchema: { type: 'object' } }, false);
+    expect(args).not.toContain('--json-schema');
   });
 
   it('stream-json 必须同时带 --verbose（实测缺它则无输出）', () => {

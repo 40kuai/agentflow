@@ -106,9 +106,18 @@ structured_output:b.unknown().optional(),uuid:i2,session_id:b.string()
 
 ### 3. `--json-schema` 在有工具调用的场景下是否返回了符合 schema 的结构？
 
-**未能验证**——而且实测发现它在本环境下是一个**必须规避的陷阱**：
+**已补跑验证（2026-09-18，凭据恢复后）：是的，正常返回并退出。**
+但下面记录的「永不退出」现象**依然真实存在**——它不是 `--json-schema` 本身的 bug，
+而是**请求持续失败**时 stop hook 反复注入 `You MUST call the StructuredOutput tool` 导致的空转，
+所以超时 + kill 的保护必须保留（凭据再次失效时会立刻用上）。
 
-加入 `--json-schema` 后，进程**永不退出**，并疯狂刷以下事件对（两个 15 秒窗口内各刷出 100+ 对）：
+补跑实测：`-p` + `--output-format stream-json --include-partial-messages --verbose --json-schema <schema>
+--max-budget-usd 0.50 --tools=Read,Grep,Glob` → **rc=0、7.0s 退出**，
+`result.structured_output` 为符合 schema 的已解析对象（`result` 字段则是散文总结）。
+
+原记录（凭据耗尽期间的实测，**情境：请求全部 403**）：
+
+进程**永不退出**，并疯狂刷以下事件对（两个 15 秒窗口内各刷出 100+ 对）：
 
 ```
 {"type":"assistant","message":{...,"model":"<synthetic>",...}}          ← 每行形如
@@ -303,17 +312,16 @@ ERROR: unexpected status 403 Forbidden: 用户额度不足, 剩余额度: ＄-0.
 - **解析入口事件类型**：`"result"`（**实测**）。
   解析器应逐行 `JSON.parse`，只认顶层 `type === "result"` 的那一行作为终态；
   其余 `"system"`（`subtype` 有 `hook_started` / `hook_response` / `init`）与 `"assistant"` 行按日志处理（**实测**）。
-- **结构化结果的字段路径**：`result.structured_output`（**静态验证**，二进制 schema 原文
-  `structured_output:b.unknown().optional()`；成功变体才有该字段，失败变体没有）。
-  （⚠️ 读这条时**必须先看本段落末尾的 gate**：采用下面推荐的参数数组时，该字段**永远不会出现**。）
-  ⚠️ **运行时未能观测到该字段**：额度阻断，模型没跑起来。
+- **结构化结果的字段路径**：`result.structured_output`（**运行时实测**，2026-09-18 凭据恢复后补跑；
+  二进制 schema 原文 `structured_output:b.unknown().optional()`，成功变体才有、失败变体没有）。
+  仅在传 `--json-schema` 时出现；**传了它 `result` 字段就退化为人类可读散文**，见下方「gate 已解除」。
   ⚠️ 但 `result` 顶层字段（`subtype`/`is_error`/`result`/`usage`/`total_cost_usd`/`session_id`/`num_turns`/
   `duration_ms`/`stop_reason`/`permission_denials`/`uuid`/`modelUsage`）**全部实测存在**。
 - **usage 字段路径**：`usage.input_tokens` / `usage.output_tokens`（**实测**）；
   成本字段是 `result.total_cost_usd`（**实测**，注意它不在 `usage` 内）。
   另有实测存在的 `usage.cache_creation_input_tokens` / `usage.cache_read_input_tokens` /
   `usage.service_tier` / `usage.server_tool_use.*` / `usage.cache_creation.*` / `usage.inference_geo` / `usage.iterations`。
-- **最终采用的 claude 调用参数数组**（⚠️ **不是**简报原来那组，见下方警告）：
+- **最终采用的 claude 调用参数数组**（相对简报原版**加回了 `--json-schema`**，理由见下方 gate 解除）：
 
   ```ts
   const args = [
@@ -321,36 +329,45 @@ ERROR: unexpected status 403 Forbidden: 用户额度不足, 剩余额度: ＄-0.
     '--output-format', 'stream-json',
     '--include-partial-messages',
     '--verbose',
+    '--json-schema', JSON.stringify(outputSchema),   // 有 outputSchema 时默认传
     '--max-budget-usd', '0.50',
     '--tools=Read,Grep,Glob',
   ];
   ```
 
-  **实测**：该数组（相对简报版本**去掉了 `--json-schema`**）在 23ms 内完成启动与退出，
-  产出 5 行 stream-json（3×`system` / 1×`assistant` / 1×`result`），stderr 0 字节，exit code = 1（认证失败）。
-  其中 `--tools=Read,Grep,Glob`、`--include-partial-messages`、`--output-format stream-json --verbose`
+  **实测**：去掉 `--json-schema` 的版本在 23ms 内完成启动与退出，
+  产出 5 行 stream-json（3×`system` / 1×`assistant` / 1×`result`），stderr 0 字节，exit code = 1（认证失败）；
+  带 `--json-schema` 的版本在凭据正常时 rc=0、7.0s 退出并给出 `structured_output`。
+  `--tools=Read,Grep,Glob`、`--include-partial-messages`、`--output-format stream-json --verbose`
   都单独实测过可正常启动与退出。
 
-  ⚠️ **警告一**：原简报数组里的 `--json-schema` 在本环境下会让进程**永不退出**（见第 3 问）。
-  Task 10 若仍要 `--json-schema`，**必须**给子进程加超时 + `kill`，并且不能只读 `result.structured_output`
-  一条路径。
+  ⚠️ **警告一**：`--json-schema` 在**请求持续失败**时会让进程永不退出（见第 3 问）。
+  必须给子进程加 wall-clock 超时 + 按进程组 `kill`，且解析层不能只读 `result.structured_output` 一条路径。
   ⚠️ **警告二**：`--tools` 不约束 MCP 工具（第 6 问），「只允许 Read/Grep/Glob」的目标并未真正达成。
   ⚠️ **警告三**：`--output-format stream-json` 在 `-p` 模式下**必须**同时给 `--verbose`，否则直接报错
   （原样报错：`Error: When using --print, --output-format=stream-json requires --verbose`，**实测**）。
 
-- 🚧 **gate（Task 10 采用上面这组参数时的硬约束，必须照办）**：
-  上面推荐的参数数组**已经去掉了 `--json-schema`**，因此在它下面
-  **`result.structured_output` 永远不会存在**（第 2 问已自述该字段 `.optional()`，未给 schema 时不存在）。
-  也就是说，本段落里「结构化结果的字段路径 = `result.structured_output`」与「采用上面这组参数」
-  **不能同时成立**：
-  - 照抄上面参数数组 → 拿不到结构化结果；
-  - 要拿结构化结果 → 必须加 `--json-schema` → 本环境下进程**永不退出**（警告一）。
+- ✅ **gate 已解除（2026-09-18 补跑，凭据恢复后）**：
+  原先的 gate 是「要结构化结果就必须加 `--json-schema` → 而它会永不退出」。补跑后该矛盾不成立：
 
-  因此：
-  1. **采用上述参数数组时，不要解析 `result.structured_output`**（它不会出现；解析它会永远拿不到东西）；
-  2. **结构化输出的获取路径整体属于「未验证」**。Task 10 必须在 claude 额度恢复后
-     **补跑一次带 `--json-schema` 的真实调用、并给子进程加超时 + `kill`**，
-     才有证据决定要不要把 `structured_output` 纳入解析路径；在此之前不要把结构化输出当作可用能力。
+  | 路径 | 实测结果 |
+  | --- | --- |
+  | 带 `--json-schema` | **rc=0，7.0s 正常退出**；`result` 是**人类可读散文**，结构化对象在 `result.structured_output`（**运行时实测**，不再是静态验证） |
+  | 不带 `--json-schema` | rc=0，`result` 是模型输出的文本；**严格要求时可能直接是 JSON 字符串，但不可靠**——真实端到端跑一次时模型把 JSON 包进 ```json 代码块，`JSON.parse` 失败 → **零 artifact** |
+
+  补充实测（`createClaudeCodeRunner` 真实调用，同一 prompt，各一次）：
+
+  | 路径 | 耗时 | artifact | 成本 |
+  | --- | --- | --- | --- |
+  | 不带 `--json-schema` | 29.3s | ❌ 缺失（代码块包裹） | $0.1159 |
+  | 带 `--json-schema` | 15.9s | ✅ 字段齐全（CLI 校验过） | $0.0507 |
+
+  结论：
+  1. **默认传 `--json-schema`**（`buildArgs` 的第二参数默认值已改为 `true`）；
+  2. 解析层**两条通道都读，`structured_output` 优先**，`result` 里的 JSON 字符串兜底
+     （`src/runner/claude-code-runner.ts` 的 `parseStreamLine`）；
+  3. **超时 + kill 必须保留**——「永不退出」那条路径依然真实存在，但只出现在**请求持续失败**时
+     （stop hook 反复注入 `You MUST call the StructuredOutput tool`）；凭据正常时不复现。
 
 ## 与简报 Task 10 测试样本（`SAMPLE_RESULT`）的差异
 
@@ -376,21 +393,30 @@ ERROR: unexpected status 403 Forbidden: 用户额度不足, 剩余额度: ＄-0.
 ## 复现方式
 
 ```bash
-# 验证 claude 凭据（几秒返回，会打印 403 原始报文）
+# 验证 claude 凭据（几秒返回；额度耗尽时会打印 403 原始报文）
 claude -p "hi" --output-format json
 
-# 验证 --json-schema 的无限循环（会一直不退出，需手动终止）
+# 验证带 --json-schema 的正常路径（凭据正常时 rc=0、数秒退出，输出含 structured_output）
+claude -p "判断 1+1 是否等于 2，给出 verdict 与 reason。" \
+  --output-format stream-json --include-partial-messages --verbose \
+  --json-schema '{"type":"object","properties":{"verdict":{"type":"string"},"reason":{"type":"string"}},"required":["verdict","reason"],"additionalProperties":false}' \
+  --max-budget-usd 0.50 --tools=Read,Grep,Glob
+
+# 复现「永不退出」路径（需在请求持续失败的情境下；凭据正常时不会挂起）
 claude -p "hi" --output-format stream-json --verbose --include-partial-messages \
   --json-schema '{"type":"object","properties":{"a":{"type":"string"}},"required":["a"],"additionalProperties":false}'
 
-# 【待补跑·未验证】CLI 是否校验工具名（额度恢复后再跑，并保存输出）
+# 【待补跑·未验证】CLI 是否校验工具名
 claude -p "hi" --output-format json --tools=BogusTool
 
-# 验证可正常退出的参数集（本文件「对 Task 10 的结论」里那组）
+# 验证可正常退出的参数集（不带 --json-schema）
 claude -p "hi" --output-format stream-json --include-partial-messages --verbose \
   --max-budget-usd 0.50 --tools=Read,Grep,Glob
 
-# 原始探针脚本（本环境跑不通，仅作留档）
+# 真实 Runner 端到端（走 createClaudeCodeRunner，会真实消耗额度约 $0.05~0.12/次）
+npx tsx <临时脚本>   # 两条路径各跑一次，断言 event kinds 含 artifact
+
+# 原始探针脚本（凭据耗尽期间跑不通，仅作留档）
 npx tsx spikes/cli-probe/probe-claude.ts
 npx tsx spikes/cli-probe/probe-codex.ts
 npx tsx spikes/cli-probe/analyze.ts
@@ -404,10 +430,14 @@ npx tsx spikes/cli-probe/analyze.ts
 | `--tools` 生效的对照组 | `init.tools` 有/无 `--tools` 的差异 | 第 6 问的 `tools` 原文；对照组原始文件 `/tmp/claude-t2.jsonl` |
 | 挂起重试次数 | 16,403 次，计数恒为 `attempt 1/11` | `grep -c '\[ERROR\] API error (attempt 1/11)' ~/.claude/debug/09af1339-eb2a-464c-91a5-7a4f8a3cf448.txt` |
 | codex 两路输出分流 | stdout 0 字节 / stderr 61602 字节（82 行） | `/tmp/codex-out.txt`、`/tmp/codex-err.txt` |
+| 带 `--json-schema` 的正常路径（2026-09-18 补跑） | rc=0 / 7.0s / 含 `structured_output` | 复现方式第 2 条命令 |
+| Runner 两路径真实对比（2026-09-18 补跑） | 不带 schema：29.3s、无 artifact、$0.1159；带 schema：15.9s、有 artifact、$0.0507 | 探针 3 的原始 stdout 落盘于 `/tmp/agentflow-e2e-logs/{plain,schema}/*.jsonl`（临时，未入库）；带 schema 的 result 行已逐字归档为 `tests/fixtures/claude-stream-structured-sample.jsonl` |
 
 ⚠️ **注意**：`probe-claude.ts` / `probe-codex.ts` 只在子进程 `close` 事件写盘（见脚本 `:20-25`），
 进程被 `kill` 就**零产物**——这正是 `out/` 为空、本文件不得不外挂原始片段的原因。
 Task 10 的子进程管理不能复制这个写法，必须**边收边落盘**或先设超时。
 
-⚠️ **不要为了复核而重跑探针**：本机 claude 额度已耗尽（剩余额度为负），重跑只会得到 403 认证失败输出、
-拿不到成功路径，且会白白消耗额度。上表中除「待补跑」标注的命令外，其余都可用**已冻结的文件**复核。
+⚠️ **不要把探针脚本当作可复现证据**：`out/` 里的产物在凭据耗尽那轮为空的根本原因是——`probe-*.ts` 只在子进程
+`close` 事件写盘，而当时进程被人工 `kill`。本文件里的数值以**已冻结的原始文件**与**指令原文**为准。
+凭据已于 2026-09-18 恢复（`claude -p "hi" --output-format json` 实测 `is_error:false`），
+文末命令都可重跑；注意每次真实调用都会消耗额度（单次约 $0.01~0.12）。

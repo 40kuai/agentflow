@@ -47,6 +47,16 @@ export function parseStreamLine(line: string): RunnerEvent[] {
       return events;
     }
 
+    // 两条产物通道都读，且 structured_output 优先：
+    // 开启 --json-schema 时（2026-09-18 凭据恢复后实测），结构化对象只出现在 structured_output，
+    // result 退化为人类可读的散文总结；未开启时由 prompt 约束模型把 JSON 直接放进 result。
+    // 只读 result 会让开启 --json-schema 的调用静默不产出 artifact。
+    const structured = obj['structured_output'];
+    if (structured !== null && typeof structured === 'object') {
+      events.push({ kind: 'artifact', raw: structured });
+      return events;
+    }
+
     if (typeof raw === 'string') {
       try {
         events.push({ kind: 'artifact', raw: JSON.parse(raw) as unknown });
@@ -120,15 +130,17 @@ export type ClaudeCodeRunnerOptions = {
   /** 追加的额外参数，用于探针阶段调试 */
   extraArgs?: string[];
   /**
-   * 是否启用 CLI 层的结构化输出强制（--json-schema）。
-   * 默认 false —— Task 2 实测该参数会让 CLI 永不退出（16,403 次重试空转）。
-   * 仅在未来 CLI 修好该 bug、且已补跑验证后才可开启。
+   * 是否启用 CLI 层的结构化输出强制（--json-schema）。默认 **true**。
+   * 依据 2026-09-18 凭据恢复后的真实端到端实测：不传时常被模型包进 ```json 代码块 →
+   * JSON.parse 失败 → 零 artifact；传了则 CLI 正常退出（15.9s）并把校验过的对象放进
+   * result.structured_output，耗时与成本都更低。仅在需要排障时显式关掉。
+   * 注意该参数在请求失败路径上仍可能空转重试，故 wall-clock 超时 + killTree 是必需配套。
    */
   useJsonSchema?: boolean;
 };
 
 /** 根据角色权限和产出要求拼装 claude 命令行参数 */
-export function buildArgs(req: RunRequest, useJsonSchema = false): string[] {
+export function buildArgs(req: RunRequest, useJsonSchema = true): string[] {
   const args = [
     '-p', req.prompt,
     '--output-format', 'stream-json',
@@ -141,8 +153,8 @@ export function buildArgs(req: RunRequest, useJsonSchema = false): string[] {
   if (req.systemPrompt) {
     args.push('--system-prompt', req.systemPrompt);
   }
-  // 默认不传 --json-schema：实测会让进程永不退出。
-  // 产物格式改由 prompt 约束 + 解析层 JSON 提取 + zod 校验兜底。
+  // 默认传 --json-schema（见 options.useJsonSchema 注释里的实测依据）；
+  // 解析层同时兼容两条通道：structured_output 优先，result 里的 JSON 字符串兜底。
   if (useJsonSchema && req.outputSchema) {
     args.push('--json-schema', JSON.stringify(req.outputSchema));
   }
@@ -174,7 +186,7 @@ export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentR
     },
 
     async *run(req: RunRequest): AsyncIterable<RunnerEvent> {
-      const args = [...buildArgs(req, options.useJsonSchema ?? false), ...(options.extraArgs ?? [])];
+      const args = [...buildArgs(req, options.useJsonSchema ?? true), ...(options.extraArgs ?? [])];
       const logPath = join(options.logDir, `${req.runId}.jsonl`);
       const logStream = createWriteStream(logPath, { flags: 'a' });
 
@@ -190,8 +202,9 @@ export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentR
       registerGroup(child.pid ?? -1);
 
       // 硬性 wall-clock 超时保护。
-      // Task 2 实测存在「CLI 永不退出」的路径（--json-schema 挂起 13 分钟），
-      // 没有这层保护，任务会永久卡住且后续节点永不执行。
+      // 已知挂起路径：请求持续失败时，--json-schema 的 stop hook 会反复注入
+      // 「You MUST call the StructuredOutput tool」，CLI 不退出（Task 2 实测空转 13 分钟）。
+      // 凭据正常时该路径不复现（2026-09-18 实测 15.9s 正常退出），但超时保护必须保留。
       let timedOut = false;
       const timeoutTimer = setTimeout(() => {
         timedOut = true;

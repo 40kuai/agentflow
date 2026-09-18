@@ -14,16 +14,21 @@ const base: RunRequest = {
 };
 
 describe('buildArgs', () => {
-  it('默认不传 --json-schema（实测该参数会让 CLI 永不退出）', () => {
+  it('默认传 --json-schema（实测：不传时模型常把 JSON 包进代码块，导致解析失败、零产物）', () => {
     const args = buildArgs({ ...base, outputSchema: { type: 'object' } });
-    expect(args).not.toContain('--json-schema');
-  });
-
-  it('显式开启 useJsonSchema 时才传 --json-schema', () => {
-    const args = buildArgs({ ...base, outputSchema: { type: 'object' } }, true);
     const idx = args.indexOf('--json-schema');
     expect(idx).toBeGreaterThanOrEqual(0);
     expect(args[idx + 1]).toBe(JSON.stringify({ type: 'object' }));
+  });
+
+  it('没有 outputSchema 时不传 --json-schema', () => {
+    const args = buildArgs(base);
+    expect(args).not.toContain('--json-schema');
+  });
+
+  it('显式关闭 useJsonSchema 时不传 --json-schema', () => {
+    const args = buildArgs({ ...base, outputSchema: { type: 'object' } }, false);
+    expect(args).not.toContain('--json-schema');
   });
 
   it('stream-json 必须同时带 --verbose（实测缺它则无输出）', () => {

@@ -1,0 +1,39 @@
+id: simple_dev
+start: pm_analyze
+# 注意：Phase 1 所有节点 isolate 一律为 false。
+# 原因：本阶段还没有"合并"能力，若 dev 在 worktree 里写代码，跑完 worktree 会被回收，
+# 代码即丢失，随后 qa_verify（在主工作区运行）看不到任何改动，闭环就断了。
+# worktree 隔离必须与合并能力一起引入，属于 Phase 2。
+nodes:
+  - id: pm_analyze
+    title: 需求分析
+    role: pm
+    consumes: []
+    produces: requirement
+    isolate: false
+
+  - id: dev_implement
+    title: 编码实现
+    role: backend_dev
+    consumes:
+      - requirement
+    produces: code_diff
+    isolate: false
+
+  - id: qa_verify
+    title: 测试验证
+    role: qa_engineer
+    consumes:
+      - requirement
+      - code_diff
+    produces: test_report
+    isolate: false
+
+edges:
+  - from: pm_analyze
+    to: dev_implement
+    when: "all(artifacts.requirement.status == 'ok')"
+
+  - from: dev_implement
+    to: qa_verify
+    when: "all(artifacts.code_diff.status == 'ok')"

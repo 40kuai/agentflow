@@ -44,4 +44,36 @@ describe('claude stream-json 契约回归', () => {
       expect(kinds).toContain('artifact');
     }
   });
+
+  it('带 --json-schema 的真实成功样本：artifact 与样本自身的 structured_output 逐字相等', () => {
+    // 样本逐字取自 2026-09-18 凭据恢复后的真实调用（createClaudeCodeRunner + useJsonSchema 默认开启），
+    // 这是**生产路径**的形状：result 是人类可读散文，结构化对象在 structured_output。
+    const raw = readFileSync(
+      resolve(import.meta.dirname, '../../tests/fixtures/claude-stream-structured-sample.jsonl'),
+      'utf8',
+    );
+    const lines = raw.split('\n').filter((l) => l.trim() !== '');
+    const resultLine = lines.find(
+      (l) => (JSON.parse(l) as { type?: unknown }).type === 'result',
+    );
+    expect(resultLine).toBeDefined();
+
+    const sample = JSON.parse(resultLine!) as {
+      is_error: unknown;
+      structured_output: unknown;
+      result: unknown;
+    };
+    // 前提守卫：样本必须真的是「散文 result + 对象 structured_output」，否则本用例失去意义
+    expect(sample.is_error).toBe(false);
+    expect(typeof sample.result).toBe('string');
+    expect(typeof sample.structured_output).toBe('object');
+
+    const events = parseStreamLine(resultLine!);
+    expect(events).toContainEqual({ kind: 'artifact', raw: sample.structured_output });
+    // 反向确认：解析层没有被散文 result 带偏（旧实现会走到「无法解析」分支）
+    const artifact = events.find((e) => e.kind === 'artifact');
+    if (artifact && artifact.kind === 'artifact') {
+      expect(artifact.raw).not.toBe(sample.result);
+    }
+  });
 });

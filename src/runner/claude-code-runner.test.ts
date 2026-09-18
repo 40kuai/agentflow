@@ -92,6 +92,59 @@ describe('parseStreamLine', () => {
     expect(events.some((e) => e.kind === 'log')).toBe(true);
   });
 
+  it('带 --json-schema 时优先取 structured_output：result 是散文也能产出 artifact', () => {
+    // 真实样本（2026-09-18 补跑，凭据恢复后）：开启 --json-schema 后 CLI 的 result 字段
+    // 变成人类可读的散文总结，结构化对象只出现在 structured_output。
+    // 若解析层只读 result，这条路径会「无法解析」而静默不产出 artifact。
+    const line = JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      session_id: 'sess-abc',
+      result: 'Verdict: true — 标准算术下 1+1=2 成立。',
+      structured_output: { verdict: 'true', reason: '皮亚诺公理' },
+      usage: { input_tokens: 10, output_tokens: 5 },
+      total_cost_usd: 0.04,
+      is_error: false,
+    });
+    const events = parseStreamLine(line);
+    const artifact = events.find((e) => e.kind === 'artifact');
+    expect(artifact).toBeDefined();
+    if (artifact && artifact.kind === 'artifact') {
+      expect(artifact.raw).toEqual({ verdict: 'true', reason: '皮亚诺公理' });
+    }
+  });
+
+  it('structured_output 与 result 同时为 JSON 时，以 structured_output 为准', () => {
+    const line = JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      session_id: 'sess-abc',
+      result: '{"from":"result"}',
+      structured_output: { from: 'structured_output' },
+      usage: { input_tokens: 1, output_tokens: 1 },
+      total_cost_usd: 0,
+      is_error: false,
+    });
+    const events = parseStreamLine(line);
+    expect(events).toContainEqual({ kind: 'artifact', raw: { from: 'structured_output' } });
+    expect(events).not.toContainEqual({ kind: 'artifact', raw: { from: 'result' } });
+  });
+
+  it('is_error 为 true 时，即使带 structured_output 也不产出 artifact', () => {
+    const line = JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      session_id: 'sess-abc',
+      result: '部分结果',
+      structured_output: { from: 'structured_output' },
+      usage: { input_tokens: 1, output_tokens: 1 },
+      total_cost_usd: 0,
+      is_error: true,
+    });
+    const events = parseStreamLine(line);
+    expect(events.some((e) => e.kind === 'artifact')).toBe(false);
+  });
+
   it('无法解析为 JSON 的 result 内容不产出 artifact，只产出日志', () => {
     const line = JSON.stringify({
       type: 'result',
