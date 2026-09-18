@@ -85,6 +85,35 @@ function killTree(pid: number | undefined, signal: NodeJS.Signals): void {
   }
 }
 
+// 模块级：登记活跃的子进程组，供退出钩子统一清理。
+// 必要性：spawn 用了 detached: true（为了让 killTree 能按进程组杀），
+// 代价是子进程脱离父进程组——父进程异常退出时它不会随之被终端信号带走。
+// 若不清理，孤儿 claude 会继续消耗 API 额度。
+const activeGroups = new Set<number>();
+let exitHookInstalled = false;
+
+function registerGroup(pid: number): void {
+  if (!Number.isInteger(pid) || pid <= 0) return;
+  activeGroups.add(pid);
+  if (!exitHookInstalled) {
+    exitHookInstalled = true;
+    // 用 'exit' 而非 SIGINT/SIGTERM：进程正常退出、或上层（main.ts）处理完信号后
+    // 调用 process.exit() 时，'exit' 都会触发，而 kill 是同步的，能在此安全执行。
+    // SIGKILL 这类不可捕获的终止无法覆盖，这是设计边界。
+    process.once('exit', () => {
+      for (const groupPid of activeGroups) {
+        killTree(groupPid, 'SIGKILL');
+      }
+    });
+  }
+}
+
+/** 进程已结束（close / error）时从登记表移除，避免退出钩子做无用功 */
+function unregisterGroup(pid: number | undefined): void {
+  if (pid === undefined) return;
+  activeGroups.delete(pid);
+}
+
 export type ClaudeCodeRunnerOptions = {
   binPath: string;
   logDir: string;
@@ -157,6 +186,8 @@ export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentR
         detached: true,
       });
       running.set(req.runId, child);
+      // 登记子进程组，父进程异常退出时由退出钩子兜底清理（见模块级 registerGroup）
+      registerGroup(child.pid ?? -1);
 
       // 硬性 wall-clock 超时保护。
       // Task 2 实测存在「CLI 永不退出」的路径（--json-schema 挂起 13 分钟），
@@ -217,6 +248,7 @@ export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentR
         push({ kind: 'exited', code: timedOut ? -1 : code });
         logStream.end();
         running.delete(req.runId);
+        unregisterGroup(child.pid);
       });
 
       child.on('error', (error) => {
@@ -226,6 +258,7 @@ export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentR
         push({ kind: 'exited', code: -1 });
         logStream.end();
         running.delete(req.runId);
+        unregisterGroup(child.pid);
       });
 
       while (!closed || queue.length > 0) {
