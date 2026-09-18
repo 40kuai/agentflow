@@ -79,7 +79,7 @@ describe('assemblePrompt', () => {
     expect(r.prompt).toContain('让多角色自动流转');
     expect(r.prompt).toContain('code_diff');
     expect(r.prompt).toContain('src/server/**');
-    expect(r.worktreePath).toBe('/tmp/ws');
+    expect(r.prompt).toContain('/tmp/ws');
   });
 
   it('只放输入产物的 summary 与 refs，不放 payload 正文', () => {

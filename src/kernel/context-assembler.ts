@@ -5,8 +5,6 @@ import type { TaskState } from './projector.js';
 export type AssembledPrompt = {
   systemPrompt: string;
   prompt: string;
-  /** 本次装配所使用的工作区路径，便于调用方与 prompt 内容交叉核对 */
-  worktreePath: string;
   usedArtifactIds: string[];
   droppedArtifactIds: string[];
   estimatedTokens: number;
@@ -28,15 +26,11 @@ export function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
-function renderArtifactBlock(artifact: Artifact, includeSummary: boolean): string {
+function renderArtifactBlock(artifact: Artifact): string {
   const lines = [
     `### 输入产物：${artifact.type}（id=${artifact.artifact_id}，status=${artifact.status}）`,
+    `摘要：${artifact.summary}`,
   ];
-  if (includeSummary) {
-    lines.push(`摘要：${artifact.summary}`);
-  } else {
-    lines.push('摘要：已因上下文长度限制省略，请直接读取下方引用文件获取细节。');
-  }
   if (artifact.refs.length > 0) {
     lines.push('引用：');
     for (const ref of artifact.refs) {
@@ -68,7 +62,7 @@ function buildPrompt(
   sections.push(['## 工作区', `工作目录：${input.worktreePath}`, '所有文件读写都必须在上述目录内完成。'].join('\n'));
 
   if (artifacts.length > 0) {
-    sections.push(['## 输入材料', ...artifacts.map((a) => renderArtifactBlock(a, true))].join('\n\n'));
+    sections.push(['## 输入材料', ...artifacts.map((a) => renderArtifactBlock(a))].join('\n\n'));
   }
 
   if (dropped.length > 0) {
@@ -132,7 +126,6 @@ export function assemblePrompt(input: AssembleInput): AssembledPrompt {
   return {
     systemPrompt: input.role.systemPrompt,
     prompt,
-    worktreePath: input.worktreePath,
     usedArtifactIds: used.map((a) => a.artifact_id),
     droppedArtifactIds: dropped.map((a) => a.artifact_id),
     estimatedTokens: estimated,
