@@ -24,6 +24,7 @@ const RequirementPayload = z.object({
 const WorkPackageSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
+  /** 写入范围（glob 列表）。空数组表示该工作包/角色没有写入范围（只读），这是有意为之 */
   owns: z.array(z.string().min(1)),
   reads: z.array(z.string()),
   depends_on: z.array(z.string()),
@@ -77,7 +78,10 @@ export const ArtifactSchema = z.object({
   schema_version: z.number().int().positive(),
   payload: z.unknown(),
   refs: z.array(ArtifactRefSchema),
-  /** 唯一会进入下游 prompt 的部分，控制在 500 token 内 */
+  /**
+   * 唯一会进入下游 prompt 的部分。这里约束的是字符数上限（4000 字符），不是 token 上限；
+   * 「500 token」是 Task 9 上下文装配器用估算函数裁剪的约定，不由本 schema 约束
+   */
   summary: z.string().max(4000),
   created_at: z.number().int(),
 });
