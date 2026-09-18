@@ -3619,6 +3619,62 @@ export function buildArgs(req: RunRequest, useJsonSchema = false): string[] {
   return args;
 }
 
+/**
+ * 按**进程组**终止子进程树。
+ *
+ * 为什么必须组杀而不是只杀直接子进程：实测（Phase 0 探针 + 独立对照实验）表明，
+ * `#!/bin/sh` 这类脚本会 fork 出孙进程，孙进程**继承了 stdout 管道的写端**，
+ * 因此只杀掉直接子进程时，Node 的 `close` 事件永不触发 → 异步生成器永久卡在 await。
+ * 这正是「加了超时保护但保护自己挂住」的情形。
+ *
+ * 前提：spawn 时必须带 `detached: true`，子进程才会成为新进程组的组长，
+ * `process.kill(-pid)` 才能命中整组。
+ */
+function killTree(pid: number | undefined): void {
+  if (pid === undefined || !Number.isInteger(pid) || pid <= 0) return;
+  try {
+    process.kill(-pid, 'SIGKILL');
+  } catch {
+    // 进程组可能已不存在；退回只杀该 pid，再失败就说明它已经退出
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      // 已退出，忽略
+    }
+  }
+}
+
+/**
+ * 模块级：登记活跃的子进程组，供退出钩子统一清理。
+ *
+ * 必要性：spawn 用了 `detached: true`（为了让 killTree 能按进程组杀），代价是子进程
+ * 脱离父进程组——父进程异常退出时它不会随终端信号一起消失。
+ * 若不清理，孤儿的 claude 进程会继续消耗 API 额度。
+ */
+const activeGroups = new Set<number>();
+let exitHookInstalled = false;
+
+function registerGroup(pid: number): void {
+  if (!Number.isInteger(pid) || pid <= 0) return;
+  activeGroups.add(pid);
+  if (!exitHookInstalled) {
+    exitHookInstalled = true;
+    // 用 'exit' 而非 SIGINT/SIGTERM：上层（main.ts）处理完信号并调用 process.exit() 时
+    // 'exit' 同样会触发，且 kill 是同步的，可在此安全执行——这样不会与上层争抢信号处理。
+    // 边界：SIGKILL 这类不可捕获的终止无法覆盖。
+    process.once('exit', () => {
+      for (const groupPid of activeGroups) {
+        killTree(groupPid);
+      }
+    });
+  }
+}
+
+function unregisterGroup(pid: number | undefined): void {
+  if (pid === undefined) return;
+  activeGroups.delete(pid);
+}
+
 export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentRunner {
   const running = new Map<string, ReturnType<typeof spawn>>();
   mkdirSync(options.logDir, { recursive: true });
@@ -3641,19 +3697,25 @@ export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentR
         cwd: req.workdir,
         stdio: ['ignore', 'pipe', 'pipe'],
         env: { ...process.env },
+        // detached: true 让子进程成为新进程组的组长，process.kill(-pid) 才能命中整组。
+        // 这是 killTree 能生效的前提。代价是子进程脱离父进程组，需要退出钩子兜底清理。
+        detached: true,
       });
       running.set(req.runId, child);
+      registerGroup(child.pid ?? -1);
 
       // 硬性 wall-clock 超时保护。
       // Task 2 实测存在「CLI 永不退出」的路径（--json-schema 挂起 13 分钟），
       // 没有这层保护，任务会永久卡住且后续节点永不执行。
+      // 注意必须**组杀**：只杀直接子进程时，孙进程仍持有 stdout 管道写端，
+      // close 事件不触发，异步生成器会卡在 await —— 保护本身就失效了。
       let timedOut = false;
       const timeoutTimer = setTimeout(() => {
         timedOut = true;
         logStream.write(
           JSON.stringify({ ts: Date.now(), kind: 'timeout', wallTimeMs: req.wallTimeMs }) + '\n',
         );
-        child.kill('SIGKILL');
+        killTree(child.pid);
       }, req.wallTimeMs);
 
       logStream.write(`${JSON.stringify({ ts: Date.now(), kind: 'spawn', args, cwd: req.workdir })}\n`);
@@ -3732,11 +3794,13 @@ export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentR
     async cancel(runId: string): Promise<void> {
       const child = running.get(runId);
       if (!child) return;
-      child.kill('SIGTERM');
+      // 与超时路径共用 killTree：只杀直接子进程会留下持有管道的孙进程
+      killTree(child.pid);
       await new Promise((resolve) => setTimeout(resolve, 3000));
       if (running.has(runId)) {
-        child.kill('SIGKILL');
+        killTree(child.pid);
         running.delete(runId);
+        unregisterGroup(child.pid);
       }
     },
   };
