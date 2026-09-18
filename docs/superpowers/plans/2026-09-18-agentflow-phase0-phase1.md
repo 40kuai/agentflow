@@ -1615,6 +1615,14 @@ export function project(events: KernelEvent[]): TaskState {
       case 'artifact.invalidated': {
         const artifactId = str(p, 'artifact_id');
         state.artifacts = state.artifacts.filter((a) => a.artifact_id !== artifactId);
+        // 必须同步清理节点上的索引。否则 TaskState 内部自相矛盾：
+        // artifacts 里已无此产物，而 nodes[].artifactIds 仍指向它，
+        // 下游按 node.artifactIds 取产物时会拿到不存在的 id（解析出 undefined 或静默丢内容），
+        // 且投影器自身不报错——不一致被无声交付出口。
+        // 该失效事件不含 node_id，因此只能全量扫描（Phase 1 规模下无性能顾虑）。
+        for (const node of Object.values(state.nodes)) {
+          node.artifactIds = node.artifactIds.filter((id) => id !== artifactId);
+        }
         break;
       }
 
@@ -1660,7 +1668,7 @@ export function project(events: KernelEvent[]): TaskState {
 - [ ] **Step 4: 运行测试，确认通过**
 
 Run: `npx vitest run src/kernel/projector.test.ts`
-Expected: 10 个测试 PASS
+Expected: 11 个测试 PASS
 
 - [ ] **Step 5: 提交**
 
