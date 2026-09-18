@@ -218,8 +218,20 @@ function resolvePath(root: unknown, path: string[]): unknown {
   let current: unknown = root;
   for (const seg of path) {
     if (Array.isArray(current)) {
-      current = current.map((item) => {
-        if (!isPlainObject(item)) return undefined;
+      // 数组跳跃时「元素不是对象」或「元素缺少该字段」必须抛错，而不是映射成 undefined。
+      // 若静默映射为 undefined，在 all(...) 里后果与抛错相同（边不匹配），
+      // 但在 any(...) / count(...) == 0 / not 这些形态下会翻到「放行」一侧，可能让工作流在本不该走时走。
+      current = current.map((item, index) => {
+        if (!isPlainObject(item)) {
+          throw new ExpressionError(
+            `路径 "${path.join('.')}" 在数组第 ${index} 个元素处无法继续取值（元素不是对象）`,
+          );
+        }
+        if (!(seg in item)) {
+          throw new ExpressionError(
+            `路径 "${path.join('.')}" 在数组第 ${index} 个元素处缺少字段 "${seg}"`,
+          );
+        }
         return item[seg];
       });
       continue;
@@ -290,6 +302,14 @@ function evalValue(ast: Ast, facts: Facts): unknown {
       const l = evalValue(ast.l, facts);
       const r = evalValue(ast.r, facts);
       return compare(ast.op, l, r);
+    }
+
+    default: {
+      // 穷尽性守卫：不是为了兜底，而是为了让「新增 Ast 变体却漏处理」变成编译错误。
+      // tsconfig 没有 noImplicitReturns，且 evalValue 返回 unknown，
+      // 若不加这个守卫，漏掉 case 会静默返回 undefined 而 tsc 不报错。
+      const exhaustive: never = ast;
+      throw new Error(`未处理的 Ast 变体：${JSON.stringify(exhaustive)}`);
     }
   }
 }

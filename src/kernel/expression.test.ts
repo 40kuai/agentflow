@@ -58,6 +58,28 @@ describe('evaluateExpression', () => {
     expect(evaluateExpression("all(deps(wp).status == 'merged')", facts)).toBe(true);
   });
 
+  it('数组元素的字段缺失时抛错，而不是静默变成 undefined', () => {
+    // 这条护栏防的是一类危险情形：若把缺失字段静默映射为 undefined，
+    // 在 any() / count(...) == 0 / not 这些形态下会翻到「放行」一侧，
+    // 即工作流边可能在本不该走时走。
+    const f: Facts = {
+      wp: { id: 'wp1' },
+      __functions: {
+        deps: () => [{ id: 'wp0' /* 故意不含 status */ }, { id: 'wpX', status: 'merged' }],
+      },
+    };
+    expect(() => evaluateExpression("all(deps(wp).status == 'merged')", f)).toThrow(ExpressionError);
+    expect(() => evaluateExpression("deps(wp).status == 'merged'", f)).toThrow(ExpressionError);
+  });
+
+  it('数组元素字段齐全时正常逐元素比较', () => {
+    const f: Facts = {
+      wp: { id: 'wp1' },
+      __functions: { deps: () => [{ id: 'wp0', status: 'merged' }] },
+    };
+    expect(evaluateExpression("all(deps(wp).status == 'merged')", f)).toBe(true);
+  });
+
   it('and / or 优先级与括号', () => {
     expect(evaluateExpression("tests.failed == 0 and run.attempt < 3", facts)).toBe(true);
     expect(evaluateExpression("tests.failed > 0 or run.attempt < 3", facts)).toBe(true);
@@ -89,5 +111,17 @@ describe('evaluateExpression', () => {
   it('拒绝任意 JS 求值（安全性）', () => {
     expect(() => evaluateExpression('process.exit(1)', facts)).toThrow(ExpressionError);
     expect(() => evaluateExpression("require('fs')", facts)).toThrow(ExpressionError);
+  });
+
+  it('白名单外的函数名在解析期就被拒（与是否注册在 __functions 无关）', () => {
+    // customFn 已存在于注册表中，却仍不许出现在表达式里：
+    // 证明拒绝来自解析期的白名单，而不是求值期的注册表查空。
+    const f: Facts = {
+      __functions: { customFn: () => true, deps: () => [] },
+    };
+    expect(() => evaluateExpression('customFn(1)', f)).toThrow(/不允许调用函数/);
+    expect(() => evaluateExpression('process.exit(1)', f)).toThrow(/不允许调用函数/);
+    // 与「白名单内但未注册」的错误文案可区分
+    expect(() => evaluateExpression('deps(wp)', { wp: {} })).toThrow(/未注册的函数/);
   });
 });
