@@ -1,0 +1,35 @@
+# 依赖
+node_modules/
+.pnpm-store/
+
+# 构建产物
+dist/
+build/
+*.tsbuildinfo
+vite.config.ts.timestamp-*
+
+# 运行数据（事件库、工作区、日志）
+data/
+workspaces/
+logs/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# 环境与密钥
+.env
+.env.local
+.env.*.local
+
+# 编辑器与系统
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# 缓存
+.cache/
+.turbo/
+*.log
+npm-debug.log*
