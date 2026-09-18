@@ -605,16 +605,32 @@ type RunnerEvent =
 - 无 `structuredOutput` → 用 prompt 强约束 + JSON 提取容错 + zod 校验失败即重试一次
 - 无 `budgetCap` → 由内核的 `budget` 模块记账，超限时主动 `cancel`
 
-> **实测修正（2026-09-18，Phase 0 探针）**：`--json-schema` 在 agentic 场景下会让 claude CLI **永不退出** ——
-> 实测空转 13 分钟、产生 16,403 次 `You MUST call the StructuredOutput tool` 重试、CPU 占用 45%~50%，进程不返回。
-> 因此 **Phase 1 默认不传 `--json-schema`**，产物格式改由「prompt 强约束 + 解析层 JSON 提取 + zod 校验 + 一次重试」保证。
-> 相关连带结论：
+> **实测修正（2026-09-18，两轮实测，结论已反转一次，以本条为准）**
+>
+> 第一轮探针（**凭据耗尽期，所有请求 403**）观测到：`--json-schema` 会让 claude CLI **永不退出**（空转 13 分钟、
+> 16,403 次 `You MUST call the StructuredOutput tool` 重试、CPU 45%~50%）。当时据此裁定「Phase 1 默认不传」。
+>
+> 第二轮补跑（**凭据恢复后，请求正常**）推翻了该裁定：
+> - **不传** `--json-schema`：rc=0，但模型把 JSON 包进 ```` ```json ```` 代码块 → `JSON.parse` 失败 → **零 artifact**（实测 29.3s / $0.1159）
+> - **传** `--json-schema`：rc=0、正常退出（实测 7.0s / 15.9s），`result.structured_output` 是 **CLI 校验过的对象**（$0.0507）
+> - 即「永不退出」**不是该参数本身的 bug**，而是**请求持续失败**时 stop hook 反复注入重试导致的空转。凭据正常时不复现
+>
+> **因此 Phase 1 的最终行为是：默认传 `--json-schema`**，且解析层**两条通道都读、`structured_output` 优先、`result` 内的 JSON 字符串兜底**
+> （只读 `structured_output` 会让未开启该参数的调用静默不产出；只读 `result` 会让开启后的调用静默不产出）。
+>
+> **超时必须保留**：「永不退出」那条路径依然真实存在，只是触发条件从「参数」变为「请求持续失败」。
+> 且必须**按进程组 kill** —— 只杀直接子进程会留下继承 stdout 管道写端的孙进程，导致 `close` 永不触发、保护自身挂死。
+>
+> 连带结论（两轮均成立）：
 > 1. **失败判定必须用 `is_error`，不能用 `subtype`** —— 认证失败时 `subtype` 仍为 `"success"`；
 > 2. **解析层不得做字段白名单** —— 真实事件字段远多于文档样本；
-> 3. **`wallTimeMs` 必须被强制实施（超时即 kill）** —— 否则存在永久挂起路径；
+> 3. **`wallTimeMs` 必须被强制实施（超时即 kill 进程组）**；
 > 4. `-p` 搭配 `--output-format stream-json` 必须同时给 `--verbose`，否则无输出。
 >
-> 证据与可复现命令见 `spikes/cli-probe/README.md`。
+> 证据、可复现命令与两轮对照实测表见 `spikes/cli-probe/README.md`；真实成功样本已归档为 `tests/fixtures/claude-stream-structured-sample.jsonl`。
+>
+> **这条反转留一个方法论教训**：第一轮的观测环境是「所有请求都失败」，因此**无法区分**「参数本身有问题」与「参数与失败的请求路径交互不良」。
+> 单环境实测不足以支撑「禁用某能力」这类结论。
 
 > **另一条实测局限**：`--tools` / `--allowed-tools` **不约束 MCP 工具**，因此 11.3「角色权限即沙箱参数」的保证弱于本文档原意；
 > 另本机 claude 走第三方代理且所有模型映射为同一模型，11.4 的「交叉引擎评审」在本机可能退化为同模型互评。
