@@ -2387,7 +2387,8 @@ type Decision =
 3. 若无当前节点且无已完成节点 → `start` 工作流的 `start` 节点
 4. 否则取**最后完成的节点**，按声明顺序遍历其出边，第一条 `when` 为真（或 `when` 为空）的边胜出 → `start` 目标节点
 5. 若某条边的 `when` 求值抛错 → 该边视为不匹配，但错误原因要记录进结果（通过 `wait` 的 reason 暴露）。**任何一条边都不匹配 → `end` 且 `status: 'failed'`**
-6. 目标节点若已在 `completedNodeIds` 中且 `visitCounts >= 3` → `end` 且 `failed`，理由是死循环保护
+6. 目标节点若 `visitCounts >= 3` → `end` 且 `failed`，理由是死循环保护。
+   **刻意不要求「该节点曾成功完成」**：判据是「被反复进入」这件事本身，否则在反复失败重试场景下保护会失效（spec §9.4：`node.visit_count` 检测同状态反复进入 → 升级）
 
 - [ ] **Step 1: 写失败的测试 `src/kernel/state-machine.test.ts`**
 
@@ -2674,6 +2675,9 @@ export function decideNext(input: DecideInput): Decision {
     }
     const visits = state.visitCounts[edge.to] ?? 0;
     if (visits >= MAX_NODE_VISITS) {
+      // 死循环保护：判据是「目标节点被反复进入」这件事本身，
+      // 刻意**不**要求该节点曾经成功完成——否则在「反复失败重试」场景下保护会失效，
+      // 而那正是最该拦住的场景（spec §9.4：visit_count 检测同状态反复进入 → 升级）。
       return {
         kind: 'end',
         status: 'failed',
