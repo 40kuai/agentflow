@@ -1,0 +1,104 @@
+import { z } from 'zod';
+import { zodToJsonSchema } from 'zod-to-json-schema';
+
+export const ARTIFACT_TYPES = [
+  'requirement',
+  'work_package_plan',
+  'code_diff',
+  'test_report',
+] as const;
+
+export const ArtifactTypeSchema = z.enum(ARTIFACT_TYPES);
+export type ArtifactType = z.infer<typeof ArtifactTypeSchema>;
+
+export const ArtifactStatusSchema = z.enum(['ok', 'needs_changes', 'blocked']);
+export type ArtifactStatus = z.infer<typeof ArtifactStatusSchema>;
+
+const RequirementPayload = z.object({
+  problem: z.string().min(1),
+  goals: z.array(z.string().min(1)),
+  non_goals: z.array(z.string()),
+  acceptance_criteria: z.array(z.string().min(1)),
+});
+
+const WorkPackageSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1),
+  owns: z.array(z.string().min(1)),
+  reads: z.array(z.string()),
+  depends_on: z.array(z.string()),
+  /** 接口契约：键为接口签名，值为行为描述。冻结后不可变 */
+  interface_contract: z.record(z.string()),
+  acceptance_refs: z.array(z.string()),
+});
+
+const WorkPackagePlanPayload = z.object({
+  packages: z.array(WorkPackageSchema).min(1),
+});
+
+const CodeDiffPayload = z.object({
+  wp_id: z.string().min(1),
+  branch: z.string().min(1),
+  files_changed: z.array(z.string()),
+  insertions: z.number().int().nonnegative(),
+  deletions: z.number().int().nonnegative(),
+  self_test_result: z.enum(['passed', 'failed', 'not_run']),
+  notes: z.string(),
+});
+
+const TestReportPayload = z.object({
+  wp_id: z.string().min(1),
+  suites: z.array(z.string()),
+  passed: z.number().int().nonnegative(),
+  failed: z.number().int().nonnegative(),
+  failures: z.array(z.object({ test: z.string(), reason: z.string() })),
+});
+
+/** 本阶段实现的 4 种 Artifact 载荷 schema */
+export const ARTIFACT_PAYLOAD_SCHEMAS = {
+  requirement: RequirementPayload,
+  work_package_plan: WorkPackagePlanPayload,
+  code_diff: CodeDiffPayload,
+  test_report: TestReportPayload,
+} satisfies Record<ArtifactType, z.ZodTypeAny>;
+
+export const ArtifactRefSchema = z.object({
+  kind: z.enum(['file', 'commit', 'artifact']),
+  uri: z.string().min(1),
+});
+export type ArtifactRef = z.infer<typeof ArtifactRefSchema>;
+
+export const ArtifactSchema = z.object({
+  artifact_id: z.string().min(1),
+  task_id: z.string().min(1),
+  run_id: z.string().min(1),
+  type: ArtifactTypeSchema,
+  status: ArtifactStatusSchema,
+  schema_version: z.number().int().positive(),
+  payload: z.unknown(),
+  refs: z.array(ArtifactRefSchema),
+  /** 唯一会进入下游 prompt 的部分，控制在 500 token 内 */
+  summary: z.string().max(4000),
+  created_at: z.number().int(),
+});
+export type Artifact = z.infer<typeof ArtifactSchema>;
+
+export const ARTIFACT_SCHEMA_VERSION = 1;
+
+/** 校验并解析载荷；失败时抛出带 artifact 类型信息的错误 */
+export function parseArtifactPayload(type: ArtifactType, raw: unknown): unknown {
+  const schema = ARTIFACT_PAYLOAD_SCHEMAS[type];
+  const result = schema.safeParse(raw);
+  if (!result.success) {
+    throw new Error(`Artifact(${type}) 载荷校验失败：${result.error.message}`);
+  }
+  return result.data;
+}
+
+/** 导出 JSON Schema，供 claude --json-schema 使用 */
+export function jsonSchemaForArtifact(type: ArtifactType): object {
+  return zodToJsonSchema(ARTIFACT_PAYLOAD_SCHEMAS[type], {
+    target: 'jsonSchema7',
+    $refStrategy: 'none',
+  }) as object;
+}
