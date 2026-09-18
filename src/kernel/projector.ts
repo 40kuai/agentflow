@@ -178,6 +178,11 @@ export function project(events: KernelEvent[]): TaskState {
       case 'artifact.invalidated': {
         const artifactId = str(p, 'artifact_id');
         state.artifacts = state.artifacts.filter((a) => a.artifact_id !== artifactId);
+        // 同步清理节点上的索引，否则 TaskState 内部自相矛盾：
+        // artifacts 里已无此产物，而 nodes[].artifactIds 仍指向它
+        for (const node of Object.values(state.nodes)) {
+          node.artifactIds = node.artifactIds.filter((id) => id !== artifactId);
+        }
         break;
       }
 

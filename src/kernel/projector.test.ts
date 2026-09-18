@@ -84,6 +84,47 @@ describe('project', () => {
     expect(s.nodes.pm_analyze?.artifactIds).toEqual(['art_1']);
   });
 
+  it('artifact.invalidated 同时清理节点上的 artifactIds，不留悬空 id', () => {
+    const s = project([
+      ev('node.started', { node_id: 'pm_analyze', role_id: 'pm', run_id: 'run_1', attempt: 1 }),
+      ev('artifact.created', {
+        artifact_id: 'art_1',
+        run_id: 'run_1',
+        node_id: 'pm_analyze',
+        type: 'requirement',
+        status: 'ok',
+        summary: 's',
+      }),
+      ev('artifact.invalidated', { artifact_id: 'art_1' }),
+    ]);
+    expect(s.artifacts).toEqual([]);
+    expect(s.nodes.pm_analyze?.artifactIds).toEqual([]);
+
+    // 同一节点上另一个产物不受影响
+    const s2 = project([
+      ev('node.started', { node_id: 'pm_analyze', role_id: 'pm', run_id: 'run_1', attempt: 1 }),
+      ev('artifact.created', {
+        artifact_id: 'art_1',
+        run_id: 'run_1',
+        node_id: 'pm_analyze',
+        type: 'requirement',
+        status: 'ok',
+        summary: 's1',
+      }),
+      ev('artifact.created', {
+        artifact_id: 'art_2',
+        run_id: 'run_1',
+        node_id: 'pm_analyze',
+        type: 'requirement',
+        status: 'ok',
+        summary: 's2',
+      }),
+      ev('artifact.invalidated', { artifact_id: 'art_1' }),
+    ]);
+    expect(s2.artifacts.map((a) => a.artifact_id)).toEqual(['art_2']);
+    expect(s2.nodes.pm_analyze?.artifactIds).toEqual(['art_2']);
+  });
+
   it('transfer.decided 记录转移历史', () => {
     const s = project([
       ev('transfer.decided', {
