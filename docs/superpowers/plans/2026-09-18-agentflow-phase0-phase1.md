@@ -2921,6 +2921,19 @@ describe('FakeRunner', () => {
     expect(first.at(-1)).toEqual({ kind: 'exited', code: 0 });
     expect(second.at(-1)).toEqual({ kind: 'exited', code: 3 });
   });
+
+  it('脚本队列耗尽时抛错，而不是静默返回成功', async () => {
+    // 防的是一类测试假绿：脚本份数少于 run 次数时，
+    // 若兜底返回成功，测试编排错误会被伪装成「测试通过」。
+    // 注意先消费掉唯一那份脚本，这样测的才是「队列耗尽」而不是「创建时队列为空」。
+    const runner = createFakeRunner({ script: [{ kind: 'exited', code: 0 }] });
+
+    // 第一次正常消费
+    await collect(runner.run(req));
+
+    // 第二次没有脚本了，必须响亮失败
+    await expect(collect(runner.run(req))).rejects.toThrow(/脚本队列已耗尽/);
+  });
 });
 ```
 
@@ -2934,12 +2947,10 @@ Expected: FAIL —— 找不到模块 `./fake-runner.js`
 ```ts
 import type { AgentRunner, RunRequest, RunnerEvent } from './types.js';
 
-/** 脚本项：runner 不产生 started（由实现自动补），其余按顺序回放 */
-export type FakeScriptItem =
-  | { kind: 'log'; chunk: string }
-  | { kind: 'usage'; tokensIn: number; tokensOut: number; costUsd: number }
-  | { kind: 'artifact'; raw: unknown }
-  | { kind: 'exited'; code: number | null };
+/** 脚本项：runner 不产生 started（由实现自动补），其余按顺序回放。
+ *  刻意从 RunnerEvent 派生而非手写联合：这样 RunnerEvent 字段漂移时会在编译期报错，
+ *  而不是被一个 `as RunnerEvent` 断言悄悄绕过去。 */
+export type FakeScriptItem = Exclude<RunnerEvent, { kind: 'started' }>;
 
 export type FakeRunnerOptions = {
   /** 单次 run 的脚本 */
@@ -2995,7 +3006,7 @@ export function createFakeRunner(options: FakeRunnerOptions): FakeRunner {
 - [ ] **Step 5: 运行测试，确认通过**
 
 Run: `npx vitest run src/runner/fake-runner.test.ts`
-Expected: 5 个测试 PASS
+Expected: 6 个测试 PASS
 
 - [ ] **Step 6: 提交**
 
