@@ -687,7 +687,7 @@ describe('Artifact payload schema', () => {
     expect(r.success).toBe(false);
   });
 
-  it('work_package_plan 要求每个工作包必须有 owns 与 interface_contract', () => {
+  it('work_package_plan 缺少 interface_contract 或 acceptance_refs 时拒绝', () => {
     const bad = ARTIFACT_PAYLOAD_SCHEMAS.work_package_plan.safeParse({
       packages: [{ id: 'wp1', name: '后端接口', owns: [], reads: [], depends_on: [] }],
     });
@@ -707,6 +707,42 @@ describe('Artifact payload schema', () => {
       ],
     });
     expect(good.success).toBe(true);
+  });
+
+  it('工作包缺少 owns 键时拒绝', () => {
+    // 单独隔离 owns 的必填性：其余字段全部合法，只缺 owns
+    const r = ARTIFACT_PAYLOAD_SCHEMAS.work_package_plan.safeParse({
+      packages: [
+        {
+          id: 'wp1',
+          name: '无写入范围',
+          reads: ['docs/**'],
+          depends_on: [],
+          interface_contract: {},
+          acceptance_refs: [],
+        },
+      ],
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it('owns: [] 合法——代表该工作包没有写入范围（只读），这是有意为之', () => {
+    // 这条用例用测试固定住「空 owns = 只读」的语义，
+    // 防止将来有人误给 owns 加上 .min(1)（那会让「只读」无法在 schema 层表达）
+    const r = ARTIFACT_PAYLOAD_SCHEMAS.work_package_plan.safeParse({
+      packages: [
+        {
+          id: 'wp1',
+          name: '只读工作包',
+          owns: [],
+          reads: ['docs/**'],
+          depends_on: [],
+          interface_contract: {},
+          acceptance_refs: [],
+        },
+      ],
+    });
+    expect(r.success).toBe(true);
   });
 
   it('jsonSchemaForArtifact 产出可序列化的 JSON Schema 且顶层为 object', () => {
@@ -840,7 +876,7 @@ npm install zod-to-json-schema --registry=https://registry.npmmirror.com
 - [ ] **Step 7: 运行测试，确认通过**
 
 Run: `npx vitest run src/shared/artifacts.test.ts`
-Expected: 4 个测试 PASS
+Expected: 6 个测试 PASS
 
 - [ ] **Step 8: 写失败的测试 `src/shared/events.test.ts`**
 
