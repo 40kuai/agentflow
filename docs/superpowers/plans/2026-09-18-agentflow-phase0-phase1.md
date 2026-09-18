@@ -3137,7 +3137,21 @@ git commit -m "feat: 新增上下文装配器，超限时整体丢弃而非截�
 - Consumes: `AgentRunner` / `RunRequest` / `RunnerEvent`（Task 8）；`parseArtifactPayload`（Task 3）；**Task 2 探针 README 中记录的字段路径**
 - Produces: `createClaudeCodeRunner(options): AgentRunner`，`options = { binPath: string; logDir: string; extraArgs?: string[] }`
 
-**前置条件（硬性）**：必须先完成 Task 2。本任务的所有字段路径都必须来自 `spikes/cli-probe/README.md` 的"对 Task 10 的结论"，**不允许猜测**。
+**前置条件（硬性，来自 Task 2 的实测结论）**：必须先完成 Task 2。本任务的所有字段路径与调用参数都必须来自 `spikes/cli-probe/README.md` 的「对 Task 10 的结论」与其中的 **gate**，**不允许猜测**。
+
+Task 2 用真实 CLI 实测（含 16,403 次重试的可复核证据）推翻了本计划原先的 4 个假设，实现时必须照下面的**修正后**设计做，不要照抄本节早先的写法：
+
+| 原假设 | 实测结论 | 本任务必须怎么做 |
+| --- | --- | --- |
+| 用 `--json-schema` 在 CLI 层强制产物格式 | **该参数会让 CLI 永不退出**（空转 13 分钟、16,403 次 `You MUST call the StructuredOutput tool`、CPU 45%~50%） | **默认不传 `--json-schema`**。产物格式靠 prompt 强约束 + JSON 提取 + zod 校验 + 一次重试兜底 |
+| 用 `subtype == 'success'` 判成功 | 认证失败时 `subtype` 仍为 `"success"`，而 `is_error` 为 `true`、exit=1 | **只用 `is_error` 判定失败**，绝不看 `subtype` |
+| 事件字段可用白名单校验 | 真实事件字段远多于样本（`duration_ms` / `duration_api_ms` / `num_turns` / `stop_reason` / `modelUsage` / `permission_denials` / `uuid`） | 解析层**不做字段白名单**，只取自己需要的字段 |
+| `RunRequest.wallTimeMs` 是提示性字段 | 存在永不退出的路径 | **必须实现硬性 wall-clock 超时并 kill 子进程**，否则任务会永久挂起 |
+| 成功路径的样本可从 `spikes/cli-probe/out/` 取 | 该目录确认为空（claude 额度耗尽，成功路径未跑通） | fixture 改从 `spikes/cli-probe/README.md` **内联的 5 行原始 JSONL** 提取（那是已归档的真实输出） |
+
+另外两条已实测确认、实现时直接采信的事实：
+- `-p` 搭配 `--output-format stream-json` **必须同时给 `--verbose`**，否则没有输出
+- 解析必须对 `result` 是「JSON 字符串」和「对象」两种形态都容错
 
 **可测性设计**：解析逻辑与进程管理分离。`parseStreamLine(line)` 是纯函数，可脱离真实 CLI 单测；`createClaudeCodeRunner` 只负责 spawn 与把 stdout 行喂给解析函数。
 
@@ -3147,8 +3161,14 @@ git commit -m "feat: 新增上下文装配器，超限时整体丢弃而非截�
 import { describe, expect, it } from 'vitest';
 import { parseStreamLine } from './claude-code-runner.js';
 
-// 注意：下面每条样本都必须来自 spikes/cli-probe/out/claude-stream.jsonl 的真实输出。
-// 若真实字段与样本不符，以探针结果为准修正本测试与实现——不要修改样本去迁就实现。
+// 注意：下面的样本是**人工构造的**，用于覆盖成功路径（result 为合法 JSON 字符串）。
+// 原因：Task 2 因 claude 额度耗尽，成功路径从未跑通，因此没有成功样本可归档。
+// 真实归档样本（认证失败路径）由 Step 6 的 fixture 契约回归覆盖。
+// 构造样本里的字段名必须与 Task 2 实测结论一致：
+//   - 失败判定用 is_error，不用 subtype
+//   - usage 在 result 事件内，字段为 input_tokens / output_tokens
+//   - 成本字段为 result.total_cost_usd
+// 一旦额度恢复并补录到成功样本，应把本文件的入口测试替换为真实样本。
 const SAMPLE_RESULT = JSON.stringify({
   type: 'result',
   subtype: 'success',
@@ -3157,6 +3177,10 @@ const SAMPLE_RESULT = JSON.stringify({
   usage: { input_tokens: 1200, output_tokens: 300 },
   total_cost_usd: 0.0231,
   is_error: false,
+  // 真实事件还有 duration_ms / num_turns / stop_reason / modelUsage 等字段；
+  // 解析层不得对其做白名单校验，这里故意不放全，以验证「未知字段被容忍」
+  duration_ms: 23,
+  num_turns: 2,
 });
 
 describe('parseStreamLine', () => {
@@ -3237,7 +3261,11 @@ Expected: FAIL —— 找不到模块 `./claude-code-runner.js`
 mkdir -p tests/fixtures
 ```
 
-把 `spikes/cli-probe/out/claude-stream.jsonl` 中**真实的 result 行**复制到 `tests/fixtures/claude-stream-sample.jsonl`。**不要手工编造**——这份 fixture 是后续契约回归测试的基线。
+**样本来源已变更**：原计划要求从 `spikes/cli-probe/out/claude-stream.jsonl` 取，但 Task 2 确认该目录为空（claude 额度耗尽，成功路径未跑通）。
+
+改从 `spikes/cli-probe/README.md` 中**内联的 5 行原始 JSONL** 提取——那是已归档的真实输出，已被复审逐行 `JSON.parse` 并核对过键集合。把其中的 `result` 行写入 `tests/fixtures/claude-stream-sample.jsonl`。**不要手工编造**——这份 fixture 是契约回归测试的基线。
+
+写完后先确认它至少包含这些真实字段（缺任何一个都说明你抄错了行）：`type: "result"`、`subtype`、`is_error`、`usage.input_tokens`、`usage.output_tokens`、`total_cost_usd`、`session_id`。
 
 - [ ] **Step 4: 实现 `src/runner/claude-code-runner.ts`**
 
@@ -3311,14 +3339,21 @@ export type ClaudeCodeRunnerOptions = {
   logDir: string;
   /** 追加的额外参数，用于探针阶段调试 */
   extraArgs?: string[];
+  /**
+   * 是否启用 CLI 层的结构化输出强制（--json-schema）。
+   * 默认 false —— Task 2 实测该参数会让 CLI 永不退出（16,403 次重试空转）。
+   * 仅在未来 CLI 修好该 bug、且已补跑验证后才可开启。
+   */
+  useJsonSchema?: boolean;
 };
 
 /** 根据角色权限和产出要求拼装 claude 命令行参数 */
-export function buildArgs(req: RunRequest): string[] {
+export function buildArgs(req: RunRequest, useJsonSchema = false): string[] {
   const args = [
     '-p', req.prompt,
     '--output-format', 'stream-json',
     '--include-partial-messages',
+    // 实测：-p 搭配 stream-json 必须同时给 --verbose，否则没有输出
     '--verbose',
     '--model', req.model,
   ];
@@ -3326,7 +3361,9 @@ export function buildArgs(req: RunRequest): string[] {
   if (req.systemPrompt) {
     args.push('--system-prompt', req.systemPrompt);
   }
-  if (req.outputSchema) {
+  // 默认不传 --json-schema：实测会让进程永不退出。
+  // 产物格式改由 prompt 约束 + 解析层 JSON 提取 + zod 校验兜底。
+  if (useJsonSchema && req.outputSchema) {
     args.push('--json-schema', JSON.stringify(req.outputSchema));
   }
   if (req.readOnly) {
@@ -3357,7 +3394,7 @@ export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentR
     },
 
     async *run(req: RunRequest): AsyncIterable<RunnerEvent> {
-      const args = [...buildArgs(req), ...(options.extraArgs ?? [])];
+      const args = [...buildArgs(req, options.useJsonSchema ?? false), ...(options.extraArgs ?? [])];
       const logPath = join(options.logDir, `${req.runId}.jsonl`);
       const logStream = createWriteStream(logPath, { flags: 'a' });
 
@@ -3367,6 +3404,18 @@ export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentR
         env: { ...process.env },
       });
       running.set(req.runId, child);
+
+      // 硬性 wall-clock 超时保护。
+      // Task 2 实测存在「CLI 永不退出」的路径（--json-schema 挂起 13 分钟），
+      // 没有这层保护，任务会永久卡住且后续节点永不执行。
+      let timedOut = false;
+      const timeoutTimer = setTimeout(() => {
+        timedOut = true;
+        logStream.write(
+          JSON.stringify({ ts: Date.now(), kind: 'timeout', wallTimeMs: req.wallTimeMs }) + '\n',
+        );
+        child.kill('SIGKILL');
+      }, req.wallTimeMs);
 
       logStream.write(`${JSON.stringify({ ts: Date.now(), kind: 'spawn', args, cwd: req.workdir })}\n`);
       yield { kind: 'started', pid: child.pid ?? -1 };
@@ -3400,16 +3449,25 @@ export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentR
       });
 
       child.on('close', (code) => {
+        clearTimeout(timeoutTimer);
         if (buffered.trim() !== '') {
           for (const e of parseStreamLine(buffered)) push(e);
         }
+        if (timedOut) {
+          push({
+            kind: 'log',
+            chunk: `调用超过 wall-clock 上限 ${req.wallTimeMs}ms，已被强制终止`,
+          });
+        }
         closed = true;
-        push({ kind: 'exited', code });
+        // 被 SIGKILL 终止时 code 为 null，统一归一为 -1，避免上层把 null 当成功
+        push({ kind: 'exited', code: timedOut ? -1 : code });
         logStream.end();
         running.delete(req.runId);
       });
 
       child.on('error', (error) => {
+        clearTimeout(timeoutTimer);
         push({ kind: 'log', chunk: `进程启动失败：${error.message}` });
         closed = true;
         push({ kind: 'exited', code: -1 });
@@ -3446,12 +3504,126 @@ export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentR
 }
 ```
 
-- [ ] **Step 5: 运行测试与类型检查**
+- [ ] **Step 5: 补两条针对实测缺陷的回归测试**
+
+这两条测试是 Task 2 最有价值产出的直接防护：一条防止有人把 `--json-schema` 加回来，一条防止 wall-clock 超时被删掉。
+
+先写 `src/runner/claude-code-runner.args.test.ts`：
+
+```ts
+import { describe, expect, it } from 'vitest';
+import { buildArgs } from './claude-code-runner.js';
+import type { RunRequest } from './types.js';
+
+const base: RunRequest = {
+  runId: 'run_1',
+  prompt: '做点事',
+  systemPrompt: '你是后端开发',
+  workdir: '/tmp',
+  model: 'sonnet',
+  artifactType: 'code_diff',
+  readOnly: false,
+  wallTimeMs: 60_000,
+};
+
+describe('buildArgs', () => {
+  it('默认不传 --json-schema（实测该参数会让 CLI 永不退出）', () => {
+    const args = buildArgs({ ...base, outputSchema: { type: 'object' } });
+    expect(args).not.toContain('--json-schema');
+  });
+
+  it('显式开启 useJsonSchema 时才传 --json-schema', () => {
+    const args = buildArgs({ ...base, outputSchema: { type: 'object' } }, true);
+    const idx = args.indexOf('--json-schema');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe(JSON.stringify({ type: 'object' }));
+  });
+
+  it('stream-json 必须同时带 --verbose（实测缺它则无输出）', () => {
+    const args = buildArgs(base);
+    expect(args).toContain('--output-format');
+    expect(args[args.indexOf('--output-format') + 1]).toBe('stream-json');
+    expect(args).toContain('--verbose');
+  });
+
+  it('只读角色不给写权限（permission-mode 为 default，且不开放写工具）', () => {
+    const args = buildArgs({ ...base, readOnly: true });
+    expect(args).toContain('--tools=Read,Grep,Glob');
+    expect(args[args.indexOf('--permission-mode') + 1]).toBe('default');
+    expect(args.join(' ')).not.toContain('Write');
+    expect(args.join(' ')).not.toContain('acceptEdits');
+  });
+
+  it('非只读角色使用 acceptEdits 并开放写工具', () => {
+    const args = buildArgs(base);
+    expect(args[args.indexOf('--permission-mode') + 1]).toBe('acceptEdits');
+    expect(args.join(' ')).toContain('Write');
+  });
+
+  it('budgetCapUsd 映射到 --max-budget-usd', () => {
+    const args = buildArgs({ ...base, budgetCapUsd: 0.5 });
+    expect(args[args.indexOf('--max-budget-usd') + 1]).toBe('0.5');
+  });
+});
+```
+
+再写 `src/runner/claude-code-runner.timeout.test.ts`。用「忽略参数、永远睡下去」的可执行文件模拟实测到的那条永不退出路径：
+
+```ts
+import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { describe, expect, it } from 'vitest';
+import { createClaudeCodeRunner } from './claude-code-runner.js';
+import type { RunRequest, RunnerEvent } from './types.js';
+
+function makeHangingBin(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'agentflow-hang-'));
+  const bin = join(dir, 'fake-claude.sh');
+  // 忽略所有参数，一直睡下去——复现「CLI 永不退出」
+  writeFileSync(bin, '#!/bin/sh\nsleep 60\n');
+  chmodSync(bin, 0o755);
+  return bin;
+}
+
+const req: RunRequest = {
+  runId: 'run_hang',
+  prompt: 'p',
+  systemPrompt: '',
+  workdir: tmpdir(),
+  model: 'sonnet',
+  artifactType: 'code_diff',
+  readOnly: false,
+  wallTimeMs: 300,
+};
+
+describe('claude runner wall-clock 超时保护', () => {
+  it('超过 wallTimeMs 时强制终止，退出码归一为 -1 并留下日志', async () => {
+    const binPath = makeHangingBin();
+    const logDir = mkdtempSync(join(tmpdir(), 'agentflow-hanglog-'));
+    const runner = createClaudeCodeRunner({ binPath, logDir });
+
+    const events: RunnerEvent[] = [];
+    const startedAt = Date.now();
+    for await (const e of runner.run(req)) events.push(e);
+    const elapsed = Date.now() - startedAt;
+
+    // 必须在远小于 sleep 60 的时间内结束
+    expect(elapsed).toBeLessThan(5_000);
+    expect(events.at(-1)).toEqual({ kind: 'exited', code: -1 });
+    expect(
+      events.some((e) => e.kind === 'log' && e.chunk.includes('wall-clock')),
+    ).toBe(true);
+  }, 10_000);
+});
+```
+
+- [ ] **Step 6: 运行测试与类型检查**
 
 Run: `npx vitest run src/runner && npx tsc --noEmit`
-Expected: 全部 PASS，无类型错误
+Expected: 全部 PASS，无类型错误。超时用例应在约 300ms 内结束，而不是等满 60 秒——**若它跑满 60 秒才结束，说明 kill 逻辑没生效，必须修实现**。
 
-- [ ] **Step 6: 用 fixture 做一次契约回归**
+- [ ] **Step 7: 用 fixture 做一次契约回归**
 
 新增 `src/runner/claude-code-runner.fixture.test.ts`：
 
@@ -3462,7 +3634,7 @@ import { describe, expect, it } from 'vitest';
 import { parseStreamLine } from './claude-code-runner.js';
 
 describe('claude stream-json 契约回归', () => {
-  it('真实样本的每一行都能被解析，且至少产出一个 artifact', () => {
+  it('真实归档样本的每一行都能被解析，且 result 行的处理与 is_error 一致', () => {
     const raw = readFileSync(
       resolve(import.meta.dirname, '../../tests/fixtures/claude-stream-sample.jsonl'),
       'utf8',
@@ -3470,22 +3642,43 @@ describe('claude stream-json 契约回归', () => {
     const lines = raw.split('\n').filter((l) => l.trim() !== '');
     expect(lines.length).toBeGreaterThan(0);
 
-    let sawArtifact = false;
+    // 每一行都必须能被解析且不抛错（解析层不做字段白名单，未知字段一律容忍）
     let sawUsage = false;
+    const kinds: string[] = [];
     for (const line of lines) {
       for (const e of parseStreamLine(line)) {
-        if (e.kind === 'artifact') sawArtifact = true;
+        kinds.push(e.kind);
         if (e.kind === 'usage') sawUsage = true;
       }
     }
-    expect(sawArtifact).toBe(true);
+
     expect(sawUsage).toBe(true);
+
+    // 归档样本是 claude 额度耗尽时的认证失败 result（is_error: true）。
+    // 期望值从样本自身推导，而不是写死——这样将来补录到成功样本时本测试依然正确。
+    const resultLine = lines.find((l) => {
+      try {
+        return (JSON.parse(l) as { type?: unknown }).type === 'result';
+      } catch {
+        return false;
+      }
+    });
+    expect(resultLine).toBeDefined();
+
+    const resultObj = JSON.parse(resultLine!) as { is_error?: unknown };
+
+    if (resultObj.is_error === true) {
+      expect(kinds).not.toContain('artifact');
+      expect(kinds).toContain('log');
+    } else {
+      expect(kinds).toContain('artifact');
+    }
   });
 });
 ```
 
 Run: `npx vitest run src/runner/claude-code-runner.fixture.test.ts`
-Expected: PASS。**若失败，说明实现与真实 CLI 输出不符——修实现，不要改 fixture。**
+Expected: PASS。**若失败，说明实现与真实归档输出不符——修实现，不要改 fixture。**
 
 - [ ] **Step 7: 提交**
 

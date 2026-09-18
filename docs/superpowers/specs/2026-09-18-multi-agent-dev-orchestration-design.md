@@ -605,6 +605,20 @@ type RunnerEvent =
 - 无 `structuredOutput` → 用 prompt 强约束 + JSON 提取容错 + zod 校验失败即重试一次
 - 无 `budgetCap` → 由内核的 `budget` 模块记账，超限时主动 `cancel`
 
+> **实测修正（2026-09-18，Phase 0 探针）**：`--json-schema` 在 agentic 场景下会让 claude CLI **永不退出** ——
+> 实测空转 13 分钟、产生 16,403 次 `You MUST call the StructuredOutput tool` 重试、CPU 占用 45%~50%，进程不返回。
+> 因此 **Phase 1 默认不传 `--json-schema`**，产物格式改由「prompt 强约束 + 解析层 JSON 提取 + zod 校验 + 一次重试」保证。
+> 相关连带结论：
+> 1. **失败判定必须用 `is_error`，不能用 `subtype`** —— 认证失败时 `subtype` 仍为 `"success"`；
+> 2. **解析层不得做字段白名单** —— 真实事件字段远多于文档样本；
+> 3. **`wallTimeMs` 必须被强制实施（超时即 kill）** —— 否则存在永久挂起路径；
+> 4. `-p` 搭配 `--output-format stream-json` 必须同时给 `--verbose`，否则无输出。
+>
+> 证据与可复现命令见 `spikes/cli-probe/README.md`。
+
+> **另一条实测局限**：`--tools` / `--allowed-tools` **不约束 MCP 工具**，因此 11.3「角色权限即沙箱参数」的保证弱于本文档原意；
+> 另本机 claude 走第三方代理且所有模型映射为同一模型，11.4 的「交叉引擎评审」在本机可能退化为同模型互评。
+
 ### 11.3 角色权限即沙箱参数
 
 **安全由 CLI 强制，不靠提示词自觉。**
