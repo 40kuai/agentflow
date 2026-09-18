@@ -190,4 +190,43 @@ describe('decideNext', () => {
     const d = decideNext({ workflow: wf, state, facts });
     expect(d.kind).toBe('end');
   });
+
+  it('目标节点反复进入但从未成功完成时，同样判定为死循环', () => {
+    // 这条用例钉住的是「死循环保护的判据是反复进入本身，而非完成过再进入」。
+    // 若将来有人给保护加上「且已在 completedNodeIds 中」这个条件，
+    // 本用例会变红——那正是我们要防止的退化：
+    // 在「反复失败重试」场景下，该条件会让保护失效，而那是 SSD 最该拦住的场景。
+    //
+    // 注意：必须先用另一个节点完成，让 pm_analyze 成为「即将启动的目标节点」——
+    // 若没有任何节点完成过，decideNext 会按规则 3 回到 start 节点，根本走不到死循环保护。
+    const retryWorkflow: WorkflowDef = {
+      ...workflow,
+      edges: [{ from: 'dev_implement', to: 'pm_analyze', when: 'true' }],
+    };
+
+    const events: KernelEvent[] = [ev('task.created', {}, 1)];
+    let seq = 2;
+    // pm_analyze 被反复进入 3 次，每次都是 started 后 failed（从未 succeeded，因此不进 completedNodeIds）
+    for (let i = 0; i < 3; i += 1) {
+      events.push(ev('node.started', { node_id: 'pm_analyze', role_id: 'pm', run_id: `run_${i}`, attempt: i + 1 }, seq++));
+      events.push(ev('node.failed', { node_id: 'pm_analyze', run_id: `run_${i}`, error: '模拟失败' }, seq++));
+    }
+    // 另一个节点完成，使 pm_analyze 成为「即将启动的目标节点」
+    events.push(ev('node.started', { node_id: 'dev_implement', role_id: 'backend_dev', run_id: 'run_dev', attempt: 1 }, seq++));
+    events.push(ev('node.succeeded', { node_id: 'dev_implement', run_id: 'run_dev', log_ref: 'x' }, seq++));
+
+    const state = project(events);
+    // 前提断言：待进入的目标节点 pm_analyze 确实从未完成过（因此不在 completedNodeIds 中）
+    expect(state.completedNodeIds).toEqual(['dev_implement']);
+    expect(state.visitCounts.pm_analyze).toBe(3);
+
+    const facts = buildFacts({ state, workflow: retryWorkflow, roles: new Map() });
+    const d = decideNext({ workflow: retryWorkflow, state, facts });
+
+    expect(d.kind).toBe('end');
+    if (d.kind === 'end') {
+      expect(d.status).toBe('failed');
+      expect(d.reason).toContain('访问次数');
+    }
+  });
 });

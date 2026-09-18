@@ -76,6 +76,9 @@ export function decideNext(input: DecideInput): Decision {
       continue;
     }
     const visits = state.visitCounts[edge.to] ?? 0;
+    // 死循环保护：判据是「目标节点被反复进入」这件事本身，
+    // 刻意**不**要求该节点曾经成功完成——否则在「反复失败重试」场景下保护会失效，
+    // 而那正是最该拦住的场景（spec §9.4：visit_count 检测同状态反复进入 → 升级）。
     if (visits >= MAX_NODE_VISITS) {
       return {
         kind: 'end',
