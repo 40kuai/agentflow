@@ -3117,7 +3117,7 @@ describe('assemblePrompt', () => {
     expect(r.prompt).toContain('让多角色自动流转');
     expect(r.prompt).toContain('code_diff');
     expect(r.prompt).toContain('src/server/**');
-    expect(r.worktreePath).toBe('/tmp/ws');
+    expect(r.prompt).toContain('/tmp/ws');
   });
 
   it('只放输入产物的 summary 与 refs，不放 payload 正文', () => {
@@ -3280,7 +3280,7 @@ function buildPrompt(
   sections.push(['## 工作区', `工作目录：${input.worktreePath}`, '所有文件读写都必须在上述目录内完成。'].join('\n'));
 
   if (artifacts.length > 0) {
-    sections.push(['## 输入材料', ...artifacts.map((a) => renderArtifactBlock(a, true))].join('\n\n'));
+    sections.push(['## 输入材料', ...artifacts.map((a) => renderArtifactBlock(a))].join('\n\n'));
   }
 
   if (dropped.length > 0) {
