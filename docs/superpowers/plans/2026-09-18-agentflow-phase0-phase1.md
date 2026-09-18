@@ -3561,7 +3561,7 @@ export function parseStreamLine(line: string): RunnerEvent[] {
     // 两条产物通道都读，structured_output 优先（2026-09-18 补跑实测：传了 --json-schema 时
     // 结构化对象在 structured_output；result 形状不确定（散文 / ```json 代码块都出现过），故不能只读它）
     const structured = obj['structured_output'];
-    if (structured !== null && typeof structured === 'object') {
+    if (structured !== null && typeof structured === 'object' && !Array.isArray(structured)) {
       events.push({ kind: 'artifact', raw: structured });
       return events;
     }
