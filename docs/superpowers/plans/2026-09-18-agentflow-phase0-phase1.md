@@ -23,6 +23,7 @@
 - 本阶段实现的 Artifact 类型**只有 4 种**：`requirement` / `work_package_plan` / `code_diff` / `test_report`。其余类型在后续阶段补充
 - 本阶段是**单引擎（claude-code）、串行**流程。并行、codex、卡点 G1–G3 均不属于本计划范围
 - **Artifact status 规则（本阶段）**：CLI 退出码为 0 且载荷通过 zod 校验 → 内核写入 `status: 'ok'`；否则节点失败。也就是说 **Phase 1 中 status 恒为 `ok`**，工作流边条件里的 `artifacts.*.status == 'ok'` 实际起的是"确认产物存在且合法"的作用。从载荷内容派生出 `needs_changes` / `blocked` 需要 LLM 判断，留到引入 LLM 决策器的阶段再做
+- **本阶段所有工作流节点的 `isolate` 一律为 `false`**：Phase 1 没有合并能力，若在 worktree 里写代码，worktree 回收后代码即丢失，后续节点看不到改动，闭环就断了。worktree 隔离必须与合并能力一起引入，属于 Phase 2
 
 ## 目录与文件结构
 
@@ -174,9 +175,13 @@ AGENTFLOW_CODEX_BIN=codex
 import { describe, expect, it } from 'vitest';
 import { loadEnv } from './env.js';
 
+// 这些测试必须与真实 .env 隔离：显式传入一个不存在的 env 文件路径，
+// 否则开发者一旦创建了 .env，默认值断言就会失败。
+const NO_ENV_FILE = '/nonexistent/agentflow-test.env';
+
 describe('loadEnv', () => {
   it('未提供环境变量时使用默认值', () => {
-    const env = loadEnv({});
+    const env = loadEnv({}, NO_ENV_FILE);
     expect(env.host).toBe('127.0.0.1');
     expect(env.port).toBe(8787);
     expect(env.maxPromptTokens).toBe(30000);
@@ -185,13 +190,20 @@ describe('loadEnv', () => {
   });
 
   it('环境变量覆盖默认值，且端口被解析为数字', () => {
-    const env = loadEnv({ AGENTFLOW_PORT: '9999', AGENTFLOW_DB_PATH: '/tmp/x.sqlite' });
+    const env = loadEnv(
+      { AGENTFLOW_PORT: '9999', AGENTFLOW_DB_PATH: '/tmp/x.sqlite' },
+      NO_ENV_FILE,
+    );
     expect(env.port).toBe(9999);
     expect(env.dbPath).toBe('/tmp/x.sqlite');
   });
 
   it('端口非法时抛错', () => {
-    expect(() => loadEnv({ AGENTFLOW_PORT: 'abc' })).toThrow(/AGENTFLOW_PORT/);
+    expect(() => loadEnv({ AGENTFLOW_PORT: 'abc' }, NO_ENV_FILE)).toThrow(/AGENTFLOW_PORT/);
+  });
+
+  it('env 文件不存在时静默使用默认值，不抛错', () => {
+    expect(() => loadEnv({}, '/nonexistent/definitely-missing.env')).not.toThrow();
   });
 });
 ```
@@ -268,8 +280,11 @@ function readStr(source: Record<string, string | undefined>, key: string, fallba
 }
 
 /** 合并 .env 文件与显式传入的环境变量（后者优先），产出类型安全的配置 */
-export function loadEnv(overrides: Record<string, string | undefined> = {}): AppEnv {
-  const merged = { ...readDotEnvFile(), ...process.env, ...overrides };
+export function loadEnv(
+  overrides: Record<string, string | undefined> = {},
+  envFilePath = resolve(process.cwd(), '.env'),
+): AppEnv {
+  const merged = { ...readDotEnvFile(envFilePath), ...process.env, ...overrides };
   return {
     dbPath: readStr(merged, 'AGENTFLOW_DB_PATH', DEFAULTS.dbPath),
     logDir: readStr(merged, 'AGENTFLOW_LOG_DIR', DEFAULTS.logDir),
@@ -296,7 +311,7 @@ npm install --registry=https://registry.npmmirror.com
 - [ ] **Step 9: 运行测试与类型检查，确认通过**
 
 Run: `npx vitest run src/config/env.test.ts && npx tsc --noEmit`
-Expected: 3 个测试 PASS，类型检查无错误
+Expected: 4 个测试 PASS，类型检查无错误
 
 - [ ] **Step 10: 提交**
 
@@ -2335,6 +2350,13 @@ describe('decideNext', () => {
   });
 
   it('同一节点访问超过 3 次时判定死循环', () => {
+    // 必须用真正的自环（pm→pm）来触发保护：保护机制检查的是"即将启动的目标节点"
+    // 的访问次数，若目标是 dev 且从未启动过，访问次数为 0，不会被拦住。
+    const loopWorkflow: WorkflowDef = {
+      ...workflow,
+      edges: [{ from: 'pm_analyze', to: 'pm_analyze', when: 'true' }],
+    };
+
     const events: KernelEvent[] = [ev('task.created', {}, 1)];
     let seq = 2;
     for (let i = 0; i < 4; i += 1) {
@@ -2345,12 +2367,33 @@ describe('decideNext', () => {
       }, seq++));
       events.push(ev('node.succeeded', { node_id: 'pm_analyze', run_id: `run_${i}`, log_ref: 'x' }, seq++));
     }
-    const d = decide(events);
+
+    const state = project(events);
+    const facts = buildFacts({ state, workflow: loopWorkflow, roles: new Map() });
+    const d = decideNext({ workflow: loopWorkflow, state, facts });
+
     expect(d.kind).toBe('end');
     if (d.kind === 'end') {
       expect(d.status).toBe('failed');
       expect(d.reason).toContain('访问次数');
     }
+  });
+
+  it('目标节点访问次数未超限时不会误判为死循环', () => {
+    // 自环跑 1 次后继续判定，应当仍允许再次进入（1 < 3），而不是直接判死循环
+    const loopWorkflow: WorkflowDef = {
+      ...workflow,
+      edges: [{ from: 'pm_analyze', to: 'pm_analyze', when: 'true' }],
+    };
+    const events: KernelEvent[] = [
+      ev('task.created', {}, 1),
+      ev('node.started', { node_id: 'pm_analyze', role_id: 'pm', run_id: 'run_0', attempt: 1 }, 2),
+      ev('node.succeeded', { node_id: 'pm_analyze', run_id: 'run_0', log_ref: 'x' }, 3),
+    ];
+    const state = project(events);
+    const facts = buildFacts({ state, workflow: loopWorkflow, roles: new Map() });
+    const d = decideNext({ workflow: loopWorkflow, state, facts });
+    expect(d).toMatchObject({ kind: 'start', nodeId: 'pm_analyze' });
   });
 
   it('条件表达式求值失败时不会崩溃，而是判为不匹配', () => {
@@ -2477,7 +2520,7 @@ export function decideNext(input: DecideInput): Decision {
 - [ ] **Step 4: 运行测试，确认通过**
 
 Run: `npx vitest run src/kernel/state-machine.test.ts`
-Expected: 10 个测试 PASS
+Expected: 11 个测试 PASS
 
 - [ ] **Step 5: 提交**
 
@@ -2869,7 +2912,10 @@ describe('assemblePrompt', () => {
   });
 
   it('超出 token 上限时整体丢弃低优先级产物 summary，并记录 droppedArtifactIds', () => {
-    const big = 'x'.repeat(4000); // 约 1000 token
+    // 每条大摘要 20_000 字符 ≈ 5000 token，上限 1500，base prompt ≈ 250 token。
+    // 必须让"丢掉最后一条后仍然超限"，才能验证出多条被连续丢弃；
+    // 若摘要只有 1000 token，丢掉一条就满足了，断言会与预期不符。
+    const big = 'x'.repeat(20_000);
     const r = assemblePrompt({
       role,
       node,
@@ -2888,18 +2934,21 @@ describe('assemblePrompt', () => {
     expect(r.prompt).toContain('docs/drop1.md');
   });
 
-  it('即使单条摘要就超限，也不会截断内容，而是丢弃它', () => {
+  it('即使单条摘要就超限，也不会截断内容，而是整体丢弃它', () => {
     const huge = 'y'.repeat(20_000);
+    // 上限必须大于"不含任何产物摘要的 base prompt"本身（其中内嵌了 code_diff 的完整 JSON Schema，
+    // 约 300~400 token）。设成 200 会导致断言不可能成立。
+    // 20_000 字符 ≈ 5000 token，远大于 1500，因此必然被丢弃。
     const r = assemblePrompt({
       role,
       node,
       state: baseState([artifact('huge', 'requirement', huge)]),
       worktreePath: '/tmp/ws',
-      maxPromptTokens: 200,
+      maxPromptTokens: 1500,
     });
     expect(r.prompt).not.toContain('yyyy');
     expect(r.droppedArtifactIds).toEqual(['huge']);
-    expect(r.estimatedTokens).toBeLessThanOrEqual(200);
+    expect(r.estimatedTokens).toBeLessThanOrEqual(1500);
   });
 
   it('无输入产物时也能装配出合法 prompt', () => {
@@ -3574,6 +3623,10 @@ max_wall_time_ms: 1800000
 ```yaml
 id: simple_dev
 start: pm_analyze
+# 注意：Phase 1 所有节点 isolate 一律为 false。
+# 原因：本阶段还没有"合并"能力，若 dev 在 worktree 里写代码，跑完 worktree 会被回收，
+# 代码即丢失，随后 qa_verify（在主工作区运行）看不到任何改动，闭环就断了。
+# worktree 隔离必须与合并能力一起引入，属于 Phase 2。
 nodes:
   - id: pm_analyze
     title: 需求分析
@@ -3588,7 +3641,7 @@ nodes:
     consumes:
       - requirement
     produces: code_diff
-    isolate: true
+    isolate: false
 
   - id: qa_verify
     title: 测试验证
@@ -3966,7 +4019,9 @@ git commit -m "feat: 新增角色与工作流配置加载"
 
 - [ ] **Step 1: 实现 `src/kernel/scheduler.ts`**
 
-**关于本步骤不走"先写测试"的说明**：`scheduler.ts` 只是一层 git 命令包装（`git worktree add` / `remove`）加上一条非 git 仓库的退化路径，本身不含业务决策逻辑。它的行为在 Step 2 的 `kernel.test.ts` 中通过完整流转被间接覆盖（测试用的仓库未初始化 git，走的正是退化路径）。因此这里先实现、后由集成测试覆盖；若你希望更严格，可在本步骤前补一个只针对退化路径的单测。
+**关于本步骤不走"先写测试"的说明**：`scheduler.ts` 是一层 git 命令包装（`git worktree add` / `remove`）加上非 git 仓库的退化路径，本身不含业务决策逻辑。
+
+**同时注意一个诚实的事实**：Phase 1 的 `simple_dev.yaml` 里所有节点都是 `isolate: false`（见 Task 11 的说明），所以 `createWorktree` 那条分支**在本阶段的集成测试里不会被走到**。它现在是为 Phase 2 预置的骨架。若你希望它在 Phase 1 就被验证，可在本步骤前补一个专门的单测：在临时目录 `git init` + 一次提交，然后断言 `prepareWorkspace({isolate: true})` 返回 `createdWorktree === true` 且目录存在。
 
 ```ts
 import { execFileSync } from 'node:child_process';
@@ -4833,6 +4888,9 @@ const REQUIREMENT = {
 let closers: Array<() => Promise<void>> = [];
 
 afterEach(async () => {
+  // POST /api/tasks 会异步触发 runTask；等它落地再关服务与事件库，
+  // 否则出现"数据库已关闭"的偶发失败
+  await new Promise((resolve) => setTimeout(resolve, 50));
   for (const close of closers) await close();
   closers = [];
 });
@@ -4861,6 +4919,23 @@ function boot() {
     store.close();
   });
   return { server, kernel };
+}
+
+/**
+ * 通过 HTTP 创建任务并返回 taskId。
+ * 必须走 POST：只有它会在服务层登记 knownTaskIds / taskSummaries，
+ * 直接用 kernel.startTask 建出来的任务，HTTP 读取接口一律返回 404。
+ */
+async function postTask(
+  server: ReturnType<typeof boot>['server'],
+  title = '自动流转',
+): Promise<string> {
+  const res = await server.app.inject({
+    method: 'POST',
+    url: '/api/tasks',
+    payload: { title, requirementRaw: '让角色自动流转' },
+  });
+  return (res.json() as { taskId: string }).taskId;
 }
 
 describe('HTTP API', () => {
@@ -4893,11 +4968,11 @@ describe('HTTP API', () => {
   });
 
   it('GET /api/tasks/:id 返回投影状态', async () => {
-    const { server, kernel } = boot();
-    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    const { server } = boot();
+    const taskId = await postTask(server);
     const res = await server.app.inject({ method: 'GET', url: `/api/tasks/${taskId}` });
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toMatchObject({ taskId, status: 'active' });
+    expect(res.json()).toMatchObject({ taskId });
   });
 
   it('GET 未知任务返回 404', async () => {
@@ -4907,17 +4982,18 @@ describe('HTTP API', () => {
   });
 
   it('GET /api/tasks/:id/events 返回原始事件流', async () => {
-    const { server, kernel } = boot();
-    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    const { server } = boot();
+    const taskId = await postTask(server);
     const res = await server.app.inject({ method: 'GET', url: `/api/tasks/${taskId}/events` });
     expect(res.statusCode).toBe(200);
-    const body = res.json() as { events: unknown[] };
-    expect(body.events.length).toBe(1);
+    const body = res.json() as { events: Array<{ type: string }> };
+    expect(body.events[0]?.type).toBe('task.created');
+    expect(body.events.length).toBeGreaterThan(1);
   });
 
   it('GET /api/tasks 返回任务列表', async () => {
-    const { server, kernel } = boot();
-    kernel.startTask({ title: 'A', requirementRaw: 'r', baseBranch: 'main' });
+    const { server } = boot();
+    await postTask(server, 'A');
     const res = await server.app.inject({ method: 'GET', url: '/api/tasks' });
     expect(res.statusCode).toBe(200);
     const body = res.json() as { tasks: Array<{ title: string }> };
@@ -5368,7 +5444,7 @@ export function openEventSocket(onMessage: (message: unknown) => void): WebSocke
 - [ ] **Step 7: 创建 `web/src/App.tsx`**
 
 ```tsx
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import {
   createTask,
   getTask,
@@ -5419,7 +5495,7 @@ export function App() {
     return () => clearInterval(timer);
   }, [selectedId, refreshDetail]);
 
-  async function handleSubmit(event: React.FormEvent): Promise<void> {
+  async function handleSubmit(event: FormEvent): Promise<void> {
     event.preventDefault();
     if (!title.trim() || !requirement.trim()) return;
     setSubmitting(true);

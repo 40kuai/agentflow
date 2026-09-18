@@ -33,3 +33,6 @@ logs/
 .turbo/
 *.log
 npm-debug.log*
+
+# SDD 流程工作区（ledger / brief / review package 等临时产物）
+.superpowers/
