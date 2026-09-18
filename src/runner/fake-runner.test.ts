@@ -65,4 +65,16 @@ describe('FakeRunner', () => {
     expect(first.at(-1)).toEqual({ kind: 'exited', code: 0 });
     expect(second.at(-1)).toEqual({ kind: 'exited', code: 3 });
   });
+
+  it('脚本队列耗尽时抛错，而不是静默返回成功', async () => {
+    // 防的是一类测试假绿：脚本份数少于 run 次数时，
+    // 若兜底返回成功，测试编排错误会被伪装成「测试通过」。
+    const runner = createFakeRunner({ script: [{ kind: 'exited', code: 0 }] });
+
+    // 第一次正常消费
+    await collect(runner.run(req));
+
+    // 第二次没有脚本了，必须响亮失败
+    await expect(collect(runner.run(req))).rejects.toThrow(/脚本队列已耗尽/);
+  });
 });
