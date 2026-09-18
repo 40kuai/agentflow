@@ -2585,6 +2585,56 @@ describe('decideNext', () => {
     const d = decideNext({ workflow: wf, state, facts });
     expect(d.kind).toBe('end');
   });
+
+  it('目标节点反复进入但从未成功完成时，同样判定为死循环', () => {
+    // 钉住「死循环保护的判据是反复进入本身，而非完成过再进入」。
+    // 若将来有人给保护加上「且已在 completedNodeIds 中」这个条件，本用例会变红——
+    // 那正是要防止的退化：在反复失败重试场景下会导致保护失效。
+    //
+    // 事件编排要点：**只产生 node.failed 是到不了保护分支的**。
+    // node.failed 不写入 completedNodeIds，于是 completedNodeIds 为空，
+    // decideNext 会走规则 3（无当前节点且无已完成节点）直接回起点。
+    // 所以必须让另一个节点完成，使「即将启动的目标节点」恰是那个反复失败的节点。
+    const loopWorkflow: WorkflowDef = {
+      id: 'loop',
+      start: 'pm_analyze',
+      nodes: [
+        { id: 'pm_analyze', title: '需求分析', role: 'pm', consumes: [], produces: 'requirement', isolate: false },
+        { id: 'dev_implement', title: '编码实现', role: 'backend_dev', consumes: ['requirement'], produces: 'code_diff', isolate: false },
+      ],
+      edges: [{ from: 'dev_implement', to: 'pm_analyze', when: 'true' }],
+    };
+
+    const events: KernelEvent[] = [ev('task.created', {}, 1)];
+    let seq = 2;
+
+    // pm_analyze 反复失败 3 次，从未 succeeded → 不在 completedNodeIds 中
+    for (let i = 0; i < 3; i += 1) {
+      events.push(
+        ev('node.started', { node_id: 'pm_analyze', role_id: 'pm', run_id: `run_pm_${i}`, attempt: i + 1 }, seq++),
+      );
+      events.push(ev('node.failed', { node_id: 'pm_analyze', run_id: `run_pm_${i}`, error: '模拟失败' }, seq++));
+    }
+
+    // dev_implement 成功一次，使 lastCompletedNodeId = dev_implement
+    events.push(ev('node.started', { node_id: 'dev_implement', role_id: 'backend_dev', run_id: 'run_dev', attempt: 1 }, seq++));
+    events.push(ev('node.succeeded', { node_id: 'dev_implement', run_id: 'run_dev', log_ref: 'x' }, seq++));
+
+    const state = project(events);
+    // 前提断言：这个节点确实从未完成过，但它被进入了 3 次
+    expect(state.completedNodeIds).toEqual(['dev_implement']);
+    expect(state.visitCounts['pm_analyze']).toBe(3);
+    expect(state.currentNodeIds).toEqual([]);
+
+    const facts = buildFacts({ state, workflow: loopWorkflow, roles: new Map() });
+    const d = decideNext({ workflow: loopWorkflow, state, facts });
+
+    expect(d.kind).toBe('end');
+    if (d.kind === 'end') {
+      expect(d.status).toBe('failed');
+      expect(d.reason).toContain('访问次数');
+    }
+  });
 });
 ```
 
@@ -2698,7 +2748,7 @@ export function decideNext(input: DecideInput): Decision {
 - [ ] **Step 4: 运行测试，确认通过**
 
 Run: `npx vitest run src/kernel/state-machine.test.ts`
-Expected: 11 个测试 PASS
+Expected: 12 个测试 PASS
 
 - [ ] **Step 5: 提交**
 
