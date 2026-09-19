@@ -8,6 +8,11 @@ export type FakeRunnerOptions = {
   script?: FakeScriptItem[];
   /** 多次 run 的脚本队列；提供时 script 被忽略 */
   scripts?: FakeScriptItem[][];
+  /**
+   * 每次 run 开始时回调。测试可用它在**真实工作区**里模拟节点写入
+   * （例如驱动内核的 `owns` 越界核对：`onRun` 里 `writeFileSync(req.workdir + '/README.md', …)`）。
+   */
+  onRun?: (req: RunRequest) => void;
 };
 
 export type FakeRunner = AgentRunner & {
@@ -39,6 +44,7 @@ export function createFakeRunner(options: FakeRunnerOptions): FakeRunner {
 
     async *run(req: RunRequest): AsyncIterable<RunnerEvent> {
       requests.push(req);
+      options.onRun?.(req);
       yield { kind: 'started', pid: 4242, sessionId: `fake-session-${req.runId}` };
 
       const script = queue.shift();

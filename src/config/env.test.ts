@@ -31,4 +31,17 @@ describe('loadEnv', () => {
   it('env 文件不存在时静默使用默认值，不抛错', () => {
     expect(() => loadEnv({}, '/nonexistent/definitely-missing.env')).not.toThrow();
   });
+
+  it('批次冲突策略默认 serialize，可由环境变量指定为 reject', () => {
+    expect(loadEnv({}, NO_ENV_FILE).batchConflictPolicy).toBe('serialize');
+    expect(
+      loadEnv({ AGENTFLOW_BATCH_CONFLICT_POLICY: 'reject' }, NO_ENV_FILE).batchConflictPolicy,
+    ).toBe('reject');
+  });
+
+  it('批次冲突策略非法时显式报错，不静默回退', () => {
+    expect(() => loadEnv({ AGENTFLOW_BATCH_CONFLICT_POLICY: 'parallel' }, NO_ENV_FILE)).toThrow(
+      /AGENTFLOW_BATCH_CONFLICT_POLICY/,
+    );
+  });
 });

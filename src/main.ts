@@ -26,6 +26,7 @@ const kernel = createKernel({
   logDir: resolve(env.logDir),
   repoPath: process.cwd(),
   maxSteps: 50,
+  batchConflictPolicy: env.batchConflictPolicy,
 });
 
 const server = createServer({

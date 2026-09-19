@@ -10,6 +10,11 @@ export type AppEnv = {
   port: number;
   maxPromptTokens: number;
   globalConcurrency: number;
+  /**
+   * 并行批次内 `owns` 路径重叠时的处理策略：serialize=改为串行；reject=拒绝该批次。
+   * 由环境变量 `AGENTFLOW_BATCH_CONFLICT_POLICY` 指定（默认 serialize）。
+   */
+  batchConflictPolicy: 'serialize' | 'reject';
   claudeBin: string;
   codexBin: string;
 };
@@ -23,6 +28,7 @@ const DEFAULTS: AppEnv = {
   port: 8787,
   maxPromptTokens: 30000,
   globalConcurrency: 4,
+  batchConflictPolicy: 'serialize',
   claudeBin: 'claude',
   codexBin: 'codex',
 };
@@ -61,6 +67,18 @@ function readStr(source: Record<string, string | undefined>, key: string, fallba
   return raw === undefined || raw === '' ? fallback : raw;
 }
 
+/** 批次冲突策略只接受 serialize / reject 两个取值；非法值显式报错，不静默回退 */
+function readConflictPolicy(
+  source: Record<string, string | undefined>,
+  key: string,
+  fallback: 'serialize' | 'reject',
+): 'serialize' | 'reject' {
+  const raw = source[key];
+  if (raw === undefined || raw === '') return fallback;
+  if (raw === 'serialize' || raw === 'reject') return raw;
+  throw new Error(`环境变量 ${key} 只能是 serialize 或 reject，实际为 "${raw}"`);
+}
+
 /** 合并 .env 文件与显式传入的环境变量（后者优先），产出类型安全的配置 */
 export function loadEnv(
   overrides: Record<string, string | undefined> = {},
@@ -76,6 +94,11 @@ export function loadEnv(
     port: readInt(merged, 'AGENTFLOW_PORT', DEFAULTS.port),
     maxPromptTokens: readInt(merged, 'AGENTFLOW_MAX_PROMPT_TOKENS', DEFAULTS.maxPromptTokens),
     globalConcurrency: readInt(merged, 'AGENTFLOW_GLOBAL_CONCURRENCY', DEFAULTS.globalConcurrency),
+    batchConflictPolicy: readConflictPolicy(
+      merged,
+      'AGENTFLOW_BATCH_CONFLICT_POLICY',
+      DEFAULTS.batchConflictPolicy,
+    ),
     claudeBin: readStr(merged, 'AGENTFLOW_CLAUDE_BIN', DEFAULTS.claudeBin),
     codexBin: readStr(merged, 'AGENTFLOW_CODEX_BIN', DEFAULTS.codexBin),
   };

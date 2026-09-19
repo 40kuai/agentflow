@@ -1,11 +1,12 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { createKernel } from './kernel.js';
 import { project } from './projector.js';
 import { createEventStore } from './event-store.js';
-import { createFakeRunner, type FakeScriptItem } from '../runner/fake-runner.js';
+import { createFakeRunner, type FakeRunner, type FakeScriptItem } from '../runner/fake-runner.js';
 import type { RoleDef, WorkflowDef } from '../shared/domain.js';
 
 const workflow: WorkflowDef = {
@@ -621,6 +622,129 @@ describe('转移决策的可解释性（Task 4）', () => {
     expect(p['artifact_statuses']).toEqual([{ type: 'requirement', status: 'blocked' }]);
     // 既有中文说明文案保留
     expect(String(p['reason'])).toContain('requirement=blocked');
+    store.close();
+  });
+});
+
+describe('owns 路径级强制与越界检出（Task 7）', () => {
+  /** 真实临时 git 仓库：越界核对走真实 `git status`，未跟踪新文件必须被覆盖 */
+  function makeGitRepo(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'agentflow-git-'));
+    execFileSync('git', ['init'], { cwd: dir, stdio: 'pipe' });
+    writeFileSync(join(dir, 'README.md'), '# 基座\n');
+    execFileSync('git', ['add', 'README.md'], { cwd: dir, stdio: 'pipe' });
+    execFileSync(
+      'git',
+      ['-c', 'user.email=test@example.com', '-c', 'user.name=test', 'commit', '-m', 'init'],
+      { cwd: dir, stdio: 'pipe' },
+    );
+    return dir;
+  }
+
+  function makeKernelInRepo(repoPath: string, logDir: string, runner: FakeRunner) {
+    const store = createEventStore(':memory:');
+    const kernel = createKernel({
+      store,
+      runner,
+      workflow,
+      roles: roles(),
+      maxPromptTokens: 30_000,
+      workspaceRoot: join(repoPath, '.agentflow-ws'),
+      logDir,
+      repoPath,
+      maxSteps: 20,
+    });
+    return { kernel, store };
+  }
+
+  it('越界写被检出：artifact.invalidated + permission_denied，任务不静默继续', async () => {
+    const repo = makeGitRepo();
+    const logs = makeLogDir();
+    const runner = createFakeRunner({
+      scripts: [scriptFor('requirement'), scriptFor('code_diff'), scriptFor('test_report')],
+      // backend_dev（code_diff）越界写 README.md —— 复刻端到端实测的那次越界
+      onRun: (req) => {
+        if (req.artifactType === 'code_diff') {
+          writeFileSync(join(req.workdir, 'README.md'), '# 越界写入\n');
+        }
+      },
+    });
+    const { kernel, store } = makeKernelInRepo(repo, logs, runner);
+
+    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    const state = await kernel.runTask(taskId);
+
+    expect(state.status).toBe('failed');
+    expect(state.nodes['dev_implement']?.status).toBe('failed');
+    // 越界产物被作废（不再出现在状态里）
+    expect(state.artifacts.find((a) => a.type === 'code_diff')).toBeUndefined();
+
+    const events = kernel.getEvents(taskId);
+    const invalidated = events.find((e) => e.type === 'artifact.invalidated');
+    expect(invalidated).toBeDefined();
+    expect(invalidated?.payload['node_id']).toBe('dev_implement');
+    expect(invalidated?.payload['out_of_bounds_paths']).toEqual(['README.md']);
+
+    const nodeFailed = events.find((e) => e.type === 'node.failed');
+    expect(nodeFailed?.payload['reason_category']).toBe('permission_denied');
+    expect(nodeFailed?.payload['reason_label']).toBe('权限被拒');
+    expect(nodeFailed?.payload['out_of_bounds_paths']).toEqual(['README.md']);
+
+    // 不静默继续：qa_verify 未被启动
+    expect(runner.requests).toHaveLength(2);
+    expect(state.nodes['qa_verify']).toBeUndefined();
+    store.close();
+  });
+
+  it('未越界时不误报：变更全在 owns 内，正常完成且无违规记录', async () => {
+    const repo = makeGitRepo();
+    const logs = makeLogDir();
+    const runner = createFakeRunner({
+      scripts: [scriptFor('requirement'), scriptFor('code_diff'), scriptFor('test_report')],
+      onRun: (req) => {
+        if (req.artifactType === 'code_diff') {
+          mkdirSync(join(req.workdir, 'src'), { recursive: true });
+          writeFileSync(join(req.workdir, 'src', 'a.ts'), 'export const a = 1;\n');
+        }
+        if (req.artifactType === 'test_report') {
+          mkdirSync(join(req.workdir, 'tests'), { recursive: true });
+          writeFileSync(join(req.workdir, 'tests', 'a.test.ts'), '// 测试\n');
+        }
+      },
+    });
+    const { kernel, store } = makeKernelInRepo(repo, logs, runner);
+
+    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    const state = await kernel.runTask(taskId);
+
+    expect(state.status).toBe('completed');
+    expect(state.nodes['dev_implement']?.status).toBe('succeeded');
+    expect(state.nodes['qa_verify']?.status).toBe('succeeded');
+    expect(kernel.getEvents(taskId).some((e) => e.type === 'artifact.invalidated')).toBe(false);
+    store.close();
+  });
+
+  it('只读角色（owns 为空）写入任何路径都算越界', async () => {
+    const repo = makeGitRepo();
+    const logs = makeLogDir();
+    const runner = createFakeRunner({
+      scripts: [scriptFor('requirement')],
+      // pm 是只读角色（owns: []），却写了文件
+      onRun: (req) => {
+        if (req.artifactType === 'requirement') {
+          writeFileSync(join(req.workdir, 'pm-note.md'), '不该写\n');
+        }
+      },
+    });
+    const { kernel, store } = makeKernelInRepo(repo, logs, runner);
+
+    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    const state = await kernel.runTask(taskId);
+
+    expect(state.status).toBe('failed');
+    const failed = kernel.getEvents(taskId).find((e) => e.type === 'node.failed');
+    expect(failed?.payload['reason_category']).toBe('permission_denied');
+    expect(failed?.payload['out_of_bounds_paths']).toEqual(['pm-note.md']);
     store.close();
   });
 });

@@ -7,6 +7,12 @@ import type { AgentRunner, RunnerEvent } from '../runner/types.js';
 import { assemblePrompt } from './context-assembler.js';
 import type { EventStore } from './event-store.js';
 import { buildFacts } from './facts.js';
+import {
+  checkBatchOwns,
+  collectChangedPaths,
+  findOwnViolations,
+  type BatchConflictPolicy,
+} from './path-guard.js';
 import { project, type TaskState } from './projector.js';
 import { prepareWorkspace, releaseWorkspace } from './scheduler.js';
 import { decideNext, type EdgeEvaluation } from './state-machine.js';
@@ -21,6 +27,11 @@ export type KernelDeps = {
   logDir: string;
   repoPath: string;
   maxSteps: number;
+  /**
+   * 并行批次内 `owns` 重叠时的处理策略：serialize=改为串行；reject=拒绝该批次。
+   * 取自 `AGENTFLOW_BATCH_CONFLICT_POLICY`（默认 serialize）。属 Task 8 的「配置中可指定」。
+   */
+  batchConflictPolicy?: BatchConflictPolicy;
 };
 
 export type StartTaskInput = {
@@ -115,8 +126,33 @@ export function createKernel(deps: KernelDeps): Kernel {
         return getState(taskId);
       }
 
+      // Task 8：占用检查必须在**批次启动之前**执行。当前决策恒激活 1 个节点（fan-out 属 Task 9），
+      // 检查对单节点天然放行；代码路径已就绪，待多节点批次出现时即生效。
+      const batchNodes = decision.nodeIds.map((id) => {
+        const node = workflow.nodes.find((n) => n.id === id);
+        const batchRole = node ? roles.get(node.role) : undefined;
+        return { nodeId: id, owns: batchRole?.owns ?? [] };
+      });
+      const guard = checkBatchOwns(batchNodes, deps.batchConflictPolicy ?? 'serialize');
+      if (guard.mode === 'reject') {
+        // 拒绝该批次：在启动这些节点之前就把原因写清楚（哪两个节点、哪段路径重叠）
+        store.append({
+          task_id: taskId,
+          type: 'task.failed',
+          payload: {
+            reason: guard.reason,
+            reason_category: 'other' satisfies FailureReason,
+            reason_label: FAILURE_REASON_LABELS.other,
+            owns_overlaps: guard.overlaps,
+          },
+          actor: 'kernel',
+        });
+        return getState(taskId);
+      }
+
       // 串行消费**激活节点集合**：当前决策恒激活 1 个（fan-out 由后续任务引入），
-      // 逐个 await 保证与改动前的单节点行为等价。
+      // 逐个 await 保证与改动前的单节点行为等价。`serialize` 策略下亦是此串行行为；
+      // 真正的并发调度属 Task 10（`guard.mode === 'parallel'` 时才会并发）。
       for (let i = 0; i < decision.nodeIds.length; i += 1) {
         await runNode(taskId, decision.nodeIds[i]!, decision.selectedEdges[i] ?? null);
       }
@@ -230,6 +266,10 @@ export function createKernel(deps: KernelDeps): Kernel {
 
     const readOnly = role.owns.length === 0;
 
+    // Task 7：节点启动前记录工作区的变更基线。非隔离节点共用主工作区，若只看节点结束后的
+    // 全量快照，会把"启动前就存在的脏文件"算到本节点头上（误报）；用前后快照差即只算本节点新增的变更。
+    const changesBefore = new Set(collectChangedPaths(ws.path));
+
     try {
       for await (const event of deps.runner.run({
         runId: ws.runId,
@@ -296,13 +336,31 @@ export function createKernel(deps: KernelDeps): Kernel {
       }
     }
 
+    // Task 7：节点结束后、回收工作区之前采集实际变更路径（worktree 一旦回收就再也读不到）。
+    // `git status --porcelain` 覆盖未跟踪的新文件——端到端实测的越界（README.md / scripts/hello.sh）
+    // 恰恰是未跟踪新文件，`git diff --name-only` 会漏掉它们。
+    const changesAfter = collectChangedPaths(ws.path);
+    const changedPaths = changesAfter.filter((path) => !changesBefore.has(path));
+    const outOfBoundsPaths = findOwnViolations(changedPaths, role.owns);
+    // 越界路径清单会随所有失败落库（即便节点因别的原因失败，也不把越界这件事丢掉）
+    const violationExtra: Record<string, unknown> =
+      outOfBoundsPaths.length > 0
+        ? { out_of_bounds_paths: outOfBoundsPaths, changed_paths: changedPaths }
+        : {};
+
     releaseWorkspace(ws, deps.repoPath);
 
     /**
      * 统一的失败落库：node.failed 与 task.failed 各写一条，均带**稳定分类枚举 + 中文说明**，
      * 原始文本保留在 error/raw 字段里（不丢原文，便于排查 CLI 细节）。
+     * `extra` 用于携带附加事实（如 Task 7 的越界路径清单）。
      */
-    function failNode(category: FailureReason, rawError: string, taskReason: string): void {
+    function failNode(
+      category: FailureReason,
+      rawError: string,
+      taskReason: string,
+      extra: Record<string, unknown> = {},
+    ): void {
       store.append({
         task_id: taskId,
         type: 'node.failed',
@@ -313,6 +371,7 @@ export function createKernel(deps: KernelDeps): Kernel {
           reason_category: category,
           reason_label: FAILURE_REASON_LABELS[category],
           log_ref: logRef,
+          ...extra,
         },
         actor: 'kernel',
       });
@@ -324,6 +383,7 @@ export function createKernel(deps: KernelDeps): Kernel {
           reason_category: category,
           reason_label: FAILURE_REASON_LABELS[category],
           raw: rawError,
+          ...extra,
         },
         actor: 'kernel',
       });
@@ -337,13 +397,13 @@ export function createKernel(deps: KernelDeps): Kernel {
       }
       const rawError = `CLI 退出码 ${exitCode}${detailParts.length > 0 ? `：${detailParts.join(' / ')}` : ''}`;
       // 分类来自 runner 层对 CLI subtype 的映射；runner 未给出分类时归入 other
-      failNode(failureReason ?? 'other', rawError, `节点 ${nodeId} 执行失败`);
+      failNode(failureReason ?? 'other', rawError, `节点 ${nodeId} 执行失败`, violationExtra);
       return;
     }
 
     if (!hasArtifact) {
       const rawError = `未产出任何结构化结果（期望类型 ${node.produces}）`;
-      failNode(failureReason ?? 'other', rawError, `节点 ${nodeId} 未产出结构化结果`);
+      failNode(failureReason ?? 'other', rawError, `节点 ${nodeId} 未产出结构化结果`, violationExtra);
       return;
     }
 
@@ -351,15 +411,16 @@ export function createKernel(deps: KernelDeps): Kernel {
     try {
       parsed = parseArtifactPayload(node.produces as ArtifactType, artifactRaw);
     } catch (error) {
-      failNode('invalid_payload', (error as Error).message, `节点 ${nodeId} 产出载荷不合规`);
+      failNode('invalid_payload', (error as Error).message, `节点 ${nodeId} 产出载荷不合规`, violationExtra);
       return;
     }
 
+    const artifactId = newId('art');
     store.append({
       task_id: taskId,
       type: 'artifact.created',
       payload: {
-        artifact_id: newId('art'),
+        artifact_id: artifactId,
         run_id: ws.runId,
         node_id: nodeId,
         type: node.produces,
@@ -374,6 +435,34 @@ export function createKernel(deps: KernelDeps): Kernel {
       },
       actor: `role:${role.id}`,
     });
+
+    // Task 7：越界写必须被检出，且**不得静默继续**。
+    // 语义选择：节点判 `failed` 并带分类化原因（复用稳定枚举 `permission_denied` = 权限被拒），
+    // 刚产出的产物随即以 `artifact.invalidated` 作废（复用既有事件类型，此前全仓无生产者）。
+    // 理由见 impl-task7-8-report.md：越界意味着产物本身不可信，若只告警却继续流转，
+    // 下游会在被污染的产物上继续工作，正是"数据混乱"的来源。
+    if (outOfBoundsPaths.length > 0) {
+      store.append({
+        task_id: taskId,
+        type: 'artifact.invalidated',
+        payload: {
+          artifact_id: artifactId,
+          run_id: ws.runId,
+          node_id: nodeId,
+          reason: `节点写入超出 owns 允许范围（允许写入：${role.owns.length > 0 ? role.owns.join(', ') : '（空，只读角色）'}）`,
+          out_of_bounds_paths: outOfBoundsPaths,
+          changed_paths: changedPaths,
+        },
+        actor: 'kernel',
+      });
+      failNode(
+        'permission_denied',
+        `越界写入 ${outOfBoundsPaths.length} 个路径：${outOfBoundsPaths.join(', ')}`,
+        `节点 ${nodeId} 越界写入（超出 owns 允许范围）`,
+        violationExtra,
+      );
+      return;
+    }
 
     store.append({
       task_id: taskId,
