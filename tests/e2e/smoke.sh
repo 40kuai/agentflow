@@ -45,11 +45,16 @@ TASK_ID=$(curl -s -X POST "${BASE}/api/tasks" \
 echo "任务 id：${TASK_ID}"
 [ -n "${TASK_ID}" ] || { echo "创建任务失败"; exit 1; }
 
-echo "==> 轮询任务状态（最长 15 分钟）"
-for i in $(seq 1 180); do
+echo "==> 轮询任务状态（最长 40 分钟，每 5 秒一次）"
+# 注意：原先用 sed -n 's/.*"status":"\([^"]*\)".*/\1/p' 提取状态是**错的**——
+# sed 的 `.*` 是贪婪的，会匹配到最后一个 "status" 字段；而 TaskState 里 artifacts[].status
+# 是 "ok"，于是取到的是 "ok" 而不是任务顶层 status，早退判据永不触发
+# （Task 15 实测：必然跑满整个窗口才被 trap 中断，最终误判 FAIL）。
+# 改为用 node 解析 JSON，直接取任务**顶层** status（node 项目已有，最可靠）。
+for i in $(seq 1 480); do
   STATE=$(curl -s "${BASE}/api/tasks/${TASK_ID}")
-  STATUS=$(echo "$STATE" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p' | head -n 1)
-  echo "  [${i}] status=${STATUS}"
+  STATUS=$(echo "$STATE" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{console.log(JSON.parse(s).status||'')}catch{console.log('')}})")
+  echo "  [${i}] 已等待 $((i * 5)) 秒，status=${STATUS}"
   if [ "$STATUS" = "completed" ] || [ "$STATUS" = "failed" ]; then
     break
   fi

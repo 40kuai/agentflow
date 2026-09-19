@@ -46,10 +46,39 @@ describe('buildArgs', () => {
     expect(args.join(' ')).not.toContain('acceptEdits');
   });
 
+  // 安全边界：预授权只属于「真正需要执行」的角色。只读角色若被放开 Bash 预授权，
+  // 就等于把 Read/Grep/Glob 的沙箱彻底打破，故这条必须有断言把守。
+  it('只读角色不含任何 Bash 预授权（安全边界）', () => {
+    const args = buildArgs({ ...base, readOnly: true });
+    expect(args).not.toContain('--allowed-tools');
+    expect(args.join(' ')).not.toContain('Bash');
+  });
+
   it('非只读角色使用 acceptEdits 并开放写工具', () => {
     const args = buildArgs(base);
     expect(args[args.indexOf('--permission-mode') + 1]).toBe('acceptEdits');
     expect(args.join(' ')).toContain('Write');
+  });
+
+  // 2026-09-18 探针（/tmp/agentflow-perm-probe，claude 2.1.38）实测：
+  // headless 下 `acceptEdits` 只放行文件编辑，`sh -c 'echo ...'` 返回
+  // `This command requires approval`（Task 15 端到端里这类拒绝 461 次）；
+  // 叠加 --allowed-tools 预授权后，sh/bash/chmod/git/node/npm 均真实执行、`permission_denials` 为空。
+  it('非只读角色带 --allowed-tools 精准预授权（headless 下 acceptEdits 不放行执行）', () => {
+    const args = buildArgs(base);
+    const idx = args.indexOf('--allowed-tools');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe(
+      'Bash(sh:*),Bash(bash:*),Bash(chmod:*),Bash(git:*),Bash(node:*),Bash(npm:*)',
+    );
+  });
+
+  it('--tools 与 --allowed-tools 并用：工具集含 Bash，且不放弃 CLI 权限强制', () => {
+    const args = buildArgs(base);
+    // 探针 D 实测：两者同时给出不冲突——--tools 限定可用工具集，--allowed-tools 在其内预授权
+    expect(args).toContain('--tools=Read,Edit,Write,Grep,Glob,Bash');
+    expect(args).toContain('--allowed-tools');
+    expect(args.join(' ')).not.toContain('dangerously-skip-permissions');
   });
 
   it('budgetCapUsd 映射到 --max-budget-usd', () => {

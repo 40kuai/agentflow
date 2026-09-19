@@ -160,9 +160,31 @@ export function buildArgs(req: RunRequest, useJsonSchema = true): string[] {
     args.push('--json-schema', JSON.stringify(req.outputSchema));
   }
   if (req.readOnly) {
+    // 只读角色不放宽：它只需要读，`default` + 只读工具集即可。
+    // 这也是「角色权限即沙箱参数」的体现——只有真正需要执行的角色才拿到执行权限。
     args.push('--tools=Read,Grep,Glob', '--permission-mode', 'default');
   } else {
-    args.push('--permission-mode', 'acceptEdits', '--tools=Read,Edit,Write,Grep,Glob,Bash');
+    // 可写角色需要「精准预授权」，原因（2026-09-18 探针 + Task 15 端到端实测）：
+    // headless（-p）下没有人工审批通道，而 `acceptEdits` 只自动放行**文件编辑**；
+    // Bash 里的非白名单命令（chmod / sh x.sh / git checkout -b）一律返回
+    // `This command requires approval`（Task 15 真实日志里这类拒绝出现 461 次）。
+    // 但 dev_implement 的产物 schema 要求 self_test_result、dev/qa 的 prompt 明确要求
+    // 「真实运行自测/测试」——契约不可满足 → agent 陷入重试，单节点成本涨到 $1.13~$2.20。
+    // 故在不放弃 CLI 权限强制的前提下，用 --allowed-tools 显式预授权角色真正需要的命令前缀：
+    //   sh / bash → 运行 .sh 脚本（prompt 要求「运行一次自测」；真实日志里 `bash x.sh` 也被拒过）
+    //   chmod     → 让脚本可执行（真实日志里被拒过，属「运行 shell 脚本」的必要一步）
+    //   git       → 基本操作（开分支 / 提交）
+    //   node / npm→ 跑测试
+    // 明确不用 --dangerously-skip-permissions：那会放弃 CLI 的全部权限强制。
+    // `--tools` 与 `--allowed-tools` 语义不同且实测可并用（2026-09-18 探针 D/E）：
+    // 前者限定「可用工具集」必须包含 Bash，后者在该集合内「预授权具体命令」，
+    // 两者同时给出时 sh/bash/chmod/git/node/npm 均实际执行成功、permission_denials 为空。
+    args.push(
+      '--permission-mode', 'acceptEdits',
+      '--tools=Read,Edit,Write,Grep,Glob,Bash',
+      '--allowed-tools',
+      'Bash(sh:*),Bash(bash:*),Bash(chmod:*),Bash(git:*),Bash(node:*),Bash(npm:*)',
+    );
   }
   if (req.budgetCapUsd !== undefined) {
     args.push('--max-budget-usd', String(req.budgetCapUsd));
