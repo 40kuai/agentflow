@@ -244,6 +244,13 @@ Task（一次需求 = 一个 Task）
 
 **所有 payload 用 zod 定义，并可导出 JSON Schema**——这份 schema 直接作为 `claude --json-schema` 的参数，把产物格式**下沉到 CLI 层强制**，而不是"求 agent 按格式输出"。
 
+**status 的来源（2026-09-19 契约修复）**：`status` 由**模型在结构化输出里给出**——每个 payload schema 内嵌
+`status: ok | needs_changes | blocked`（带 `default('ok')`，故不含该字段的历史归档样本仍能解析），
+内核用 `parseArtifactPayload` 把它**提升为 Artifact 行的独立列**（payload 内不含 status）并消费，
+**不再是内核写死 `ok`**。工作流边条件（如 `all(artifacts.requirement.status == 'ok')`）
+因此真正生效：模型判 `blocked` / `needs_changes` 时该边不通过，任务明确落 `failed`，
+并在错误原因里带出未满足的条件与当前产物状态（而非静默继续）。
+
 ---
 
 ## 6. 事件与投影

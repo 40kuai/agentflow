@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ARTIFACT_PAYLOAD_SCHEMAS, jsonSchemaForArtifact } from './artifacts.js';
+import { ARTIFACT_PAYLOAD_SCHEMAS, jsonSchemaForArtifact, parseArtifactPayload } from './artifacts.js';
 
 describe('Artifact payload schema', () => {
   it('requirement 接受合法载荷', () => {
@@ -80,5 +80,82 @@ describe('Artifact payload schema', () => {
     const schema = jsonSchemaForArtifact('test_report') as Record<string, unknown>;
     expect(schema.type).toBe('object');
     expect(() => JSON.stringify(schema)).not.toThrow();
+  });
+});
+
+describe('Artifact status 契约（由模型在结构化输出里给出，内核消费）', () => {
+  const requirementBase = {
+    problem: '用户无法自动流转任务',
+    goals: ['支持多角色自动流转'],
+    non_goals: ['不做分布式调度'],
+    acceptance_criteria: ['一个需求输入后三角色自动完成'],
+  };
+
+  it('每个 payload schema 都接受 status 字段（模型可表达判断）', () => {
+    const req = ARTIFACT_PAYLOAD_SCHEMAS.requirement.safeParse({ ...requirementBase, status: 'blocked' });
+    expect(req.success && req.data.status).toBe('blocked');
+    const wp = ARTIFACT_PAYLOAD_SCHEMAS.work_package_plan.safeParse({
+      packages: [
+        {
+          id: 'wp1',
+          name: 'x',
+          owns: [],
+          reads: [],
+          depends_on: [],
+          interface_contract: {},
+          acceptance_refs: [],
+        },
+      ],
+      status: 'blocked',
+    });
+    expect(wp.success && wp.data.status).toBe('blocked');
+    const diff = ARTIFACT_PAYLOAD_SCHEMAS.code_diff.safeParse({
+      wp_id: 'wp1',
+      branch: 'main',
+      files_changed: [],
+      insertions: 0,
+      deletions: 0,
+      self_test_result: 'not_run',
+      notes: '',
+      status: 'blocked',
+    });
+    expect(diff.success && diff.data.status).toBe('blocked');
+    const report = ARTIFACT_PAYLOAD_SCHEMAS.test_report.safeParse({
+      wp_id: 'wp1',
+      suites: [],
+      passed: 0,
+      failed: 0,
+      failures: [],
+      status: 'needs_changes',
+    });
+    expect(report.success && report.data.status).toBe('needs_changes');
+  });
+
+  it('归档样本形状（不含 status）仍能解析，status 默认为 ok（向后兼容）', () => {
+    const parsed = parseArtifactPayload('requirement', requirementBase);
+    expect(parsed.status).toBe('ok');
+    expect(parsed.payload).toEqual(requirementBase);
+  });
+
+  it('parseArtifactPayload 把 status 提升到顶层，payload 里不再含 status', () => {
+    const parsed = parseArtifactPayload('requirement', { ...requirementBase, status: 'blocked' });
+    expect(parsed.status).toBe('blocked');
+    expect(parsed.payload).not.toHaveProperty('status');
+    expect((parsed.payload as Record<string, unknown>)['problem']).toBe(requirementBase.problem);
+  });
+
+  it('非法 status 被拒', () => {
+    const r = ARTIFACT_PAYLOAD_SCHEMAS.requirement.safeParse({
+      ...requirementBase,
+      status: 'done',
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it('jsonSchemaForArtifact 暴露 status 字段（下沉到 CLI 层强制）', () => {
+    const schema = jsonSchemaForArtifact('requirement') as {
+      properties?: Record<string, unknown>;
+    };
+    expect(schema.properties?.['status']).toBeDefined();
   });
 });

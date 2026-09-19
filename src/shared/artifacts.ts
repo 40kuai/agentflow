@@ -14,11 +14,19 @@ export type ArtifactType = z.infer<typeof ArtifactTypeSchema>;
 export const ArtifactStatusSchema = z.enum(['ok', 'needs_changes', 'blocked']);
 export type ArtifactStatus = z.infer<typeof ArtifactStatusSchema>;
 
+/**
+ * 每个 payload schema 内嵌 `status` 字段，目的是让模型能在**结构化输出里**表达自己的判断
+ * （spec §5.3：role prompt 要求模型判断 ok / needs_changes / blocked）。
+ * 它最终不是 payload 的一部分，而是 Artifact 行的独立列——由 parseArtifactPayload 提升出来、
+ * 内核写入 artifact.created（2026-09-19 契约修复前，内核写死 'ok'，模型的判断被静默吃掉）。
+ * `default('ok')` 是为**向后兼容**：`tests/fixtures/` 下逐字归档的真实样本没有该字段，加了默认值仍能解析。
+ */
 const RequirementPayload = z.object({
   problem: z.string().min(1),
   goals: z.array(z.string().min(1)),
   non_goals: z.array(z.string()),
   acceptance_criteria: z.array(z.string().min(1)),
+  status: ArtifactStatusSchema.default('ok'),
 });
 
 const WorkPackageSchema = z.object({
@@ -35,6 +43,7 @@ const WorkPackageSchema = z.object({
 
 const WorkPackagePlanPayload = z.object({
   packages: z.array(WorkPackageSchema).min(1),
+  status: ArtifactStatusSchema.default('ok'),
 });
 
 const CodeDiffPayload = z.object({
@@ -45,6 +54,7 @@ const CodeDiffPayload = z.object({
   deletions: z.number().int().nonnegative(),
   self_test_result: z.enum(['passed', 'failed', 'not_run']),
   notes: z.string(),
+  status: ArtifactStatusSchema.default('ok'),
 });
 
 const TestReportPayload = z.object({
@@ -53,6 +63,7 @@ const TestReportPayload = z.object({
   passed: z.number().int().nonnegative(),
   failed: z.number().int().nonnegative(),
   failures: z.array(z.object({ test: z.string(), reason: z.string() })),
+  status: ArtifactStatusSchema.default('ok'),
 });
 
 /** 本阶段实现的 4 种 Artifact 载荷 schema */
@@ -89,14 +100,24 @@ export type Artifact = z.infer<typeof ArtifactSchema>;
 
 export const ARTIFACT_SCHEMA_VERSION = 1;
 
+/**
+ * 解析后的载荷：`status` 被**提升到顶层**（它是 Artifact 行的独立列，不是 payload 语义的一部分），
+ * `payload` 是剔除 status 之后的纯载荷，供内核写库 / 拼摘要。
+ */
+export type ParsedArtifactPayload = {
+  status: ArtifactStatus;
+  payload: Record<string, unknown>;
+};
+
 /** 校验并解析载荷；失败时抛出带 artifact 类型信息的错误 */
-export function parseArtifactPayload(type: ArtifactType, raw: unknown): unknown {
+export function parseArtifactPayload(type: ArtifactType, raw: unknown): ParsedArtifactPayload {
   const schema = ARTIFACT_PAYLOAD_SCHEMAS[type];
   const result = schema.safeParse(raw);
   if (!result.success) {
     throw new Error(`Artifact(${type}) 载荷校验失败：${result.error.message}`);
   }
-  return result.data;
+  const { status, ...payload } = result.data as { status: ArtifactStatus } & Record<string, unknown>;
+  return { status, payload };
 }
 
 /** 导出 JSON Schema，供 claude --json-schema 使用 */

@@ -89,9 +89,16 @@ export function decideNext(input: DecideInput): Decision {
     return { kind: 'start', nodeId: edge.to, reason };
   }
 
+  // 无可用转移必须落到明确的 failed，并把**当前产物状态**一并写进原因：
+  // 边条件（如 all(artifacts.requirement.status == 'ok')）不成立的真实原因通常是
+  // 模型把 status 判成了 blocked / needs_changes，只说"条件不满足"会让使用者无从判断。
+  const artifactStatuses =
+    state.artifacts.length > 0
+      ? state.artifacts.map((a) => `${a.type}=${a.status}`).join(', ')
+      : '（无产物）';
   return {
     kind: 'end',
     status: 'failed',
-    reason: `节点 ${lastNodeId} 完成后没有可用的转移：${failures.join(' | ')}`,
+    reason: `节点 ${lastNodeId} 完成后没有可用的转移：${failures.join(' | ')}；当前产物状态：${artifactStatuses}`,
   };
 }

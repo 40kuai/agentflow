@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import { jsonSchemaForArtifact, parseArtifactPayload, type ArtifactType } from '../shared/artifacts.js';
+import { jsonSchemaForArtifact, parseArtifactPayload, type ArtifactType, type ParsedArtifactPayload } from '../shared/artifacts.js';
 import { newId } from '../shared/ids.js';
 import type { KernelEvent } from '../shared/events.js';
 import type { RoleDef, WorkflowDef } from '../shared/domain.js';
@@ -284,9 +284,9 @@ export function createKernel(deps: KernelDeps): Kernel {
       return;
     }
 
-    let payload: unknown;
+    let parsed: ParsedArtifactPayload;
     try {
-      payload = parseArtifactPayload(node.produces as ArtifactType, artifactRaw);
+      parsed = parseArtifactPayload(node.produces as ArtifactType, artifactRaw);
     } catch (error) {
       store.append({
         task_id: taskId,
@@ -316,11 +316,14 @@ export function createKernel(deps: KernelDeps): Kernel {
         run_id: ws.runId,
         node_id: nodeId,
         type: node.produces,
-        status: 'ok',
+        // status 由模型在结构化输出里给出（payload schema 内嵌 status 字段），内核消费它；
+        // 修复前这里写死 'ok'，会让工作流边条件 all(artifacts.*.status == 'ok') 永远放行，
+        // 模型的 blocked / needs_changes 判断被静默吃掉（2026-09-19 契约修复）。
+        status: parsed.status,
         schema_version: 1,
-        payload,
+        payload: parsed.payload,
         refs: [],
-        summary: buildSummary(node.produces as ArtifactType, payload),
+        summary: buildSummary(node.produces as ArtifactType, parsed.payload),
       },
       actor: `role:${role.id}`,
     });

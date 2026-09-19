@@ -322,6 +322,56 @@ describe('Kernel 串行闭环', () => {
   });
 });
 
+describe('Artifact status 由模型决定并被内核消费', () => {
+  it('模型判 blocked 时 artifact.status 记 blocked，边不通过 → 任务 failed 且错误信息说明原因', async () => {
+    const repo = makeRepo();
+    const logs = makeLogDir();
+    const { kernel, store, runner } = makeKernel(
+      [
+        [
+          {
+            kind: 'artifact',
+            raw: { ...(ARTIFACTS['requirement'] as Record<string, unknown>), status: 'blocked' },
+          },
+          { kind: 'usage', tokensIn: 100, tokensOut: 50, costUsd: 0.01 },
+          { kind: 'exited', code: 0 },
+        ],
+      ],
+      repo,
+      logs,
+    );
+
+    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    const state = await kernel.runTask(taskId);
+
+    // status 来自模型的结构化输出，而不是内核写死的 ok
+    expect(state.artifacts.find((a) => a.type === 'requirement')?.status).toBe('blocked');
+    // 边条件 all(artifacts.requirement.status == 'ok') 不成立 → 不再推进到 dev_implement
+    expect(runner.requests).toHaveLength(1);
+    expect(state.status).toBe('failed');
+    expect(state.completedNodeIds).toEqual(['pm_analyze']);
+
+    const failedEvent = kernel.getEvents(taskId).find((e) => e.type === 'task.failed');
+    const reason = String(failedEvent?.payload['reason']);
+    expect(reason).toContain('pm_analyze');
+    expect(reason).toContain('requirement=blocked');
+    store.close();
+  });
+
+  it('模型未给 status 时默认为 ok，流程照常流转到底', async () => {
+    const repo = makeRepo();
+    const logs = makeLogDir();
+    const { kernel, store } = makeKernel(undefined, repo, logs);
+
+    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    const state = await kernel.runTask(taskId);
+
+    expect(state.artifacts.every((a) => a.status === 'ok')).toBe(true);
+    expect(state.status).toBe('completed');
+    store.close();
+  });
+});
+
 describe('Task 创建的元数据落库', () => {
   it('task.created 事件包含标题与原始需求', () => {
     const repo = makeRepo();
