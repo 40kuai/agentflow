@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -9,8 +9,10 @@ import {
   commonLiteralPrefix,
   detectOwnsOverlaps,
   findOwnViolations,
+  isUnderPrefix,
   matchesOwns,
   ownsPatternsIntersect,
+  runtimeExcludePrefixes,
   segmentsIntersect,
 } from './path-guard.js';
 
@@ -63,6 +65,75 @@ describe('owns 路径匹配与越界检出（Task 7）', () => {
     expect(findOwnViolations(['README.md', './README.md', 'a/b.txt'], ['src/**'])).toEqual([
       'README.md',
       'a/b.txt',
+    ]);
+  });
+});
+
+describe('平台运行时目录排除（owns 误判修复）', () => {
+  const runtime = ['logs', 'data', 'workspaces'];
+
+  it('排除前缀由配置路径推导：只保留确实位于仓库内的目录', () => {
+    // 绝对路径（生产形态：resolve(env.logDir) 等）与相对路径（.env 里的 ./logs）都要能推导；
+    // 仓库之外的目录、以及恰为仓库根的路径不产生前缀（它们不会被采集为仓库相对改动）。
+    expect(
+      runtimeExcludePrefixes('/repo', [
+        '/repo/logs',
+        '/repo/data',
+        '/repo/custom-workspaces',
+        '/outside/logs',
+        '/repo',
+      ]),
+    ).toEqual(['logs', 'data', 'custom-workspaces']);
+    expect(runtimeExcludePrefixes('/repo', ['./logs', './data', undefined, ':memory:'])).toEqual([
+      'logs',
+      'data',
+    ]);
+  });
+
+  it('符号链接路径（macOS `/tmp → /private/tmp`）经真实路径归一后仍能推导出前缀', () => {
+    // 真实冒烟里的盲区：repoPath 来自 process.cwd()（真实路径），配置里是经符号链接的绝对路径。
+    // 不对两者做 realpath 归一时 relative() 会得到 `../..`，排除规则整体失效。
+    const real = mkdtempSync(join(tmpdir(), 'agentflow-realpath-'));
+    const link = `${real}-link`;
+    symlinkSync(real, link);
+    try {
+      expect(runtimeExcludePrefixes(link, [join(real, 'logs')])).toEqual(['logs']);
+      expect(runtimeExcludePrefixes(real, [join(link, 'logs'), join(link, 'data')])).toEqual([
+        'logs',
+        'data',
+      ]);
+    } finally {
+      rmSync(link, { force: true });
+      rmSync(real, { recursive: true, force: true });
+    }
+  });
+
+  it('前缀按整段匹配：`logs` 覆盖其下内容，但不误伤 `logsx`', () => {
+    expect(isUnderPrefix('logs', ['logs'])).toBe(true);
+    expect(isUnderPrefix('logs/runs/run_1.jsonl', ['logs'])).toBe(true);
+    expect(isUnderPrefix('data/agentflow.sqlite-wal', ['data'])).toBe(true);
+    expect(isUnderPrefix('logsx/a.jsonl', ['logs'])).toBe(false);
+    expect(isUnderPrefix('src/a.ts', ['logs'])).toBe(false);
+  });
+
+  it('运行时目录位于仓库内时：只读角色（owns 为空）不因平台自身产物被误判越界（回归）', () => {
+    // 复刻缺陷：pm（owns: []）跑完后，平台自己写的日志/库/工作区被 git status 采集为节点变更
+    expect(
+      findOwnViolations(
+        ['logs/runs/run_1.jsonl', 'data/agentflow.sqlite', 'data/agentflow.sqlite-wal', 'workspaces/wt/doc.txt'],
+        [],
+        runtime,
+      ),
+    ).toEqual([]);
+  });
+
+  it('排除运行时目录后：真实越界仍被检出（不削弱安全闸）', () => {
+    expect(
+      findOwnViolations(['logs/runs/run_1.jsonl', 'README.md', 'src/a.ts'], ['src/**'], runtime),
+    ).toEqual(['README.md']);
+    // 只读角色写了业务文件（非平台产物）仍然是越界
+    expect(findOwnViolations(['logs/runs/run_1.jsonl', 'pm-note.md'], [], runtime)).toEqual([
+      'pm-note.md',
     ]);
   });
 });

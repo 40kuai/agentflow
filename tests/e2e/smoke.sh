@@ -13,23 +13,24 @@ git init -q
 git -c user.email=e2e@local -c user.name=e2e commit -q --allow-empty -m "初始提交"
 echo "# 端到端目标仓库" > README.md
 
-# 平台自身的运行时产物（事件库 / 运行日志 / worktree 落点）必须放在目标仓库**之外**：
-# 内核的 repoPath = process.cwd()（= 目标仓库），而 Task 7 的 owns 路径级强制用 git status
-# 采集目标仓库的**实际变更路径** —— 若这些运行时文件落在目标仓库内，会立刻被当成「节点越界写入」
-# （对 owns=[] 的只读角色尤其致命：第一个节点 pm_analyze 就会因此被判失败）。
-RUNTIME_DIR="$(mktemp -d /tmp/agentflow-e2e-runtime-XXXXXX)"
+# 平台自身的运行时产物（事件库 / 运行日志 / worktree 落点）**刻意按默认形态放在目标仓库之内**：
+# 内核的 repoPath = process.cwd()（= 目标仓库），Task 7 的 owns 路径级强制用 git status 采集
+# 目标仓库的**实际变更路径**。修复前，这些平台自写的文件（尤其 logs/runs/*.jsonl）会被当成
+# 「节点越界写入」，只读角色 pm_analyze 必然失败；修复后内核按注入的配置路径
+# （AGENTFLOW_LOG_DIR / AGENTFLOW_DB_PATH / AGENTFLOW_WORKSPACE_DIR）把它们排除出「节点改动」。
+# 本冒烟保持「运行时目录在目标仓库内」的形态，正是为了端到端覆盖该修复。
 
 HOST="127.0.0.1"
 PORT="${AGENTFLOW_PORT:-8787}"
 BASE="http://${HOST}:${PORT}"
 
 echo "==> 目标仓库：$TARGET_REPO"
-echo "==> 运行时目录（在目标仓库之外，避免被 owns 判定为越界）：$RUNTIME_DIR"
+echo "==> 运行时目录（刻意放在目标仓库内，验证 owns 核对会排除平台自身产物）"
 echo "==> 启动 AgentFlow"
 AGENTFLOW_CONFIG_DIR="$AGENTFLOW_ROOT/config" \
-AGENTFLOW_DB_PATH="$RUNTIME_DIR/data/e2e.sqlite" \
-AGENTFLOW_LOG_DIR="$RUNTIME_DIR/logs" \
-AGENTFLOW_WORKSPACE_DIR="$RUNTIME_DIR/workspaces" \
+AGENTFLOW_DB_PATH="$TARGET_REPO/data/e2e.sqlite" \
+AGENTFLOW_LOG_DIR="$TARGET_REPO/logs" \
+AGENTFLOW_WORKSPACE_DIR="$TARGET_REPO/workspaces" \
   npx tsx "$AGENTFLOW_ROOT/src/main.ts" > /tmp/agentflow-e2e.log 2>&1 &
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
@@ -79,12 +80,17 @@ echo "==> 事件类型统计"
 curl -s "${BASE}/api/tasks/${TASK_ID}/events" \
   | grep -o '"type":"[^"]*"' | sort | uniq -c | sort -rn
 
+echo "==> 实测总花费 budgetUsedUsd / artifact 数 / requires approval 次数"
+echo "$STATE" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const j=JSON.parse(s);console.log('  budgetUsedUsd = '+j.budgetUsedUsd)}catch(e){console.log('  budgetUsedUsd 解析失败')}})"
+echo "  artifact.created 数 = $(curl -s "${BASE}/api/tasks/${TASK_ID}/events" | grep -o '"type":"artifact.created"' | wc -l | tr -d ' ')"
+echo "  requires approval 次数 = $(grep -rho 'requires approval' "$TARGET_REPO/logs" 2>/dev/null | wc -l | tr -d ' ')"
+
 echo "==> log_ref 是否真的指向存在的文件（Task 12/13 未在单测里覆盖的这一环在此补验）"
 for ref in $(curl -s "${BASE}/api/tasks/${TASK_ID}/events" | grep -o '"log_ref":"[^"]*"' | sed 's/.*:"//;s/"$//' | sort -u); do
   if [ -f "$ref" ]; then echo "  OK   $ref"; else echo "  MISS $ref"; fi
 done
 
-echo "==> 目标仓库是否被 agent 改动（隔离是否生效）"
+echo "==> 目标仓库改动（预期：src/ 与 tests/ 的节点产物，加上 data/ logs/ workspaces/ 这些平台运行时目录）"
 git -C "$TARGET_REPO" status --short || true
 
 echo "==> 本仓库是否保持干净（不应被 agent 触碰）"

@@ -1,4 +1,6 @@
 import { execFileSync } from 'node:child_process';
+import { realpathSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 /**
  * 路径安全闸（Task 7 + Task 8）。
@@ -90,13 +92,83 @@ export function matchesOwns(path: string, owns: string[]): boolean {
 }
 
 /**
+ * 把路径归一到「规范化真实路径」：对**最深的存在祖先**做 `realpath`，再把不存在的尾段原样接回。
+ *
+ * 为什么必须做：路径比较的两侧来源不同——`repoPath` 来自 `process.cwd()`（Node 在 macOS 上返回
+ * **真实路径**，如 `/private/tmp/x`），而 `logDir`/`dbPath`/`workspaceRoot` 来自用户配置的**绝对路径**
+ * （可能是 `/tmp/x` 这种经符号链接的写法，macOS 的 `/tmp → /private/tmp`）。若两侧不先归一到同一基准，
+ * `relative()` 会得出 `../../../tmp/x/logs` 这类以 `..` 开头的值，于是运行时目录被误判为「在仓库之外」，
+ * 排除规则整体失效（这正是本修复第一版在真实冒烟里未生效的原因）。
+ */
+function canonicalPath(path: string): string {
+  const abs = resolve(path);
+  let current = abs;
+  const tail: string[] = [];
+  for (;;) {
+    try {
+      const real = realpathSync(current);
+      return tail.length === 0 ? real : join(real, ...tail);
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) return abs;
+      tail.unshift(basename(current));
+      current = parent;
+    }
+  }
+}
+
+/**
+ * 平台自身运行时目录 → **仓库内相对前缀**。
+ *
+ * 为什么需要：日志（`logDir`）、事件库（`dbPath` 所在目录）、工作区/worktree 根（`workspaceRoot`）
+ * 都是**平台自己写入**的产物，不属于任何节点的改动。默认配置下它们就落在目标仓库（`repoPath`）之内
+ * （`AGENTFLOW_LOG_DIR=./logs`、`AGENTFLOW_DB_PATH=./data/agentflow.sqlite`、
+ * `AGENTFLOW_WORKSPACE_DIR=./workspaces`），于是会被 `git status` 采集为「节点变更」，
+ * 使 `owns` 核对把平台日志当成节点越界写——只读角色（`owns: []`）必然误判失败。
+ *
+ * 这里一律**从注入的配置路径推导**（不做 `logs`/`data`/`workspaces` 字面量硬编码），
+ * 用户改了目录名同样有效。路径比较先经 `canonicalPath` 归一（消除符号链接差异），
+ * 仅保留确实位于 `repoPath` 之内的目录；位于仓库之外或恰为仓库根（不可能被采集为仓库相对改动）者忽略。
+ */
+export function runtimeExcludePrefixes(
+  repoPath: string,
+  runtimeDirs: (string | null | undefined)[],
+): string[] {
+  const repoAbs = canonicalPath(repoPath);
+  const prefixes: string[] = [];
+  for (const dir of runtimeDirs) {
+    if (!dir || dir === ':memory:') continue;
+    const abs = canonicalPath(isAbsolute(dir) ? dir : resolve(repoPath, dir));
+    const rel = relative(repoAbs, abs);
+    // 位于仓库之外（以 `..` 跳出）或恰为仓库根 → 不会被采集为仓库相对改动，无需排除
+    if (rel === '' || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) continue;
+    prefixes.push(normalizeRepoPath(rel));
+  }
+  return [...new Set(prefixes)];
+}
+
+/** 路径是否落在某个排除前缀之下（含前缀自身，按整段匹配，`logs` 不匹配 `logsx/...`） */
+export function isUnderPrefix(path: string, prefixes: string[]): boolean {
+  const normalized = normalizeRepoPath(path);
+  if (normalized === '') return false;
+  return prefixes.some((prefix) => normalized === prefix || normalized.startsWith(`${prefix}/`));
+}
+
+/**
  * 从实际变更路径里挑出**越界**的那些。
  * `owns` 为空表示该角色只读（不写任何路径）——此时任何变更都算越界。
+ * `excludePrefixes` 为平台自身运行时目录的仓库相对前缀（见 `runtimeExcludePrefixes`），
+ * 这些路径由平台写入、不属于节点改动，**先排除再比对 `owns`**（否则默认配置下只读角色必被误判）。
  */
-export function findOwnViolations(changedPaths: string[], owns: string[]): string[] {
+export function findOwnViolations(
+  changedPaths: string[],
+  owns: string[],
+  excludePrefixes: string[] = [],
+): string[] {
   const violations = changedPaths
     .map(normalizeRepoPath)
     .filter((path) => path !== '')
+    .filter((path) => !isUnderPrefix(path, excludePrefixes))
     .filter((path) => !matchesOwns(path, owns));
   return [...new Set(violations)].sort();
 }

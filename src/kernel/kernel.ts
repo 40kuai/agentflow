@@ -1,4 +1,4 @@
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { jsonSchemaForArtifact, parseArtifactPayload, type ArtifactType, type ParsedArtifactPayload } from '../shared/artifacts.js';
 import { newId } from '../shared/ids.js';
 import { FAILURE_REASON_LABELS, type FailureReason, type KernelEvent } from '../shared/events.js';
@@ -11,6 +11,8 @@ import {
   checkBatchOwns,
   collectChangedPaths,
   findOwnViolations,
+  isUnderPrefix,
+  runtimeExcludePrefixes,
   type BatchConflictPolicy,
 } from './path-guard.js';
 import { mergeBatchChanges } from './merge.js';
@@ -27,6 +29,12 @@ export type KernelDeps = {
   workspaceRoot: string;
   logDir: string;
   repoPath: string;
+  /**
+   * 事件库文件路径（由 `AGENTFLOW_DB_PATH` 注入）。仅用于推导「平台自身运行时目录」，
+   * 使 `owns` 越界核对排除 **事件库所在目录**（默认 `./data/agentflow.sqlite` → 排除 `data/`，
+   * 连同 `-wal`/`-shm` 旁路文件）。传 `':memory:'` 或无文件库时可不传。
+   */
+  dbPath?: string;
   maxSteps: number;
   /**
    * 并行批次内 `owns` 重叠时的处理策略：serialize=改为串行；reject=拒绝该批次。
@@ -69,6 +77,18 @@ export type Kernel = {
 
 export function createKernel(deps: KernelDeps): Kernel {
   const { store, workflow, roles } = deps;
+
+  // 平台自身运行时目录（日志 / 事件库 / 工作区根）的**仓库相对前缀**，一律由注入的配置路径推导
+  // （logDir / workspaceRoot / dbPath 的目录），不硬编码 `logs`/`data`/`workspaces`。
+  // 默认配置下这些目录就落在 repoPath 之内，若不过滤，`git status` 会把平台自己写的日志/库
+  // 采集为「节点变更」，`owns` 核对便把只读角色判成越界——整个平台在默认配置下不可用。
+  const dbDir =
+    deps.dbPath !== undefined && deps.dbPath !== ':memory:' ? dirname(deps.dbPath) : undefined;
+  const runtimePrefixes = runtimeExcludePrefixes(deps.repoPath, [
+    deps.logDir,
+    deps.workspaceRoot,
+    dbDir,
+  ]);
 
   function getState(taskId: string): TaskState {
     const events = store.readTask(taskId);
@@ -507,8 +527,12 @@ export function createKernel(deps: KernelDeps): Kernel {
     // `git status --porcelain` 覆盖未跟踪的新文件——端到端实测的越界（README.md / scripts/hello.sh）
     // 恰恰是未跟踪新文件，`git diff --name-only` 会漏掉它们。
     const changesAfter = collectChangedPaths(ws.path);
-    const changedPaths = changesAfter.filter((path) => !changesBefore.has(path));
-    const outOfBoundsPaths = findOwnViolations(changedPaths, role.owns);
+    // 平台自身运行时产物（日志/事件库/工作区）不属于任何节点的改动：先于基线求差与越界核对剔除，
+    // 使越界核对、合并与事件载荷（changed_paths）都只看到**节点真正写出的路径**。
+    const changedPaths = changesAfter
+      .filter((path) => !changesBefore.has(path))
+      .filter((path) => !isUnderPrefix(path, runtimePrefixes));
+    const outOfBoundsPaths = findOwnViolations(changedPaths, role.owns, runtimePrefixes);
     // 越界路径清单会随所有失败落库（即便节点因别的原因失败，也不把越界这件事丢掉）
     const violationExtra: Record<string, unknown> =
       outOfBoundsPaths.length > 0

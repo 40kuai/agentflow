@@ -25,6 +25,8 @@ const kernel = createKernel({
   workspaceRoot: resolve(env.workspaceDir),
   logDir: resolve(env.logDir),
   repoPath: process.cwd(),
+  // 事件库路径注入内核：用于在 `owns` 越界核对时排除平台自身的事件库目录（默认 ./data/）
+  dbPath: resolve(env.dbPath),
   maxSteps: 50,
   batchConflictPolicy: env.batchConflictPolicy,
   globalConcurrency: env.globalConcurrency,

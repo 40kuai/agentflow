@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -746,6 +746,91 @@ describe('owns 路径级强制与越界检出（Task 7）', () => {
     const failed = kernel.getEvents(taskId).find((e) => e.type === 'node.failed');
     expect(failed?.payload['reason_category']).toBe('permission_denied');
     expect(failed?.payload['out_of_bounds_paths']).toEqual(['pm-note.md']);
+    store.close();
+  });
+
+  it('平台运行时目录位于仓库内时：只读角色不因平台自身日志/库被判越界（回归）', async () => {
+    const realRepo = makeGitRepo();
+    // 复刻真实冒烟形态：repoPath 经符号链接（process.cwd() 在 macOS 上会返回真实路径），
+    // 而配置里的 logDir/dbPath 用真实路径——两侧不归一到同一基准就推导不出排除前缀。
+    const linkRepo = `${realRepo}-link`;
+    symlinkSync(realRepo, linkRepo);
+    // 默认配置形态：日志 / 事件库 / 工作区根都落在目标仓库（repoPath）之内。
+    // 缺陷即发生在此形态下——平台自己写的 logs/runs/*.jsonl 被采集为 pm（owns: []）的「节点变更」。
+    const logDir = join(realRepo, 'logs');
+    const workspaceRoot = join(realRepo, 'workspaces');
+    const dbPath = join(realRepo, 'data', 'agentflow.sqlite');
+    const store = createEventStore(dbPath);
+    const runner = createFakeRunner({
+      scripts: [scriptFor('requirement'), scriptFor('code_diff'), scriptFor('test_report')],
+      // 模拟平台 runner 写运行日志（真实 runner 的 createWriteStream(logDir/runs/<run>.jsonl)）
+      onRun: (req) => {
+        mkdirSync(join(logDir, 'runs'), { recursive: true });
+        writeFileSync(join(logDir, 'runs', `${req.runId}.jsonl`), '{}\n');
+      },
+    });
+    const kernel = createKernel({
+      store,
+      runner,
+      workflow,
+      roles: roles(),
+      maxPromptTokens: 30_000,
+      workspaceRoot,
+      logDir,
+      repoPath: linkRepo,
+      dbPath,
+      maxSteps: 20,
+    });
+
+    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    const state = await kernel.runTask(taskId);
+
+    // 前置：平台确实写了运行日志（否则本用例没有落到缺陷场景）
+    expect(existsSync(join(logDir, 'runs'))).toBe(true);
+    expect(state.status).toBe('completed');
+    expect(state.nodes['pm_analyze']?.status).toBe('succeeded');
+    expect(kernel.getEvents(taskId).some((e) => e.type === 'artifact.invalidated')).toBe(false);
+    // 事件载荷里也不应把平台运行时文件当作节点改动
+    const succeeded = kernel.getEvents(taskId).find((e) => e.type === 'node.succeeded');
+    expect(succeeded?.payload['changed_paths']).toEqual([]);
+    store.close();
+    rmSync(linkRepo, { force: true });
+  });
+
+  it('平台运行时目录位于仓库内时：真实越界（写 README.md）仍被检出', async () => {
+    const repo = makeGitRepo();
+    const logDir = join(repo, 'logs');
+    const store = createEventStore(':memory:');
+    const runner = createFakeRunner({
+      scripts: [scriptFor('requirement'), scriptFor('code_diff'), scriptFor('test_report')],
+      onRun: (req) => {
+        // 平台自身日志（应被排除）
+        mkdirSync(join(logDir, 'runs'), { recursive: true });
+        writeFileSync(join(logDir, 'runs', `${req.runId}.jsonl`), '{}\n');
+        // 节点真实越界（不得被排除）
+        if (req.artifactType === 'code_diff') {
+          writeFileSync(join(req.workdir, 'README.md'), '# 越界写入\n');
+        }
+      },
+    });
+    const kernel = createKernel({
+      store,
+      runner,
+      workflow,
+      roles: roles(),
+      maxPromptTokens: 30_000,
+      workspaceRoot: join(repo, '.agentflow-ws'),
+      logDir,
+      repoPath: repo,
+      maxSteps: 20,
+    });
+
+    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    const state = await kernel.runTask(taskId);
+
+    expect(state.status).toBe('failed');
+    const invalidated = kernel.getEvents(taskId).find((e) => e.type === 'artifact.invalidated');
+    expect(invalidated?.payload['out_of_bounds_paths']).toEqual(['README.md']);
     store.close();
   });
 });
