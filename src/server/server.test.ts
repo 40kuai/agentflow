@@ -1,8 +1,9 @@
-import { mkdirSync, mkdtempSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createServer } from './server.js';
+import { loadRole } from '../config/loader.js';
 import { createEventStore, type EventStore } from '../kernel/event-store.js';
 import { createKernel, type Kernel } from '../kernel/kernel.js';
 import { createFakeRunner, type FakeRunner, type FakeScriptItem } from '../runner/fake-runner.js';
@@ -72,25 +73,44 @@ type Boot = {
   logDir: string;
 };
 
-function boot(options?: { scripts?: FakeScriptItem[][] }): Boot {
+type BootOptions = {
+  scripts?: FakeScriptItem[][];
+  /** 角色查询/编辑 API 的配置根目录（测试必须用 mkdtemp 出来的副本，绝不能指向真实 config/） */
+  configDir?: string;
+  /** 刻意不向服务注入工作流，用于验证流转视图的 503 边界 */
+  omitWorkflow?: boolean;
+};
+
+function boot(options?: BootOptions): Boot {
   const repo = mkdtempSync(join(tmpdir(), 'agentflow-repo-'));
   writeFileSync(join(repo, 'README.md'), '# x\n');
   const logDir = join(repo, 'logs');
   const store = createEventStore(':memory:');
   const runner = createFakeRunner({ scripts: options?.scripts ?? [DEFAULT_SCRIPT] });
+  const roles = new Map<string, RoleDef>([['pm', role()]]);
   const kernel = createKernel({
     store,
     runner,
     workflow,
-    roles: new Map([['pm', role()]]),
+    roles,
     maxPromptTokens: 30_000,
     workspaceRoot: join(repo, '.ws'),
     logDir,
     repoPath: repo,
     maxSteps: 5,
   });
-  // store 与 logDir 都交给服务层：列表从事件库聚合，日志端点需要日志根目录做穿越校验
-  const server = createServer({ kernel, store, logDir, host: '127.0.0.1', port: 0 });
+  // store 与 logDir 都交给服务层：列表从事件库聚合，日志端点需要日志根目录做穿越校验；
+  // workflow/roles 供流转视图与角色使用情况使用；configDir 供角色查询/编辑 API 使用。
+  const server = createServer({
+    kernel,
+    store,
+    logDir,
+    host: '127.0.0.1',
+    port: 0,
+    ...(options?.omitWorkflow ? {} : { workflow }),
+    roles,
+    ...(options?.configDir ? { configDir: options.configDir } : {}),
+  });
   closers.push(async () => {
     await server.close();
     store.close();
@@ -626,5 +646,346 @@ describe('日志端点：错误原因码（F 项）', () => {
     });
     expect(res.statusCode).toBe(404);
     expect(res.json()).toMatchObject({ code: 'FILE_NOT_FOUND' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 5：角色与流转的查询 API
+// ---------------------------------------------------------------------------
+
+/**
+ * 角色 API 的测试配置目录：把**真实 config/ 复制一份**到临时目录再测。
+ * 编辑角色会真实写文件，绝不能落在仓库的 config/ 上（那会污染真实配置）。
+ */
+function makeTempConfigDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'agentflow-server-cfg-'));
+  cpSync(resolve(process.cwd(), 'config'), dir, { recursive: true });
+  return dir;
+}
+
+/** 一份合法的 pm 角色编辑请求体（snake_case 配置字段对应的 camelCase 形态） */
+function pmEdit(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    displayName: '产品经理',
+    systemPromptRef: 'prompts/pm.md',
+    inputs: [],
+    outputs: ['requirement'],
+    owns: [],
+    reads: ['docs/**'],
+    responsibilities: ['澄清需求'],
+    prohibitions: ['不写代码'],
+    doneCriteria: ['产出 requirement'],
+    model: 'sonnet',
+    maxRetries: 2,
+    maxWallTimeMs: 900000,
+    ...overrides,
+  };
+}
+
+describe('Task 5：角色列表与详情 API', () => {
+  it('GET /api/roles 返回全部角色的职责/禁止事项/完成判据/可写路径/可读路径/模型/预算', async () => {
+    const configDir = makeTempConfigDir();
+    const { server } = boot({ configDir });
+    const res = await server.app.inject({ method: 'GET', url: '/api/roles' });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { roles: Array<Record<string, unknown>> };
+    expect(body.roles.map((r) => r['id']).sort()).toEqual(['backend_dev', 'pm', 'qa_engineer']);
+
+    const pm = body.roles.find((r) => r['id'] === 'pm')!;
+    expect(pm['displayName']).toBe('产品经理');
+    expect(pm['systemPromptRef']).toBe('prompts/pm.md');
+    expect(pm['responsibilities']).toEqual([
+      '把用户的一句话需求转写成可执行、可验收的需求文档（产物 requirement）',
+      '明确划定"不做什么"，防止范围蔓延',
+      '给出可被观测验证的验收标准',
+    ]);
+    expect(Array.isArray(pm['prohibitions'])).toBe(true);
+    expect(Array.isArray(pm['doneCriteria'])).toBe(true);
+    expect(pm['owns']).toEqual([]);
+    expect(pm['reads']).toEqual(['docs/**']);
+    expect(pm['model']).toBe('sonnet');
+    expect(pm['budget']).toEqual({ maxRetries: 2, maxWallTimeMs: 900000 });
+  });
+
+  it('GET /api/roles/:id 返回详情；未知角色 404；非法 id 400', async () => {
+    const configDir = makeTempConfigDir();
+    const { server } = boot({ configDir });
+
+    const ok = await server.app.inject({ method: 'GET', url: '/api/roles/backend_dev' });
+    expect(ok.statusCode).toBe(200);
+    const body = ok.json() as Record<string, unknown>;
+    expect(body['id']).toBe('backend_dev');
+    expect(body['owns']).toEqual(['src/**']);
+    expect(body['budget']).toEqual({ maxRetries: 2, maxWallTimeMs: 1800000 });
+
+    const missing = await server.app.inject({ method: 'GET', url: '/api/roles/nope' });
+    expect(missing.statusCode).toBe(404);
+
+    // 非法 id 必须挡在文件路径拼接之前（杜绝 `../` 之类越界读文件）
+    const bad = await server.app.inject({ method: 'GET', url: '/api/roles/bad.id' });
+    expect(bad.statusCode).toBe(400);
+    expect(bad.json()).toMatchObject({ code: 'INVALID_ROLE_ID' });
+  });
+
+  it('未配置 configDir 时角色 API 返回 503，而不是伪装成空列表', async () => {
+    const { server } = boot();
+    const res = await server.app.inject({ method: 'GET', url: '/api/roles' });
+    expect(res.statusCode).toBe(503);
+    expect(res.json()).toMatchObject({ code: 'CONFIG_DIR_MISSING' });
+  });
+});
+
+describe('Task 5：某任务的角色使用情况', () => {
+  it('返回 角色↔节点↔状态↔产出类型↔耗时↔花费（结构化字段）', async () => {
+    const b = boot();
+    const taskId = await startAndRun(b, '角色使用');
+    const res = await b.server.app.inject({ method: 'GET', url: `/api/tasks/${taskId}/roles` });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      taskId: string;
+      totalCostUsd: number;
+      roles: Array<{
+        roleId: string;
+        displayName: string | null;
+        model: string | null;
+        budget: { maxRetries: number; maxWallTimeMs: number } | null;
+        totalCostUsd: number;
+        nodes: Array<{
+          nodeId: string;
+          status: string;
+          produces: string | null;
+          artifactTypes: string[];
+          attempt: number;
+          durationMs: number | null;
+          costUsd: number;
+        }>;
+      }>;
+    };
+    expect(body.taskId).toBe(taskId);
+    expect(body.roles).toHaveLength(1);
+    const pm = body.roles[0]!;
+    expect(pm).toMatchObject({ roleId: 'pm', displayName: '产品经理', model: 'sonnet' });
+    expect(pm.budget).toEqual({ maxRetries: 1, maxWallTimeMs: 60_000 });
+    expect(pm.nodes).toHaveLength(1);
+    expect(pm.nodes[0]).toMatchObject({
+      nodeId: 'pm_analyze',
+      status: 'succeeded',
+      produces: 'requirement',
+      artifactTypes: ['requirement'],
+      attempt: 1,
+      costUsd: 0.02,
+    });
+    expect(typeof pm.nodes[0]!.durationMs).toBe('number');
+    expect(pm.totalCostUsd).toBeCloseTo(0.02, 10);
+    expect(body.totalCostUsd).toBeCloseTo(0.02, 10);
+  });
+
+  it('边界：只有 task.created、没有任何节点的任务 → roles 为空数组', async () => {
+    const b = boot();
+    const taskId = b.kernel.startTask({ title: '空', requirementRaw: 'r', baseBranch: 'main' });
+    const res = await b.server.app.inject({ method: 'GET', url: `/api/tasks/${taskId}/roles` });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ taskId, roles: [], totalCostUsd: 0 });
+  });
+
+  it('未知任务返回 404', async () => {
+    const { server } = boot();
+    const res = await server.app.inject({ method: 'GET', url: '/api/tasks/task_ghost/roles' });
+    expect(res.statusCode).toBe(404);
+  });
+});
+
+describe('Task 5：某任务的流转视图', () => {
+  it('返回拓扑（节点+边+边说明）与每节点的进入理由、状态、耗时、花费', async () => {
+    const b = boot();
+    const taskId = await startAndRun(b);
+    const res = await b.server.app.inject({ method: 'GET', url: `/api/tasks/${taskId}/flow` });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      taskId: string;
+      status: string;
+      edges: unknown[];
+      transfers: unknown[];
+      taskFailure: unknown;
+      nodes: Array<Record<string, unknown>>;
+    };
+    expect(body.taskId).toBe(taskId);
+    expect(body.status).toBe('completed');
+    expect(body.edges).toEqual([]);
+    expect(body.nodes).toHaveLength(1);
+    const node = body.nodes[0]!;
+    expect(node).toMatchObject({
+      id: 'pm_analyze',
+      title: '需求分析',
+      role: 'pm',
+      roleDisplayName: '产品经理',
+      status: 'succeeded',
+      produces: 'requirement',
+      current: false,
+      artifactTypes: ['requirement'],
+    });
+    expect(node['enterReason']).toMatchObject({ from: '', reason: '任务开始，进入起始节点' });
+    expect((node['enterReason'] as Record<string, unknown>)['edge']).toBeNull();
+    expect(node['blockedReason']).toBeNull();
+    expect(node['costUsd']).toBeCloseTo(0.02, 10);
+    expect(typeof node['durationMs']).toBe('number');
+    expect(body.transfers).toHaveLength(1);
+    expect(body.taskFailure).toBeNull();
+  });
+
+  it('失败节点带分类化阻塞原因，任务级失败原因同时含分类与未满足条件', async () => {
+    const FAIL_SCRIPT: FakeScriptItem[] = [
+      { kind: 'failure', reason: 'timeout', detail: 'CLI 超时' },
+      { kind: 'exited', code: 1 },
+    ];
+    const b = boot({ scripts: [FAIL_SCRIPT] });
+    const taskId = await startAndRun(b);
+    const res = await b.server.app.inject({ method: 'GET', url: `/api/tasks/${taskId}/flow` });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      status: string;
+      taskFailure: {
+        reason: string;
+        category: string | null;
+        label: string | null;
+        unmetConditions: string[];
+        artifactStatuses: unknown[];
+      } | null;
+      nodes: Array<Record<string, unknown>>;
+    };
+    expect(body.status).toBe('failed');
+    const node = body.nodes[0]!;
+    expect(node['status']).toBe('failed');
+    expect(node['blockedReason']).toMatchObject({ category: 'timeout', label: '超时' });
+    expect((node['blockedReason'] as Record<string, unknown>)['error']).toContain('CLI 退出码 1');
+    expect(body.taskFailure).toMatchObject({ category: 'timeout', label: '超时' });
+    expect(Array.isArray(body.taskFailure!.unmetConditions)).toBe(true);
+    expect(Array.isArray(body.taskFailure!.artifactStatuses)).toBe(true);
+  });
+
+  it('边界：未跑过的任务 → 节点 not_started、无转移、无失败原因', async () => {
+    const b = boot();
+    const taskId = b.kernel.startTask({ title: '未跑', requirementRaw: 'r', baseBranch: 'main' });
+    const res = await b.server.app.inject({ method: 'GET', url: `/api/tasks/${taskId}/flow` });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      nodes: Array<Record<string, unknown>>;
+      transfers: unknown[];
+      taskFailure: unknown;
+    };
+    expect(body.nodes[0]).toMatchObject({ id: 'pm_analyze', status: 'not_started', attempt: 0 });
+    expect(body.nodes[0]!['enterReason']).toBeNull();
+    expect(body.transfers).toEqual([]);
+    expect(body.taskFailure).toBeNull();
+  });
+
+  it('未知任务返回 404；未注入工作流时返回 503', async () => {
+    const { server } = boot();
+    const ghost = await server.app.inject({ method: 'GET', url: '/api/tasks/task_ghost/flow' });
+    expect(ghost.statusCode).toBe(404);
+
+    const withoutWf = boot({ omitWorkflow: true });
+    const taskId = withoutWf.kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    const res = await withoutWf.server.app.inject({ method: 'GET', url: `/api/tasks/${taskId}/flow` });
+    expect(res.statusCode).toBe(503);
+    expect(res.json()).toMatchObject({ code: 'WORKFLOW_MISSING' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 6：角色编辑 API（校验通过才写回 YAML；失败不产生任何写入）
+// ---------------------------------------------------------------------------
+
+describe('Task 6：角色编辑 API', () => {
+  it('合法编辑写回后，重新加载（生产加载器）得到与提交一致的角色', async () => {
+    const configDir = makeTempConfigDir();
+    const { server } = boot({ configDir });
+    const res = await server.app.inject({
+      method: 'PUT',
+      url: '/api/roles/pm',
+      payload: pmEdit({ reads: ['docs/**', 'specs/**'], responsibilities: ['澄清需求', '划定范围'], maxRetries: 1, maxWallTimeMs: 1000 }),
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { role: Record<string, unknown>; path: string };
+    expect(body.role).toMatchObject({
+      id: 'pm',
+      reads: ['docs/**', 'specs/**'],
+      responsibilities: ['澄清需求', '划定范围'],
+      budget: { maxRetries: 1, maxWallTimeMs: 1000 },
+    });
+    expect(body.path).toBe(join(configDir, 'roles', 'pm.yaml'));
+
+    // 用生产加载路径重新加载：得到与提交一致的角色
+    const role = loadRole(configDir, 'pm');
+    expect(role.reads).toEqual(['docs/**', 'specs/**']);
+    expect(role.responsibilities).toEqual(['澄清需求', '划定范围']);
+    expect(role.maxRetries).toBe(1);
+    expect(role.maxWallTimeMs).toBe(1000);
+
+    // 查询 API 也能读到编辑后的值
+    const detail = await server.app.inject({ method: 'GET', url: '/api/roles/pm' });
+    expect((detail.json() as Record<string, unknown>)['reads']).toEqual(['docs/**', 'specs/**']);
+  });
+
+  it('非法编辑（预算为负）：返回 400，配置文件逐字不变', async () => {
+    const configDir = makeTempConfigDir();
+    const target = join(configDir, 'roles', 'pm.yaml');
+    const before = readFileSync(target, 'utf8');
+    const { server } = boot({ configDir });
+
+    const res = await server.app.inject({
+      method: 'PUT',
+      url: '/api/roles/pm',
+      payload: pmEdit({ maxWallTimeMs: -5 }),
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toContain('请求体不合法');
+    expect(readFileSync(target, 'utf8')).toBe(before);
+  });
+
+  it('必填字段缺失（responsibilities 为空数组）：返回 400，配置文件逐字不变', async () => {
+    const configDir = makeTempConfigDir();
+    const target = join(configDir, 'roles', 'pm.yaml');
+    const before = readFileSync(target, 'utf8');
+    const { server } = boot({ configDir });
+
+    const res = await server.app.inject({
+      method: 'PUT',
+      url: '/api/roles/pm',
+      payload: pmEdit({ responsibilities: [] }),
+    });
+    expect(res.statusCode).toBe(400);
+    expect(readFileSync(target, 'utf8')).toBe(before);
+  });
+
+  it('破坏契约一致性的编辑（改 outputs）：写入前被拒 422，配置文件逐字不变', async () => {
+    const configDir = makeTempConfigDir();
+    const target = join(configDir, 'roles', 'pm.yaml');
+    const before = readFileSync(target, 'utf8');
+    const { server } = boot({ configDir });
+
+    // pm 的 outputs 是工作流 pm_analyze 节点 produces 的权威来源；改掉它会让二者冲突，
+    // 必须复用加载期一致性校验在**写入前**拒绝（否则会写出无法加载的配置）。
+    const res = await server.app.inject({
+      method: 'PUT',
+      url: '/api/roles/pm',
+      payload: pmEdit({ outputs: ['test_report'] }),
+    });
+    expect(res.statusCode).toBe(422);
+    expect(res.body).toContain('编辑被拒绝');
+    expect(res.body).toContain('契约冲突');
+    expect(readFileSync(target, 'utf8')).toBe(before);
+  });
+
+  it('编辑不存在的角色返回 404，且不会凭空创建文件', async () => {
+    const configDir = makeTempConfigDir();
+    const { server } = boot({ configDir });
+    const res = await server.app.inject({
+      method: 'PUT',
+      url: '/api/roles/ghost',
+      payload: pmEdit(),
+    });
+    expect(res.statusCode).toBe(404);
+    expect(existsSync(join(configDir, 'roles', 'ghost.yaml'))).toBe(false);
   });
 });

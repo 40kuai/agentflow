@@ -36,6 +36,10 @@ const server = createServer({
   logDir: resolve(env.logDir),
   host: env.host,
   port: env.port,
+  // 角色查询/编辑 API 的数据源（配置文件）与流转视图的拓扑来源（内核实际使用的工作流/角色）
+  configDir: resolve(env.configDir),
+  workflow,
+  roles,
 });
 
 await server.app.listen({ host: env.host, port: env.port });
