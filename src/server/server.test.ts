@@ -689,7 +689,16 @@ describe('Task 5：角色列表与详情 API', () => {
     const res = await server.app.inject({ method: 'GET', url: '/api/roles' });
     expect(res.statusCode).toBe(200);
     const body = res.json() as { roles: Array<Record<string, unknown>> };
-    expect(body.roles.map((r) => r['id']).sort()).toEqual(['backend_dev', 'pm', 'qa_engineer']);
+    // 期望值随 config/roles 真实注册数更新：Task 12 新增了 parallel_dev 用的 3 个角色
+    // （pm_planner / backend_dev_module_a / backend_dev_module_b）。
+    expect(body.roles.map((r) => r['id']).sort()).toEqual([
+      'backend_dev',
+      'backend_dev_module_a',
+      'backend_dev_module_b',
+      'pm',
+      'pm_planner',
+      'qa_engineer',
+    ]);
 
     const pm = body.roles.find((r) => r['id'] === 'pm')!;
     expect(pm['displayName']).toBe('产品经理');

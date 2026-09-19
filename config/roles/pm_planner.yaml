@@ -1,0 +1,26 @@
+id: pm_planner
+display_name: 产品经理（工作包拆解）
+system_prompt_ref: prompts/pm_planner.md
+inputs:
+  - requirement
+outputs:
+  - work_package_plan
+# owns 为空 = 只读角色：工作包拆解只输出计划产物，不写任何文件
+owns: []
+reads:
+  - "docs/**"
+responsibilities:
+  - 依据已澄清的 requirement，把它拆解为可独立并行开发的工作包（产物 work_package_plan）
+  - 为每个工作包声明写入范围 owns、读取范围 reads、依赖 depends_on 与接口契约 interface_contract
+  - 给出每个工作包对应的验收标准引用 acceptance_refs，使下游开发有据可依
+prohibitions:
+  - 不修改任何代码或测试文件（owns 为空，属只读角色）
+  - 不得让同一计划内两个工作包的 owns 在相同路径上重叠——重叠会使本应并行的开发互相覆盖，占用检查会据此把并行降级为串行
+  - 不臆造工作包：需求仍存在关键歧义时不得把 status 判为 ok
+done_criteria:
+  - 已产出 work_package_plan 产物，且通过其 JSON Schema 校验
+  - 每个工作包都声明了 owns / reads / depends_on / interface_contract / acceptance_refs
+  - 同一计划内任意两个工作包的 owns 互不相交（这是它们能并行开发的前提）
+model: sonnet
+max_retries: 2
+max_wall_time_ms: 900000

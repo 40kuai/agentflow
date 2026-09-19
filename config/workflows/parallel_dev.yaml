@@ -1,0 +1,102 @@
+id: parallel_dev
+# ============================================================================
+# 并行示例工作流（Task 12）：PM 拆解工作包 → 扇出两个开发节点并行开发 → join 到测试节点。
+#
+# 与 simple_dev 的关系：
+#   - simple_dev 是**串行等价性基线**（三节点直线、全部 isolate:false），其行为不得改变；
+#   - 本文件是**独立的并行演示**，刻意让两个开发节点写入**不同的模块目录**
+#     （src/module_a/** 与 src/module_b/**），以保证它们的 owns 互不相交、能通过占用检查。
+#     这与 simple_dev 里 backend_dev 写整个 src/** 的语义**不同** —— 这里是「按模块切分工作包」的演示，
+#     也正是 PM 工作包拆解（work_package_plan）应有的形态。
+#
+# 契约唯一来源：本文件节点的 consumes/produces 是**派生**字段，权威来源是 config/roles/*.yaml
+# 的 inputs/outputs；二者不一致时加载期报错（见 src/config/loader.ts）。
+#
+# 并行要真正生效还取决于运行期配置：`AGENTFLOW_GLOBAL_CONCURRENCY`（缺省 4）≥2 时两个开发节点才真并发；
+# 占用检查判定 owns 不相交后才会并行（重叠时按 `AGENTFLOW_BATCH_CONFLICT_POLICY` 退化为串行或拒绝）；
+# 并发批次内的节点自动在独立 git worktree 中运行，批次结束后按 owns 归属确定性合并回主工作区
+# （见 src/kernel/path-guard.ts、src/kernel/kernel.ts、src/kernel/merge.ts）。
+# ============================================================================
+start: pm_analyze
+nodes:
+  - id: pm_analyze
+    title: 需求分析
+    role: pm
+    description: 把原始需求转写成可验收的需求文档，是整条流程的起点。
+    entry_condition: 任务开始即进入（起始节点）。
+    consumes: []
+    produces: requirement
+    isolate: false
+
+  - id: pm_plan
+    title: 工作包拆解
+    role: pm_planner
+    description: 依据需求文档把工作拆成若干工作包，为每个工作包划定互不重叠的写入范围（owns），供下游并行开发。
+    entry_condition: 上游 pm_analyze 产出 requirement 且其 status 为 ok。
+    consumes:
+      - requirement
+    produces: work_package_plan
+    isolate: false
+
+  - id: dev_module_a
+    title: 开发模块 A（并行）
+    role: backend_dev_module_a
+    description: 实现工作包计划中模块 A 的部分，只写 src/module_a/**；与模块 B 的写入范围互不相交，可与之并行。
+    entry_condition: 上游 pm_plan 产出 work_package_plan 且其 status 为 ok（与 dev_module_b 同一批次被激活）。
+    consumes:
+      - work_package_plan
+    produces: code_diff
+    # 显式声明隔离：并行节点必须各跑在独立 worktree 中，批次结束后按 owns 归属合并回主工作区
+    isolate: true
+
+  - id: dev_module_b
+    title: 开发模块 B（并行）
+    role: backend_dev_module_b
+    description: 实现工作包计划中模块 B 的部分，只写 src/module_b/**；与模块 A 的写入范围互不相交，可与之并行。
+    entry_condition: 上游 pm_plan 产出 work_package_plan 且其 status 为 ok（与 dev_module_a 同一批次被激活）。
+    consumes:
+      - work_package_plan
+    produces: code_diff
+    isolate: true
+
+  - id: qa_verify
+    title: 测试验证（join）
+    role: qa_engineer
+    description: 两个开发节点全部结束后，针对需求与全部代码改动编写并运行测试，如实汇总结果；缺陷通过产物报告，不改实现。
+    entry_condition: 上游 dev_module_a 与 dev_module_b 均已完成并产出 code_diff 且其 status 为 ok。
+    consumes:
+      - requirement
+      - code_diff
+    produces: test_report
+    isolate: false
+
+edges:
+  - from: pm_analyze
+    to: pm_plan
+    when: "all(artifacts.requirement.status == 'ok')"
+    description: 需求已澄清（status=ok）时才进入工作包拆解；否则不应带着歧义拆解工作包。
+    on_missing: fail
+
+  - from: pm_plan
+    to: dev_module_a
+    when: "all(artifacts.work_package_plan.status == 'ok')"
+    description: 扇出（fan-out）：工作包计划就绪（status=ok）时激活模块 A 的开发节点。
+    on_missing: fail
+
+  - from: pm_plan
+    to: dev_module_b
+    when: "all(artifacts.work_package_plan.status == 'ok')"
+    description: 扇出（fan-out）：工作包计划就绪（status=ok）时激活模块 B 的开发节点。
+    on_missing: fail
+
+  - from: dev_module_a
+    to: qa_verify
+    when: "all(artifacts.code_diff.status == 'ok')"
+    description: 汇聚（join）：模块 A 与模块 B 的开发都完成（所有 code_diff.status=ok）后才进入测试验证；另一路未完成时应保持等待。
+    on_missing: wait
+
+  - from: dev_module_b
+    to: qa_verify
+    when: "all(artifacts.code_diff.status == 'ok')"
+    description: 汇聚（join）：模块 A 与模块 B 的开发都完成（所有 code_diff.status=ok）后才进入测试验证；另一路未完成时应保持等待。
+    on_missing: wait

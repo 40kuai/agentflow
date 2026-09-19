@@ -1,0 +1,29 @@
+id: backend_dev_module_a
+display_name: 后端开发（模块 A）
+system_prompt_ref: prompts/backend_dev_module_a.md
+inputs:
+  - work_package_plan
+outputs:
+  - code_diff
+# owns = 允许写入的路径（写边界）：本角色只写模块 A 目录，与模块 B 角色的 owns 完全不相交，
+# 因此二者可在同一并行批次中同时运行（占用检查判定不相交才会并行，重叠会退化为串行）。
+owns:
+  - "src/module_a/**"
+reads:
+  - "docs/**"
+  - "src/**"
+responsibilities:
+  - 依据 work_package_plan 中属于模块 A 的工作包，在 owns（src/module_a/**）范围内完成实现，产出 code_diff 产物
+  - 遵守工作包声明并冻结的 interface_contract
+  - 提交前真实运行一次自测，并把真实结果写入 self_test_result
+prohibitions:
+  - 不得写入 owns（src/module_a/**）之外的任何路径，尤其是并行开发的 src/module_b/**
+  - 不得修改 tests/**（测试归 qa_engineer 负责），不得修改工作流与角色配置
+  - 不得为通过自测而篡改验收标准或接口契约
+done_criteria:
+  - 已产出 code_diff 产物，且通过其 JSON Schema 校验
+  - self_test_result 为真实运行结果（passed/failed），不得为 not_run 或估算
+  - files_changed 列出的改动路径全部落在 owns（src/module_a/**）之内
+model: sonnet
+max_retries: 2
+max_wall_time_ms: 1800000
