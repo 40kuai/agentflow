@@ -1,7 +1,7 @@
 import { join } from 'node:path';
 import { jsonSchemaForArtifact, parseArtifactPayload, type ArtifactType, type ParsedArtifactPayload } from '../shared/artifacts.js';
 import { newId } from '../shared/ids.js';
-import type { KernelEvent } from '../shared/events.js';
+import { FAILURE_REASON_LABELS, type FailureReason, type KernelEvent } from '../shared/events.js';
 import type { RoleDef, WorkflowDef } from '../shared/domain.js';
 import type { AgentRunner, RunnerEvent } from '../runner/types.js';
 import { assemblePrompt } from './context-assembler.js';
@@ -9,7 +9,7 @@ import type { EventStore } from './event-store.js';
 import { buildFacts } from './facts.js';
 import { project, type TaskState } from './projector.js';
 import { prepareWorkspace, releaseWorkspace } from './scheduler.js';
-import { decideNext } from './state-machine.js';
+import { decideNext, type EdgeEvaluation } from './state-machine.js';
 
 export type KernelDeps = {
   store: EventStore;
@@ -74,7 +74,11 @@ export function createKernel(deps: KernelDeps): Kernel {
         store.append({
           task_id: taskId,
           type: 'task.failed',
-          payload: { reason: `超过最大步数 ${deps.maxSteps}，判定为死循环` },
+          payload: {
+            reason: `超过最大步数 ${deps.maxSteps}，判定为死循环`,
+            reason_category: 'other',
+            reason_label: FAILURE_REASON_LABELS.other,
+          },
           actor: 'kernel',
         });
         return getState(taskId);
@@ -93,26 +97,47 @@ export function createKernel(deps: KernelDeps): Kernel {
         return state;
       }
       if (decision.kind === 'end') {
+        const payload: Record<string, unknown> = { reason: decision.reason };
+        // 失败时把**分类化原因**（稳定枚举 + 中文说明）与结构化解释一并落库，
+        // 界面无需解析 CLI 原始文本即可展示根因；`reason` 仍保留原有中文说明文本。
+        if (decision.failure) {
+          payload['reason_category'] = decision.failure.category;
+          payload['reason_label'] = FAILURE_REASON_LABELS[decision.failure.category];
+          payload['unmet_conditions'] = decision.failure.unmetConditions;
+          payload['artifact_statuses'] = decision.failure.artifactStatuses;
+        }
         store.append({
           task_id: taskId,
           type: decision.status === 'completed' ? 'task.completed' : 'task.failed',
-          payload: { reason: decision.reason },
+          payload,
           actor: 'kernel',
         });
         return getState(taskId);
       }
 
-      await runNode(taskId, decision.nodeId, decision.reason);
+      // 串行消费**激活节点集合**：当前决策恒激活 1 个（fan-out 由后续任务引入），
+      // 逐个 await 保证与改动前的单节点行为等价。
+      for (let i = 0; i < decision.nodeIds.length; i += 1) {
+        await runNode(taskId, decision.nodeIds[i]!, decision.selectedEdges[i] ?? null);
+      }
     }
   }
 
-  async function runNode(taskId: string, nodeId: string, reason: string): Promise<void> {
+  async function runNode(
+    taskId: string,
+    nodeId: string,
+    selectedEdge: EdgeEvaluation | null,
+  ): Promise<void> {
     const node = workflow.nodes.find((n) => n.id === nodeId);
     if (!node) {
       store.append({
         task_id: taskId,
         type: 'task.failed',
-        payload: { reason: `节点 ${nodeId} 不在工作流定义中` },
+        payload: {
+          reason: `节点 ${nodeId} 不在工作流定义中`,
+          reason_category: 'other' satisfies FailureReason,
+          reason_label: FAILURE_REASON_LABELS.other,
+        },
         actor: 'kernel',
       });
       return;
@@ -123,7 +148,11 @@ export function createKernel(deps: KernelDeps): Kernel {
       store.append({
         task_id: taskId,
         type: 'task.failed',
-        payload: { reason: `节点 ${nodeId} 引用了未注册的角色 ${node.role}` },
+        payload: {
+          reason: `节点 ${nodeId} 引用了未注册的角色 ${node.role}`,
+          reason_category: 'other',
+          reason_label: FAILURE_REASON_LABELS.other,
+        },
         actor: 'kernel',
       });
       return;
@@ -140,10 +169,21 @@ export function createKernel(deps: KernelDeps): Kernel {
 
     const previousVisit = stateBefore.visitCounts[nodeId] ?? 0;
 
+    // 转移记录必须是可解释的：所用边、条件表达式原文、该表达式的人类可读说明（直接取自边配置的
+    // description，不在引擎里另造）、以及判定依据（相关产物的实际状态）。
     store.append({
       task_id: taskId,
       type: 'transfer.decided',
-      payload: { from: stateBefore.transfers.at(-1)?.to ?? '', to: nodeId, reason, decided_by: 'rule' },
+      payload: {
+        from: stateBefore.transfers.at(-1)?.to ?? '',
+        to: nodeId,
+        reason: selectedEdge?.reason ?? '任务开始，进入起始节点',
+        decided_by: 'rule',
+        edge: selectedEdge ? { from: selectedEdge.from, to: selectedEdge.to } : null,
+        when: selectedEdge ? selectedEdge.when : null,
+        edge_description: selectedEdge ? selectedEdge.description : null,
+        artifact_statuses: stateBefore.artifacts.map((a) => ({ type: a.type, status: a.status })),
+      },
       actor: 'kernel',
     });
 
@@ -184,6 +224,9 @@ export function createKernel(deps: KernelDeps): Kernel {
     let hasArtifact = false;
     let exitCode: number | null = null;
     const errorLines: string[] = [];
+    // runner 层已分类的失败信号（最后一条为准，即终止性失败）；detail 保留原始文本
+    let failureReason: FailureReason | null = null;
+    let failureDetail: string | null = null;
 
     const readOnly = role.owns.length === 0;
 
@@ -237,6 +280,10 @@ export function createKernel(deps: KernelDeps): Kernel {
             errorLines.push(event.chunk.slice(0, 500));
           }
           break;
+        case 'failure':
+          failureReason = event.reason;
+          failureDetail = event.detail;
+          break;
         case 'exited':
           exitCode = event.code;
           break;
@@ -251,14 +298,20 @@ export function createKernel(deps: KernelDeps): Kernel {
 
     releaseWorkspace(ws, deps.repoPath);
 
-    if (exitCode !== 0) {
+    /**
+     * 统一的失败落库：node.failed 与 task.failed 各写一条，均带**稳定分类枚举 + 中文说明**，
+     * 原始文本保留在 error/raw 字段里（不丢原文，便于排查 CLI 细节）。
+     */
+    function failNode(category: FailureReason, rawError: string, taskReason: string): void {
       store.append({
         task_id: taskId,
         type: 'node.failed',
         payload: {
           node_id: nodeId,
           run_id: ws.runId,
-          error: `CLI 退出码 ${exitCode}${errorLines.length > 0 ? `：${errorLines.join(' / ')}` : ''}`,
+          error: rawError,
+          reason_category: category,
+          reason_label: FAILURE_REASON_LABELS[category],
           log_ref: logRef,
         },
         actor: 'kernel',
@@ -266,30 +319,31 @@ export function createKernel(deps: KernelDeps): Kernel {
       store.append({
         task_id: taskId,
         type: 'task.failed',
-        payload: { reason: `节点 ${nodeId} 执行失败` },
+        payload: {
+          reason: taskReason,
+          reason_category: category,
+          reason_label: FAILURE_REASON_LABELS[category],
+          raw: rawError,
+        },
         actor: 'kernel',
       });
+    }
+
+    if (exitCode !== 0) {
+      // 原始 CLI 文本一并保留：errorLines 已含日志中的错误行，failureDetail 是 runner 归一化的失败原文
+      const detailParts = [...errorLines];
+      if (failureDetail !== null && !detailParts.includes(failureDetail)) {
+        detailParts.push(failureDetail);
+      }
+      const rawError = `CLI 退出码 ${exitCode}${detailParts.length > 0 ? `：${detailParts.join(' / ')}` : ''}`;
+      // 分类来自 runner 层对 CLI subtype 的映射；runner 未给出分类时归入 other
+      failNode(failureReason ?? 'other', rawError, `节点 ${nodeId} 执行失败`);
       return;
     }
 
     if (!hasArtifact) {
-      store.append({
-        task_id: taskId,
-        type: 'node.failed',
-        payload: {
-          node_id: nodeId,
-          run_id: ws.runId,
-          error: `未产出任何结构化结果（期望类型 ${node.produces}）`,
-          log_ref: logRef,
-        },
-        actor: 'kernel',
-      });
-      store.append({
-        task_id: taskId,
-        type: 'task.failed',
-        payload: { reason: `节点 ${nodeId} 未产出结构化结果` },
-        actor: 'kernel',
-      });
+      const rawError = `未产出任何结构化结果（期望类型 ${node.produces}）`;
+      failNode(failureReason ?? 'other', rawError, `节点 ${nodeId} 未产出结构化结果`);
       return;
     }
 
@@ -297,23 +351,7 @@ export function createKernel(deps: KernelDeps): Kernel {
     try {
       parsed = parseArtifactPayload(node.produces as ArtifactType, artifactRaw);
     } catch (error) {
-      store.append({
-        task_id: taskId,
-        type: 'node.failed',
-        payload: {
-          node_id: nodeId,
-          run_id: ws.runId,
-          error: (error as Error).message,
-          log_ref: logRef,
-        },
-        actor: 'kernel',
-      });
-      store.append({
-        task_id: taskId,
-        type: 'task.failed',
-        payload: { reason: `节点 ${nodeId} 产出载荷不合规` },
-        actor: 'kernel',
-      });
+      failNode('invalid_payload', (error as Error).message, `节点 ${nodeId} 产出载荷不合规`);
       return;
     }
 

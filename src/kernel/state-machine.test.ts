@@ -32,15 +32,24 @@ function decide(events: KernelEvent[]) {
 describe('decideNext', () => {
   it('初始状态从 start 节点开始', () => {
     const d = decide([ev('task.created', { title: 't', requirement_raw: 'r', base_branch: 'main' }, 1)]);
-    expect(d).toEqual({ kind: 'start', nodeId: 'pm_analyze', reason: '任务开始，进入起始节点' });
+    expect(d).toEqual({
+      kind: 'start',
+      nodeIds: ['pm_analyze'],
+      selectedEdges: [],
+      skippedEdges: [],
+      reason: '任务开始，进入起始节点',
+    });
   });
 
-  it('有节点运行中时等待', () => {
+  it('有节点运行中时等待（wait 与 failed 必须区分）', () => {
     const d = decide([
       ev('task.created', {}, 1),
       ev('node.started', { node_id: 'pm_analyze', role_id: 'pm', run_id: 'run_1', attempt: 1 }, 2),
     ]);
     expect(d.kind).toBe('wait');
+    if (d.kind === 'wait') {
+      expect(d.runningNodeIds).toEqual(['pm_analyze']);
+    }
   });
 
   it('节点成功后条件满足则转移到下游', () => {
@@ -53,10 +62,25 @@ describe('decideNext', () => {
       }, 3),
       ev('node.succeeded', { node_id: 'pm_analyze', run_id: 'run_1', log_ref: 'x' }, 4),
     ]);
-    expect(d).toEqual({ kind: 'start', nodeId: 'dev_implement', reason: "all(artifacts.requirement.status == 'ok')" });
+    expect(d).toEqual({
+      kind: 'start',
+      nodeIds: ['dev_implement'],
+      selectedEdges: [
+        {
+          from: 'pm_analyze',
+          to: 'dev_implement',
+          when: "all(artifacts.requirement.status == 'ok')",
+          description: null,
+          matched: true,
+          reason: "all(artifacts.requirement.status == 'ok')",
+        },
+      ],
+      skippedEdges: [],
+      reason: "all(artifacts.requirement.status == 'ok')",
+    });
   });
 
-  it('条件不满足时任务失败收尾', () => {
+  it('条件不满足时任务失败收尾，原因含分类 / 未满足条件 / 产物实际状态', () => {
     const d = decide([
       ev('task.created', {}, 1),
       ev('node.started', { node_id: 'pm_analyze', role_id: 'pm', run_id: 'run_1', attempt: 1 }, 2),
@@ -71,6 +95,10 @@ describe('decideNext', () => {
     if (d.kind === 'end') {
       expect(d.status).toBe('failed');
       expect(d.reason).toContain('没有可用的转移');
+      // 失败原因三要素：分类化原因 + 未满足的条件 + 相关产物实际状态
+      expect(d.failure?.category).toBe('condition_unmet');
+      expect(d.failure?.unmetConditions).toEqual(["all(artifacts.requirement.status == 'ok')"]);
+      expect(d.failure?.artifactStatuses).toEqual([{ type: 'requirement', status: 'blocked' }]);
     }
   });
 
@@ -86,15 +114,21 @@ describe('decideNext', () => {
     ]);
     const facts = buildFacts({ state, workflow: wf, roles: new Map() });
     expect(decideNext({ workflow: wf, state, facts })).toEqual({
-      kind: 'start', nodeId: 'dev_implement', reason: '无条件边',
+      kind: 'start',
+      nodeIds: ['dev_implement'],
+      selectedEdges: [
+        { from: 'pm_analyze', to: 'dev_implement', when: null, description: null, matched: true, reason: '无条件边' },
+      ],
+      skippedEdges: [],
+      reason: '无条件边',
     });
   });
 
-  it('多条出边按声明顺序取第一条匹配的', () => {
+  it('多条出边按声明顺序取第一条匹配的，未选中的边带各自原因', () => {
     const wf: WorkflowDef = {
       ...workflow,
       edges: [
-        { from: 'pm_analyze', to: 'qa_verify', when: "all(artifacts.requirement.status == 'ok')", description: '先到 qa', onMissing: 'fail' },
+        { from: 'pm_analyze', to: 'qa_verify', when: 'false', description: '先到 qa', onMissing: 'fail' },
         { from: 'pm_analyze', to: 'dev_implement', when: 'true', description: '再到 dev', onMissing: 'fail' },
       ],
     };
@@ -109,7 +143,24 @@ describe('decideNext', () => {
     ]);
     const facts = buildFacts({ state, workflow: wf, roles: new Map() });
     const d = decideNext({ workflow: wf, state, facts });
-    expect(d).toMatchObject({ kind: 'start', nodeId: 'qa_verify' });
+    expect(d).toMatchObject({ kind: 'start', nodeIds: ['dev_implement'] });
+    if (d.kind === 'start') {
+      // 被选中边：人类可读说明直接取自边配置的 description
+      expect(d.selectedEdges).toEqual([
+        { from: 'pm_analyze', to: 'dev_implement', when: 'true', description: '再到 dev', matched: true, reason: 'true' },
+      ]);
+      // 未选中边及其原因
+      expect(d.skippedEdges).toEqual([
+        {
+          from: 'pm_analyze',
+          to: 'qa_verify',
+          when: 'false',
+          description: '先到 qa',
+          matched: false,
+          reason: '条件求值结果为 false（表达式：false）',
+        },
+      ]);
+    }
   });
 
   it('没有出边的末节点成功后任务完成', () => {
@@ -173,10 +224,10 @@ describe('decideNext', () => {
     const state = project(events);
     const facts = buildFacts({ state, workflow: loopWorkflow, roles: new Map() });
     const d = decideNext({ workflow: loopWorkflow, state, facts });
-    expect(d).toMatchObject({ kind: 'start', nodeId: 'pm_analyze' });
+    expect(d).toMatchObject({ kind: 'start', nodeIds: ['pm_analyze'] });
   });
 
-  it('条件表达式求值失败时不会崩溃，而是判为不匹配', () => {
+  it('条件表达式求值失败时不会崩溃，而是判为不匹配（跳过原因说明求值失败）', () => {
     const wf: WorkflowDef = {
       ...workflow,
       edges: [{ from: 'pm_analyze', to: 'dev_implement', when: 'nonexistent.path == 1' }],
@@ -189,6 +240,12 @@ describe('decideNext', () => {
     const facts = buildFacts({ state, workflow: wf, roles: new Map() });
     const d = decideNext({ workflow: wf, state, facts });
     expect(d.kind).toBe('end');
+    if (d.kind === 'end') {
+      expect(d.status).toBe('failed');
+      expect(d.failure?.category).toBe('condition_unmet');
+      expect(d.failure?.unmetConditions).toEqual(['nonexistent.path == 1']);
+      expect(d.failure?.artifactStatuses).toEqual([]);
+    }
   });
 
   it('目标节点反复进入但从未成功完成时，同样判定为死循环', () => {

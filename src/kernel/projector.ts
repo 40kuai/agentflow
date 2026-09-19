@@ -13,7 +13,20 @@ export type NodeState = {
   lastError: string | null;
 };
 
-export type TransferRecord = { from: string; to: string; reason: string; decidedBy: DecidedBy };
+export type TransferRecord = {
+  from: string;
+  to: string;
+  reason: string;
+  decidedBy: DecidedBy;
+  /** 所用边；进入起始节点（无入边）时缺省 */
+  edge?: { from: string; to: string };
+  /** 条件表达式原文；无条件边或起始进入时为 null */
+  when?: string | null;
+  /** 该条件的人类可读说明（工作流边配置的 `description` 原文） */
+  edgeDescription?: string | null;
+  /** 判定依据：该次转移时相关产物的实际状态 */
+  artifactStatuses?: { type: string; status: string }[];
+};
 
 export type TaskState = {
   taskId: string;
@@ -192,11 +205,37 @@ export function project(events: KernelEvent[]): TaskState {
       }
 
       case 'transfer.decided': {
+        // 新增的边/条件/判定依据字段全部按"存在才读"处理：更早的历史事件没有这些键，
+        // 回放时一律缺省省略（旧事件可回放，投影器对未知/缺失字段容错）。
+        const edgeRaw = p['edge'];
+        const edge =
+          typeof edgeRaw === 'object' && edgeRaw !== null && !Array.isArray(edgeRaw)
+            ? {
+                from: str(edgeRaw as Record<string, unknown>, 'from'),
+                to: str(edgeRaw as Record<string, unknown>, 'to'),
+              }
+            : undefined;
+        const statusesRaw = p['artifact_statuses'];
+        const artifactStatuses = Array.isArray(statusesRaw)
+          ? statusesRaw
+              .filter(
+                (s): s is Record<string, unknown> =>
+                  typeof s === 'object' && s !== null && !Array.isArray(s),
+              )
+              .map((s) => ({ type: str(s, 'type'), status: str(s, 'status') }))
+          : undefined;
+
         state.transfers.push({
           from: str(p, 'from'),
           to: str(p, 'to'),
           reason: str(p, 'reason'),
           decidedBy: str(p, 'decided_by', 'rule') as DecidedBy,
+          ...(edge !== undefined ? { edge } : {}),
+          ...('when' in p ? { when: (p['when'] ?? null) as string | null } : {}),
+          ...('edge_description' in p
+            ? { edgeDescription: (p['edge_description'] ?? null) as string | null }
+            : {}),
+          ...(artifactStatuses !== undefined ? { artifactStatuses } : {}),
         });
         break;
       }

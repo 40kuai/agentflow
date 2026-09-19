@@ -1,4 +1,5 @@
 import type { ArtifactType } from '../shared/artifacts.js';
+import type { FailureReason } from '../shared/events.js';
 
 export type RunRequest = {
   runId: string;
@@ -20,6 +21,12 @@ export type RunnerEvent =
   | { kind: 'log'; chunk: string }
   | { kind: 'usage'; tokensIn: number; tokensOut: number; costUsd: number }
   | { kind: 'artifact'; raw: unknown }
+  /**
+   * 已分类的失败信号：runner 层负责把 CLI 的 subtype / 超时 / 权限迹象映射成稳定枚举，
+   * 内核据此在失败事件里写分类（含中文说明），而**不必解析 CLI 原始文本**。
+   * `detail` 保留原始文本作为附加信息。
+   */
+  | { kind: 'failure'; reason: FailureReason; detail: string }
   | { kind: 'exited'; code: number | null };
 
 export type RunnerCapabilities = {

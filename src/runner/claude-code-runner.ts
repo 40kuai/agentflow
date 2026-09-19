@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { createWriteStream, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import type { FailureReason } from '../shared/events.js';
 import type { AgentRunner, RunRequest, RunnerEvent } from './types.js';
 
 /** 从 claude 的 stream-json 单行中抽取的归一化事件 */
@@ -40,10 +41,10 @@ export function parseStreamLine(line: string): RunnerEvent[] {
     const isError = obj['is_error'] === true;
     const raw = obj['result'];
     if (isError) {
-      events.push({
-        kind: 'log',
-        chunk: `调用失败：subtype=${String(obj['subtype'] ?? 'unknown')}，result=${String(raw)}`,
-      });
+      const detail = `调用失败：subtype=${String(obj['subtype'] ?? 'unknown')}，result=${String(raw)}`;
+      events.push({ kind: 'log', chunk: detail });
+      // 分类与原始文本一并给出：分类供界面直接展示根因，detail 保留 CLI 原文（不丢信息）。
+      events.push({ kind: 'failure', reason: classifyResultLine(trimmed) ?? 'other', detail });
       return events;
     }
 
@@ -99,6 +100,53 @@ export function isStructuredOutputRetriesExhausted(line: string): boolean {
     obj['is_error'] === true &&
     obj['subtype'] === 'error_max_structured_output_retries'
   );
+}
+
+/**
+ * 已知 CLI `result.subtype` → 稳定失败分类的映射表。
+ *
+ * 只登记**有证据**的 subtype；未知 subtype 一律由 `classifyResultLine` 归入 `null`（内核侧落 `other`），
+ * 这样新增 subtype 不会悄悄改变既有分类。
+ */
+const SUBTYPE_TO_FAILURE_REASON: Record<string, FailureReason> = {
+  error_max_structured_output_retries: 'structured_output_retries_exhausted',
+  error_max_turns: 'other',
+  error_during_execution: 'other',
+};
+
+/**
+ * 把一行 claude `stream-json` 文本映射为**稳定失败分类**；非失败行返回 null。
+ *
+ * 与降级重试的判据同源：第一步直接复用 `isStructuredOutputRetriesExhausted`，
+ * 保证「分类为结构化输出重试耗尽」与「触发降级重试」永远指的是同一件事（既有降级行为不受影响）。
+ *
+ * 权限被拒的判据取自 CLI 真实字段 `permission_denials` 与错误文本中的权限迹象——不新造信号。
+ */
+export function classifyResultLine(line: string): FailureReason | null {
+  const trimmed = line.trim();
+  if (trimmed === '') return null;
+  let obj: Record<string, unknown>;
+  try {
+    obj = JSON.parse(trimmed) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  if (obj['type'] !== 'result' || obj['is_error'] !== true) return null;
+
+  // 复用降级重试的既有判据，避免两处判据漂移
+  if (isStructuredOutputRetriesExhausted(trimmed)) return 'structured_output_retries_exhausted';
+
+  const denials = obj['permission_denials'];
+  if (Array.isArray(denials) && denials.length > 0) return 'permission_denied';
+
+  const subtype = typeof obj['subtype'] === 'string' ? obj['subtype'] : '';
+  const mapped = SUBTYPE_TO_FAILURE_REASON[subtype];
+  if (mapped) return mapped;
+
+  const errorText = `${String(obj['result'] ?? '')} ${JSON.stringify(obj['errors'] ?? '')}`;
+  if (/permission|requires approval|not allowed/i.test(errorText)) return 'permission_denied';
+
+  return null;
 }
 
 /**
@@ -318,7 +366,10 @@ function createRunnerCore(options: ClaudeCodeRunnerOptions): RunnerCore {
       // 回归测试：`src/runner/claude-code-runner.spawn-error.test.ts`（把本段挪回 yield 之后即变红）。
       child.on('error', (error) => {
         clearTimeout(timeoutTimer);
-        push({ kind: 'log', chunk: `进程启动失败：${error.message}` });
+        const detail = `进程启动失败：${error.message}`;
+        push({ kind: 'log', chunk: detail });
+        // spawn 失败（ENOENT 等）不属于上面列出的任一分类，归入 other，但原文一并保留供排查
+        push({ kind: 'failure', reason: 'other', detail });
         closed = true;
         push({ kind: 'exited', code: -1 });
         logStream.end();

@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { isStructuredOutputRetriesExhausted, parseStreamLine } from './claude-code-runner.js';
+import { classifyResultLine, isStructuredOutputRetriesExhausted, parseStreamLine } from './claude-code-runner.js';
 
 describe('claude stream-json 契约回归', () => {
   it('真实归档样本的每一行都能被解析，且 result 行的处理与 is_error 一致', () => {
@@ -123,5 +123,54 @@ describe('claude stream-json 契约回归', () => {
         expect(isStructuredOutputRetriesExhausted(line), `${name} 被误判`).toBe(false);
       }
     }
+  });
+});
+
+describe('失败原因分类（Task 3）：subtype → 稳定枚举', () => {
+  function fixtureLines(name: string): string[] {
+    return readFileSync(resolve(import.meta.dirname, `../../tests/fixtures/${name}`), 'utf8')
+      .split('\n')
+      .filter((l) => l.trim() !== '');
+  }
+
+  it('真实归档的重试耗尽样本被分类为 structured_output_retries_exhausted（与降级判据同源）', () => {
+    const line = fixtureLines('claude-stream-maxretries-sample.jsonl')[0]!;
+    expect(classifyResultLine(line)).toBe('structured_output_retries_exhausted');
+  });
+
+  it('真实归档的认证失败样本不属于任何已知 subtype，归入 null（内核侧落 other）', () => {
+    const line = fixtureLines('claude-stream-sample.jsonl')[0]!;
+    expect(JSON.parse(line).is_error).toBe(true);
+    expect(classifyResultLine(line)).toBeNull();
+  });
+
+  it('非失败行（成功样本）不产生分类', () => {
+    for (const name of ['claude-stream-plain-sample.jsonl', 'claude-stream-structured-sample.jsonl']) {
+      for (const line of fixtureLines(name)) {
+        expect(classifyResultLine(line)).toBeNull();
+      }
+    }
+  });
+
+  it('permission_denials 非空时分类为 permission_denied（判据取自 CLI 真实字段）', () => {
+    const line = JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      is_error: true,
+      result: '部分完成',
+      permission_denials: [{ tool_name: 'Bash', tool_input: { command: 'rm -rf /' } }],
+    });
+    expect(classifyResultLine(line)).toBe('permission_denied');
+  });
+
+  it('is_error 行同时产出「原始文本日志」与「已分类的失败信号」——原文不丢', () => {
+    const line = fixtureLines('claude-stream-maxretries-sample.jsonl')[0]!;
+    const events = parseStreamLine(line);
+    expect(events.some((e) => e.kind === 'log' && e.chunk.includes('error_max_structured_output_retries'))).toBe(true);
+    expect(events.find((e) => e.kind === 'failure')).toEqual({
+      kind: 'failure',
+      reason: 'structured_output_retries_exhausted',
+      detail: expect.stringContaining('subtype=error_max_structured_output_retries'),
+    });
   });
 });

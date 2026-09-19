@@ -441,3 +441,186 @@ describe('Task 创建的元数据落库', () => {
     store.close();
   });
 });
+
+describe('失败原因分类化（Task 3）', () => {
+  it('结构化输出重试耗尽：node.failed / task.failed 带稳定分类与中文说明，并保留原始 CLI 文本', async () => {
+    const repo = makeRepo();
+    const logs = makeLogDir();
+    const rawDetail = '调用失败：subtype=error_max_structured_output_retries，result=undefined';
+    const { kernel, store } = makeKernel(
+      [
+        [
+          { kind: 'failure', reason: 'structured_output_retries_exhausted', detail: rawDetail },
+          { kind: 'log', chunk: rawDetail },
+          { kind: 'exited', code: 1 },
+        ],
+      ],
+      repo,
+      logs,
+    );
+
+    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    const state = await kernel.runTask(taskId);
+    expect(state.status).toBe('failed');
+
+    const events = kernel.getEvents(taskId);
+    const nodeFailed = events.find((e) => e.type === 'node.failed');
+    expect(nodeFailed?.payload['reason_category']).toBe('structured_output_retries_exhausted');
+    expect(nodeFailed?.payload['reason_label']).toBe('结构化输出重试耗尽');
+    // 原始 CLI 文本作为附加信息保留（不丢原文）
+    expect(String(nodeFailed?.payload['error'])).toContain('error_max_structured_output_retries');
+
+    const taskFailed = events.find((e) => e.type === 'task.failed');
+    expect(taskFailed?.payload['reason_category']).toBe('structured_output_retries_exhausted');
+    expect(taskFailed?.payload['reason_label']).toBe('结构化输出重试耗尽');
+    expect(String(taskFailed?.payload['raw'])).toContain('error_max_structured_output_retries');
+    store.close();
+  });
+
+  it('超时分类为 timeout', async () => {
+    const repo = makeRepo();
+    const logs = makeLogDir();
+    const { kernel, store } = makeKernel(
+      [
+        [
+          { kind: 'failure', reason: 'timeout', detail: '调用超过 wall-clock 上限 60000ms，已被强制终止' },
+          { kind: 'exited', code: -1 },
+        ],
+      ],
+      repo,
+      logs,
+    );
+    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    await kernel.runTask(taskId);
+    const nodeFailed = kernel.getEvents(taskId).find((e) => e.type === 'node.failed');
+    expect(nodeFailed?.payload['reason_category']).toBe('timeout');
+    expect(nodeFailed?.payload['reason_label']).toBe('超时');
+    store.close();
+  });
+
+  it('载荷不合规分类为 invalid_payload', async () => {
+    const repo = makeRepo();
+    const logs = makeLogDir();
+    const { kernel, store } = makeKernel(
+      [[{ kind: 'artifact', raw: { problem: 123 } }, { kind: 'exited', code: 0 }]],
+      repo,
+      logs,
+    );
+    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    await kernel.runTask(taskId);
+    const events = kernel.getEvents(taskId);
+    const nodeFailed = events.find((e) => e.type === 'node.failed');
+    expect(nodeFailed?.payload['reason_category']).toBe('invalid_payload');
+    expect(nodeFailed?.payload['reason_label']).toBe('载荷不合规');
+    expect(events.find((e) => e.type === 'task.failed')?.payload['reason_category']).toBe(
+      'invalid_payload',
+    );
+    store.close();
+  });
+
+  it('runner 未给出分类时归入 other，原始退出码文本仍在', async () => {
+    const repo = makeRepo();
+    const logs = makeLogDir();
+    const { kernel, store } = makeKernel(
+      [
+        scriptFor('requirement'),
+        [{ kind: 'log', chunk: '编译失败' }, { kind: 'exited', code: 1 }],
+      ],
+      repo,
+      logs,
+    );
+    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    await kernel.runTask(taskId);
+    const nodeFailed = kernel
+      .getEvents(taskId)
+      .find((e) => e.type === 'node.failed' && e.payload['node_id'] === 'dev_implement');
+    expect(nodeFailed?.payload['reason_category']).toBe('other');
+    expect(nodeFailed?.payload['reason_label']).toBe('其他');
+    expect(String(nodeFailed?.payload['error'])).toContain('CLI 退出码 1');
+    store.close();
+  });
+});
+
+describe('转移决策的可解释性（Task 4）', () => {
+  it('transfer.decided 记录所用边、条件原文、边的人类可读说明与判定依据', async () => {
+    const repo = makeRepo();
+    const logs = makeLogDir();
+    const { kernel, store } = makeKernel(undefined, repo, logs);
+    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    await kernel.runTask(taskId);
+
+    const transfer = kernel
+      .getEvents(taskId)
+      .find((e) => e.type === 'transfer.decided' && e.payload['to'] === 'dev_implement');
+    expect(transfer).toBeDefined();
+    const p = transfer!.payload;
+    expect(p['edge']).toEqual({ from: 'pm_analyze', to: 'dev_implement' });
+    expect(p['when']).toBe("all(artifacts.requirement.status == 'ok')");
+    // 人类可读说明直接取自工作流边的 description，引擎不另造一套
+    expect(p['edge_description']).toBe('需求已澄清');
+    expect(p['artifact_statuses']).toEqual([{ type: 'requirement', status: 'ok' }]);
+
+    // 投影后的转移记录同样可读到这些字段（供后续流转视图消费）
+    const rec = kernel.getState(taskId).transfers.find((t) => t.to === 'dev_implement');
+    expect(rec?.edge).toEqual({ from: 'pm_analyze', to: 'dev_implement' });
+    expect(rec?.when).toBe("all(artifacts.requirement.status == 'ok')");
+    expect(rec?.edgeDescription).toBe('需求已澄清');
+    expect(rec?.artifactStatuses).toEqual([{ type: 'requirement', status: 'ok' }]);
+
+    // 起始进入没有入边：edge 缺省、when 为 null，旧字段语义不变
+    const first = kernel.getState(taskId).transfers[0];
+    expect(first?.to).toBe('pm_analyze');
+    expect(first?.edge).toBeUndefined();
+    expect(first?.when).toBeNull();
+    store.close();
+  });
+
+  it('串行直线流程的转移序列与决策来源保持不变（串行等价性）', async () => {
+    const repo = makeRepo();
+    const logs = makeLogDir();
+    const { kernel, store, runner } = makeKernel(undefined, repo, logs);
+    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    const state = await kernel.runTask(taskId);
+
+    expect(state.status).toBe('completed');
+    expect(state.completedNodeIds).toEqual(['pm_analyze', 'dev_implement', 'qa_verify']);
+    expect(state.transfers.map((t) => `${t.from}→${t.to}`)).toEqual([
+      '→pm_analyze',
+      'pm_analyze→dev_implement',
+      'dev_implement→qa_verify',
+    ]);
+    expect(state.transfers.every((t) => t.decidedBy === 'rule')).toBe(true);
+    expect(runner.requests).toHaveLength(3);
+    store.close();
+  });
+
+  it('无条件满足出边时任务 failed，原因同时含未满足条件、产物实际状态与分类化原因', async () => {
+    const repo = makeRepo();
+    const logs = makeLogDir();
+    const { kernel, store } = makeKernel(
+      [
+        [
+          {
+            kind: 'artifact',
+            raw: { ...(ARTIFACTS['requirement'] as Record<string, unknown>), status: 'blocked' },
+          },
+          { kind: 'exited', code: 0 },
+        ],
+      ],
+      repo,
+      logs,
+    );
+    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    const state = await kernel.runTask(taskId);
+    expect(state.status).toBe('failed');
+
+    const p = kernel.getEvents(taskId).find((e) => e.type === 'task.failed')!.payload;
+    expect(p['reason_category']).toBe('condition_unmet');
+    expect(p['reason_label']).toBe('条件不满足');
+    expect(p['unmet_conditions']).toEqual(["all(artifacts.requirement.status == 'ok')"]);
+    expect(p['artifact_statuses']).toEqual([{ type: 'requirement', status: 'blocked' }]);
+    // 既有中文说明文案保留
+    expect(String(p['reason'])).toContain('requirement=blocked');
+    store.close();
+  });
+});
