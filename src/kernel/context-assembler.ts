@@ -91,6 +91,11 @@ function buildPrompt(
       `2. 可以读取以下路径：${role.reads.length > 0 ? role.reads.join('、') : '（仅当前工作区）'}`,
       '3. 不要修改工作区之外的文件。',
       '4. 完成后直接输出结构化结果，不要输出额外的解释性长文。',
+      // 终止语义（2026-09-19 契约修复）：CLI 的结构化输出 harness 要求那次提交是**终结动作**。
+      // 真实失败现场：模型在 5 次 StructuredOutput 调用之间继续 Grep/Read 并重复提交，
+      // harness 反复重新注入约束，最终 error_max_structured_output_retries —— 全部调用都返回
+      // "provided successfully"、键集合也完全合规，仍然零产出（22 轮 / 103 秒 / $0.417）。
+      '5. 调用一次 StructuredOutput 提交结构化结果后，立即结束本轮：不要再读写任何文件，也不要重复提交。',
     ].join('\n'),
   );
 

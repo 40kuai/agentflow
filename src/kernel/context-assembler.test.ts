@@ -164,4 +164,20 @@ describe('assemblePrompt', () => {
     expect(r.prompt.length).toBeGreaterThan(0);
     expect(r.usedArtifactIds).toEqual([]);
   });
+
+  it('硬约束里写明终止语义：调用一次 StructuredOutput 后立即结束本轮', () => {
+    // 依据 2026-09-19 真实失败现场：CLI 的结构化输出 harness 要求那次调用是**终结动作**，
+    // 模型在调用之间继续读写文件、重复提交，harness 反复重新注入约束，最终
+    // error_max_structured_output_retries（5 次成功调用仍零产出）。
+    const r = assemblePrompt({
+      role,
+      node,
+      state: baseState([]),
+      worktreePath: '/tmp/ws',
+      maxPromptTokens: 30_000,
+    });
+    expect(r.prompt).toContain('StructuredOutput');
+    expect(r.prompt).toContain('立即结束');
+    expect(r.prompt).toContain('不要重复提交');
+  });
 });

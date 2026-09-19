@@ -74,6 +74,33 @@ export function parseStreamLine(line: string): RunnerEvent[] {
 }
 
 /**
+ * 是否为「结构化输出重试耗尽」——CLI 的 --json-schema harness 特有失败模式。
+ *
+ * 证据（2026-09-19 真实任务 `logs/runs/run_46e7a5442100440da2ac.jsonl`，逐字归档为
+ * `tests/fixtures/claude-stream-maxretries-sample.jsonl`）：5 次 StructuredOutput 调用每次都返回
+ * "Structured output provided successfully"、提交的键集合完全合规，CLI 仍以
+ * `error_max_structured_output_retries` 收场 → `result: undefined`，零产出（22 轮 / 103 秒 / $0.417）。
+ *
+ * 为什么必须单独识别：这类失败既不是「普通成功」（无 artifact），也不该被当成「普通失败」直接放弃——
+ * 它与「模型把 JSON 包进代码块」互为兜底的两条通道。识别出来后由 run() 自动降级重试一次。
+ */
+export function isStructuredOutputRetriesExhausted(line: string): boolean {
+  const trimmed = line.trim();
+  if (trimmed === '') return false;
+  let obj: Record<string, unknown>;
+  try {
+    obj = JSON.parse(trimmed) as Record<string, unknown>;
+  } catch {
+    return false;
+  }
+  return (
+    obj['type'] === 'result' &&
+    obj['is_error'] === true &&
+    obj['subtype'] === 'error_max_structured_output_retries'
+  );
+}
+
+/**
  * 终止子进程的整棵进程树。
  * 必须按进程组杀：claude CLI 会派生工具子进程（如 Bash 里的命令），
  * 只杀直接子进程会留下持有 stdout/stderr 管道的孙进程，导致 Node 的 `close` 事件
@@ -206,7 +233,22 @@ export function buildArgs(req: RunRequest, useJsonSchema = true): string[] {
   return args;
 }
 
-export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentRunner {
+/**
+ * 单次尝试的核心实现。`useJsonSchema` 决定本次是否传 `--json-schema`；
+ * `state.schemaRetriesExhausted` 回传「本次是否为结构化输出重试耗尽」，供外层决定是否降级重试。
+ */
+type RunnerCore = {
+  id: string;
+  capabilities: AgentRunner['capabilities'];
+  run(
+    req: RunRequest,
+    useJsonSchema: boolean,
+    state: { schemaRetriesExhausted: boolean },
+  ): AsyncIterable<RunnerEvent>;
+  cancel(runId: string): Promise<void>;
+};
+
+function createRunnerCore(options: ClaudeCodeRunnerOptions): RunnerCore {
   const running = new Map<string, ReturnType<typeof spawn>>();
   mkdirSync(options.logDir, { recursive: true });
 
@@ -219,8 +261,12 @@ export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentR
       builtinReview: false,
     },
 
-    async *run(req: RunRequest): AsyncIterable<RunnerEvent> {
-      const args = [...buildArgs(req, options.useJsonSchema ?? true), ...(options.extraArgs ?? [])];
+    async *run(
+      req: RunRequest,
+      useJsonSchema: boolean,
+      state: { schemaRetriesExhausted: boolean },
+    ): AsyncIterable<RunnerEvent> {
+      const args = [...buildArgs(req, useJsonSchema), ...(options.extraArgs ?? [])];
       const logPath = join(options.logDir, `${req.runId}.jsonl`);
       const logStream = createWriteStream(logPath, { flags: 'a' });
 
@@ -289,6 +335,7 @@ export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentR
         const lines = buffered.split('\n');
         buffered = lines.pop() ?? '';
         for (const line of lines) {
+          if (isStructuredOutputRetriesExhausted(line)) state.schemaRetriesExhausted = true;
           for (const e of parseStreamLine(line)) push(e);
         }
       });
@@ -302,6 +349,7 @@ export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentR
       child.on('close', (code) => {
         clearTimeout(timeoutTimer);
         if (buffered.trim() !== '') {
+          if (isStructuredOutputRetriesExhausted(buffered)) state.schemaRetriesExhausted = true;
           for (const e of parseStreamLine(buffered)) push(e);
         }
         if (timedOut) {
@@ -343,5 +391,48 @@ export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentR
         running.delete(runId);
       }
     },
+  };
+}
+
+/**
+ * 对外入口：在核心实现之上加**一次**降级重试。
+ *
+ * 为什么要这一层（2026-09-19 契约修复）：`--json-schema` 与 `result` 通道互为兜底，但各自会以不同方式零产出——
+ *  · 开 schema：模型把那次提交当普通工具调用，在调用之间继续读写文件、反复重提，harness 反复注入约束 →
+ *    `error_max_structured_output_retries`（归档证据 `tests/fixtures/claude-stream-maxretries-sample.jsonl`，5 次合规提交仍零产出）；
+ *  · 关 schema：模型把 JSON 包进 ```json 代码块 → `JSON.parse` 失败（归档证据 `claude-stream-plain-sample.jsonl`）。
+ *
+ * 故：本次若以「结构化输出重试耗尽」收场，则**自动关闭 `--json-schema` 重跑一次**（走 result 通道）。
+ * 只降级一次、失败即按失败处理（不递归）；只读角色不做例外，行为统一。
+ * 代价是新一次真实调用与额外花费——这是「两条通道互为兜底」这一设计本身的价值所在。
+ */
+export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentRunner {
+  const core = createRunnerCore(options);
+
+  return {
+    id: core.id,
+    capabilities: core.capabilities,
+
+    async *run(req: RunRequest): AsyncIterable<RunnerEvent> {
+      const useJsonSchema = options.useJsonSchema ?? true;
+      // 未传 schema 时该 subtype 不可能出现，故仅当本次真的开了 schema 才考虑降级
+      const canFallback = useJsonSchema && req.outputSchema !== undefined;
+      const state = { schemaRetriesExhausted: false };
+
+      for await (const event of core.run(req, useJsonSchema, state)) {
+        // 拦下第一次尝试的 exited：若它属于重试耗尽，就不让它进入事件流（否则内核会把它的退出码当最终结果）
+        if (event.kind === 'exited' && canFallback && state.schemaRetriesExhausted) {
+          yield {
+            kind: 'log',
+            chunk: '结构化输出重试耗尽，已降级为 result 通道重试一次',
+          };
+          yield* core.run(req, false, { schemaRetriesExhausted: false });
+          return;
+        }
+        yield event;
+      }
+    },
+
+    cancel: (runId: string) => core.cancel(runId),
   };
 }

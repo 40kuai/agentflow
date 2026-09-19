@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { parseStreamLine } from './claude-code-runner.js';
+import { isStructuredOutputRetriesExhausted, parseStreamLine } from './claude-code-runner.js';
 
 describe('claude stream-json 契约回归', () => {
   it('真实归档样本的每一行都能被解析，且 result 行的处理与 is_error 一致', () => {
@@ -75,6 +75,53 @@ describe('claude stream-json 契约回归', () => {
     const artifact = events.find((e) => e.kind === 'artifact');
     if (artifact && artifact.kind === 'artifact') {
       expect(artifact.raw).not.toBe(sample.result);
+    }
+  });
+
+  it('真实归档样本：结构化输出重试耗尽必须被识别为「需降级重试」，既不是普通成功也不是普通失败', () => {
+    // 逐字取自 2026-09-19 一次真实失败任务（logs/runs/run_46e7a5442100440da2ac.jsonl 的 result 行）。
+    // 事实：5 次 StructuredOutput 工具调用每次都返回 "provided successfully"、键集合完全合规，
+    // CLI 仍以 error_max_structured_output_retries 收场 → 零产出（result: undefined，$0.417）。
+    // 这是 schema 通道的失败模式：必须由 runner 降级重试兜底，而不是当成普通成功/普通失败。
+    const raw = readFileSync(
+      resolve(import.meta.dirname, '../../tests/fixtures/claude-stream-maxretries-sample.jsonl'),
+      'utf8',
+    );
+    const lines = raw.split('\n').filter((l) => l.trim() !== '');
+    expect(lines).toHaveLength(1);
+    const resultLine = lines[0]!;
+
+    const sample = JSON.parse(resultLine) as {
+      subtype?: unknown;
+      is_error?: unknown;
+      errors?: unknown;
+      result?: unknown;
+    };
+    // 前提守卫：期望值从样本自身推导，不写死
+    expect(sample.subtype).toBe('error_max_structured_output_retries');
+    expect(sample.is_error).toBe(true);
+    expect(sample.result).toBeUndefined();
+    expect(sample.errors).toEqual(['Failed to provide valid structured output after 5 attempts']);
+
+    // 核心契约：必须被识别为需要降级重试
+    expect(isStructuredOutputRetriesExhausted(resultLine)).toBe(true);
+
+    // 解析层本身仍按 is_error 判失败（不产出 artifact）——降级由 runner 层负责
+    const events = parseStreamLine(resultLine);
+    expect(events.some((e) => e.kind === 'artifact')).toBe(false);
+    expect(events.some((e) => e.kind === 'log')).toBe(true);
+  });
+
+  it('其他归档样本不得被误判为「需降级重试」', () => {
+    for (const name of [
+      'claude-stream-sample.jsonl',
+      'claude-stream-structured-sample.jsonl',
+      'claude-stream-plain-sample.jsonl',
+    ]) {
+      const raw = readFileSync(resolve(import.meta.dirname, `../../tests/fixtures/${name}`), 'utf8');
+      for (const line of raw.split('\n').filter((l) => l.trim() !== '')) {
+        expect(isStructuredOutputRetriesExhausted(line), `${name} 被误判`).toBe(false);
+      }
     }
   });
 });
