@@ -367,4 +367,41 @@ Phase 1 已完成并端到端验证（`completed`、3/3 artifact、节点级花�
 - Phase 1 的**安全边界缺口**（`owns`、目标仓库、预授权）必须在并发之前关闭
 - Phase 1 的**可观测性**（管理台 + 活性诊断）为 Phase 2 的并发观测提供基础
 
-**遗留的评审欠账（应在 Phase 2 开工前补）**：修复波次 `4fe53c2`/`3354017`/`cd8aa4e`/`f3a7300`（引擎契约）与 `5530f4d`/`eeb5729`（活日志、可见性）**尚未过独立评审**。它们改动了 payload schema、prompt、内核、runner 与界面，属最该被第三方看一遍的类别。
+### 10.1 评审欠账：已完成评审（2026-09-19）
+
+以下 6 个提交已补独立评审（逐个 `git show` 核查，含活体 GET 复验）：
+
+`4fe53c2`（status 契约）、`3354017`（降级重试）、`cd8aa4e`（并行度标注）、`f3a7300`（status 必填 + started 泄漏）、`5530f4d`（活日志）、`eeb5729`（可见性）
+
+**裁定：有条件接受，无 Critical。** 已核实成立的关键点：
+
+- **`status` 全链路无一处写死**：schema → 解析 → 内核写入 → 投影 → 条件事实 → 边条件 → 失败原因 → 前端，逐环都真实消费；并有端到端断言「模型判 blocked → 边不通过 → `task.failed` 且 reason 含 `requirement=blocked`」
+- **「一 run 一 started」成立**：枚举了 10 条路径，均为恰好 1 条；无 2 条路径；降级用 `yield*` 而非递归，结构上不可能无限降级
+- **归档 fixture 未被改动**：3 份既有样本 blob hash 全程不变，仅新增 1 份；另有反向断言「其他归档样本不得被误判为需降级」
+- **目录穿越防护被抽成唯一入口并在两个端点复用**，越界在 `stat`/读取**之前**返回，且有过界不泄露内容的断言
+- **可见性判定基于真实数据**：健康徽章只用 `TaskState.status` + 日志文件 mtime；计数类指标如实标注「本窗口内，非全程累计」；孤儿进程后端只报 pid/etime/command 并注释明写「PID↔runId 无法精确关联，绝不编造」
+
+**待修（Important，5 项）**——Phase 2 开工前应处理：
+
+| # | 问题 | 位置 | 说明 |
+| --- | --- | --- | --- |
+| I1 | **UI 文案与自己刚修好的契约矛盾** | `web/src/components/LogViewer.tsx` 的 notice 两处 | 仍称「日志引用要等节点结束才会出现在事件里」，而该提交恰恰已让 `node.started` 携带 `log_ref`；且该分支条件对新 run 实际不可达 → **会误导排障的死文案** |
+| I2 | **孤儿判定未经数据门控** | `web/src/App.tsx` 的孤儿徽章 | 只要 `claudeProcCount > 0` 就渲染「可能有孤儿残留」，未结合「当前是否有运行中节点」→ **一趟正常运行的 run 就会误报**；后端侧合规，前端需补门控 |
+| I3 | **前端判定逻辑零自动化测试，且不在仓库级闸门内** | `web/src/liveness.ts`（健康判定/当前动作/错误归因）、`logparse.ts`、`aggregate.ts` | 根 `tsconfig.json` 的 include 只覆盖 `src/**`/`spikes/**`/`tests/**`，`npm run typecheck` **不覆盖 `web/**`** |
+| I4 | **`required` 与 `default:"ok"` 并存** | `src/shared/artifacts.ts`（`jsonSchemaForArtifact`） | 发往 CLI 的 schema 同时含 `required:["status"]` 与 `properties.status.default:"ok"`。若 harness 对缺失字段应用 default，则「模型漏给 → 当作 ok 放行 → 边条件恒真」这条**残余静默路径并未真正关闭**。本轮不允许调真实 CLI，无法证实/证伪 → 建议移除该 default，或补一次真实验证 |
+| I5 | **`canFallback=true` 的异常路径缺断言** | `src/runner/*.test.ts` | 现有 spawn-error / timeout 用例的 `req` 都不带 `outputSchema`，实际走 `canFallback=false`，故 `events[0] === started` 的断言**没有覆盖生产配置**（内核恒传 `outputSchema`）；两条异常路径目前只有代码推理支撑 |
+
+**注意 I4 与本文件 §1.4 的 C1 同源**：C1 是"模型判断被静默吃掉"的原始缺陷。I4 说明这条静默路径可能**以另一种形式仍然存在**（漏给字段被 schema default 兜成 ok）。这是本阶段最值得优先处理的一项。
+
+### 10.2 并发开发引起的范围变化（对照 §5.1）
+
+评审期间工作区被并发改动，**§5.1 的所有权划分需要更新**：
+
+| 目录 | 原判定 | 现况 |
+| --- | --- | --- |
+| `web/**` | 归本阶段 | ⚠️ **已不再空闲**：另一开发正在改 `App.tsx`、`components/NodeCostView.tsx` → 前端成为争用区 |
+| `src/config/**`、`src/main.ts` | 归本阶段 | ⚠️ 已被另一开发改动 |
+| `src/kernel/**` | 高冲突 | 仍在改（`kernel.ts`、`scheduler.ts`，新增 `merge.ts`） |
+| `tests/e2e/smoke.sh` | 归本阶段 | ⚠️ 已被改动 |
+
+**另有一处需核实的进展**：`eeb5729` 提交时的「Phase 1 串行执行」文案，已被并发改动改为「**已消费 globalConcurrency**」——若属实，则本文件 §1.2 的 **P2（`globalConcurrency` 无消费者）与 P1（单节点 await）可能已部分不成立**，P0-B 的范围需重新评估后再派工。
