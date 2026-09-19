@@ -91,7 +91,7 @@ export function NodeCostView({ state, aggregate, liveness, compat, onOpenLog, on
           未覆盖的 <code>budget.consumed</code>（payload 只有 run_id）按 run_id → node_id 反查补记，避免同一笔花费被计两次。
         </div>
         <div className="notice">
-          Phase 1 串行执行，<code>env.globalConcurrency</code> 暂无消费者，本页面不展示任何并行度指标；并发调度属 Phase 2。
+          内核已消费 <code>env.globalConcurrency</code>（并发调度已实现，超上限节点排队），本页面暂不展示并行度指标。
         </div>
       </Section>
 

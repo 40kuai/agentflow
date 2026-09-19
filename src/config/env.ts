@@ -6,6 +6,11 @@ export type AppEnv = {
   logDir: string;
   workspaceDir: string;
   configDir: string;
+  /**
+   * 启动时加载的工作流 id（对应 `config/workflows/<id>.yaml`）。
+   * 由环境变量 `AGENTFLOW_WORKFLOW` 指定，默认 `simple_dev`（串行基线）。
+   */
+  workflowId: string;
   host: string;
   port: number;
   maxPromptTokens: number;
@@ -24,6 +29,7 @@ const DEFAULTS: AppEnv = {
   logDir: './logs',
   workspaceDir: './workspaces',
   configDir: './config',
+  workflowId: 'simple_dev',
   host: '127.0.0.1',
   port: 8787,
   maxPromptTokens: 30000,
@@ -90,6 +96,7 @@ export function loadEnv(
     logDir: readStr(merged, 'AGENTFLOW_LOG_DIR', DEFAULTS.logDir),
     workspaceDir: readStr(merged, 'AGENTFLOW_WORKSPACE_DIR', DEFAULTS.workspaceDir),
     configDir: readStr(merged, 'AGENTFLOW_CONFIG_DIR', DEFAULTS.configDir),
+    workflowId: readStr(merged, 'AGENTFLOW_WORKFLOW', DEFAULTS.workflowId),
     host: readStr(merged, 'AGENTFLOW_HOST', DEFAULTS.host),
     port: readInt(merged, 'AGENTFLOW_PORT', DEFAULTS.port),
     maxPromptTokens: readInt(merged, 'AGENTFLOW_MAX_PROMPT_TOKENS', DEFAULTS.maxPromptTokens),

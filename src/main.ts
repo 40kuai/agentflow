@@ -9,7 +9,7 @@ import { createServer } from './server/server.js';
 const env = loadEnv();
 
 const roles = loadAllRoles(env.configDir);
-const workflow = loadWorkflow(env.configDir, 'simple_dev');
+const workflow = loadWorkflow(env.configDir, env.workflowId);
 const store = createEventStore(resolve(env.dbPath));
 const runner = createClaudeCodeRunner({
   binPath: env.claudeBin,

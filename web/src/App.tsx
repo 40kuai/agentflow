@@ -431,8 +431,8 @@ export function App() {
                 </div>
 
                 <div className="notice">
-                  Phase 1 串行执行：同一时刻只有一个节点在跑（<code>env.globalConcurrency</code> 无消费者）。
-                  此处不展示任何并行度指标，并发调度属 Phase 2。
+                  <code>simple_dev</code> 为串行基线（同一时刻只有一个节点在跑）；内核已消费
+                  <code>env.globalConcurrency</code>，并行批次超上限即排队。本页面暂不展示并行度指标。
                 </div>
 
                 {failedNodes.length > 0 && (

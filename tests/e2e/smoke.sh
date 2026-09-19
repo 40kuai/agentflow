@@ -13,16 +13,23 @@ git init -q
 git -c user.email=e2e@local -c user.name=e2e commit -q --allow-empty -m "初始提交"
 echo "# 端到端目标仓库" > README.md
 
+# 平台自身的运行时产物（事件库 / 运行日志 / worktree 落点）必须放在目标仓库**之外**：
+# 内核的 repoPath = process.cwd()（= 目标仓库），而 Task 7 的 owns 路径级强制用 git status
+# 采集目标仓库的**实际变更路径** —— 若这些运行时文件落在目标仓库内，会立刻被当成「节点越界写入」
+# （对 owns=[] 的只读角色尤其致命：第一个节点 pm_analyze 就会因此被判失败）。
+RUNTIME_DIR="$(mktemp -d /tmp/agentflow-e2e-runtime-XXXXXX)"
+
 HOST="127.0.0.1"
 PORT="${AGENTFLOW_PORT:-8787}"
 BASE="http://${HOST}:${PORT}"
 
 echo "==> 目标仓库：$TARGET_REPO"
+echo "==> 运行时目录（在目标仓库之外，避免被 owns 判定为越界）：$RUNTIME_DIR"
 echo "==> 启动 AgentFlow"
 AGENTFLOW_CONFIG_DIR="$AGENTFLOW_ROOT/config" \
-AGENTFLOW_DB_PATH="$TARGET_REPO/data/e2e.sqlite" \
-AGENTFLOW_LOG_DIR="$TARGET_REPO/logs" \
-AGENTFLOW_WORKSPACE_DIR="$TARGET_REPO/workspaces" \
+AGENTFLOW_DB_PATH="$RUNTIME_DIR/data/e2e.sqlite" \
+AGENTFLOW_LOG_DIR="$RUNTIME_DIR/logs" \
+AGENTFLOW_WORKSPACE_DIR="$RUNTIME_DIR/workspaces" \
   npx tsx "$AGENTFLOW_ROOT/src/main.ts" > /tmp/agentflow-e2e.log 2>&1 &
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
@@ -37,9 +44,12 @@ done
 curl -sf "${BASE}/api/health" > /dev/null || { echo "服务未能启动，日志："; cat /tmp/agentflow-e2e.log; exit 1; }
 
 echo "==> 创建任务"
+# requirement 必须落在各角色 owns 之内，否则 Task 7 的路径级强制会把节点判为越界失败：
+#   dev_implement 的角色为 backend_dev，owns=["src/**"]；qa_verify 的角色为 qa_engineer，owns=["tests/**"]。
+# 故这里要求产出 src/ 下的脚本（dev 写）与 tests/ 下的测试（qa 写），而不再要求写 scripts/ 与 README.md。
 TASK_ID=$(curl -s -X POST "${BASE}/api/tasks" \
   -H 'Content-Type: application/json' \
-  -d '{"title":"E2E 冒烟","requirementRaw":"在目标仓库新增一个 scripts/hello.sh，执行后输出 hello agentflow。附带一句使用说明到 README.md。"}' \
+  -d '{"title":"E2E 冒烟","requirementRaw":"在目标仓库的 src/ 目录新增 hello.sh（执行后输出 hello agentflow），并在 tests/ 目录新增一个测试脚本验证该输出。改动仅限 src/ 与 tests/，不要修改其它目录或文件。"}' \
   | sed -n 's/.*"taskId":"\([^"]*\)".*/\1/p')
 
 echo "任务 id：${TASK_ID}"

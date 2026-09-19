@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { checkBatchOwns, detectOwnsOverlaps } from '../kernel/path-guard.js';
+import { loadEnv } from './env.js';
 import { loadAllRoles, loadWorkflow } from './loader.js';
 
 const CONFIG_DIR = './config';
+/** 与真实 .env 隔离：显式传入不存在的 env 文件路径（与 env.test.ts 同口径） */
+const NO_ENV_FILE = '/nonexistent/agentflow-test.env';
 
 describe('仓库内的真实配置', () => {
   it('全部角色都能加载', () => {
@@ -28,6 +31,15 @@ describe('仓库内的真实配置', () => {
     for (const node of workflow.nodes) {
       expect(roles.has(node.role)).toBe(true);
     }
+  });
+
+  it('AGENTFLOW_WORKFLOW 选出的工作流能真实加载（默认 simple_dev，可切到 parallel_dev）', () => {
+    const defaultEnv = loadEnv({}, NO_ENV_FILE);
+    expect(defaultEnv.workflowId).toBe('simple_dev');
+    expect(loadWorkflow(defaultEnv.configDir, defaultEnv.workflowId).id).toBe('simple_dev');
+
+    const parallelEnv = loadEnv({ AGENTFLOW_WORKFLOW: 'parallel_dev' }, NO_ENV_FILE);
+    expect(loadWorkflow(parallelEnv.configDir, parallelEnv.workflowId).id).toBe('parallel_dev');
   });
 
   it('simple_dev 所有节点 isolate 均为 false（串行基线护栏）', () => {

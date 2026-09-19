@@ -44,4 +44,11 @@ describe('loadEnv', () => {
       /AGENTFLOW_BATCH_CONFLICT_POLICY/,
     );
   });
+
+  it('工作流选择默认 simple_dev，可由 AGENTFLOW_WORKFLOW 指定', () => {
+    expect(loadEnv({}, NO_ENV_FILE).workflowId).toBe('simple_dev');
+    expect(loadEnv({ AGENTFLOW_WORKFLOW: 'parallel_dev' }, NO_ENV_FILE).workflowId).toBe(
+      'parallel_dev',
+    );
+  });
 });
