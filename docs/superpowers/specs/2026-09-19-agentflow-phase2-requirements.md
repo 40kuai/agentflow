@@ -404,4 +404,26 @@ Phase 1 已完成并端到端验证（`completed`、3/3 artifact、节点级花�
 | `src/kernel/**` | 高冲突 | 仍在改（`kernel.ts`、`scheduler.ts`，新增 `merge.ts`） |
 | `tests/e2e/smoke.sh` | 归本阶段 | ⚠️ 已被改动 |
 
-**另有一处需核实的进展**：`eeb5729` 提交时的「Phase 1 串行执行」文案，已被并发改动改为「**已消费 globalConcurrency**」——若属实，则本文件 §1.2 的 **P2（`globalConcurrency` 无消费者）与 P1（单节点 await）可能已部分不成立**，P0-B 的范围需重新评估后再派工。
+**已核实的进展（2026-09-19，并发调度已被实现）**：`globalConcurrency` **已真正被消费**，本文件 §1.2 的部分条目**失效**：
+
+```
+src/kernel/kernel.ts:41   globalConcurrency?: number
+src/kernel/kernel.ts:103  const concurrencyLimit = Math.max(1, deps.globalConcurrency ?? 1)
+src/kernel/kernel.ts:270  batchLimit = guard.mode === 'serialize' ? 1 : concurrencyLimit
+src/main.ts:30            globalConcurrency: env.globalConcurrency
+web/src/App.tsx:435 / NodeCostView.tsx:94  「内核已消费 env.globalConcurrency（并发调度已实现，超上限节点排队）」
+```
+
+因此：
+
+| §1.2 条目 | 现状 | 处理 |
+| --- | --- | --- |
+| **P1**（内核单节点 `await`） | **失效**：已引入 `concurrencyLimit` 与批次上限，且存在 `guard.mode === 'serialize'` 的退化路径 | 从需求中移除；改为**验证**（并发下事件/预算无竞态、退化路径正确） |
+| **P2**（`globalConcurrency` 无消费者） | **失效**：已被消费 | 移除 |
+| P3（`parallel`/`join` 零实现） | 需重新核实 | 派工前必须重查 |
+| P4（`work_package_plan` 有 schema 无产出者） | 需重新核实 | 派工前必须重查 |
+| P5（worktree 骨架不可达） | 需重新核实（已出现 `src/kernel/merge.ts`） | 派工前必须重查 |
+
+**结论：P0-B 不可按本稿原文派工。** 派工前必须对 `src/kernel/**` 的当前实现做一次重新盘点（尤其 `scheduler.ts`、`merge.ts` 与 `guard` 的语义），把 §1.2 与 P0-B 的需求项逐条对照现状后重写。**在重新盘点前，P0-B 应交由正在该区域工作的开发者主责**，避免多人同时改同一批文件。
+
+本稿中**仍然成立且未被他人认领**的 P0 项：**P0-A（目标仓库隔离）**、**P0-C（`owns` 强制）**、**P0-D（取消能力）**、**P0-E（节点级推送）**、**P0-F（成本闸门）**——但 C/D/E/F 均涉及 `src/kernel/**`，需与其主责人协调后再派工。
