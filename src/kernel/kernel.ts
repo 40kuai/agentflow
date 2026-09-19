@@ -73,6 +73,8 @@ export type Kernel = {
   getState(taskId: string): TaskState;
   getEvents(taskId: string): KernelEvent[];
   runTask(taskId: string): Promise<TaskState>;
+  /** 取消任务（幂等）：语义见 createKernel 内 cancel 的注释 */
+  cancel(taskId: string): TaskState;
 };
 
 export function createKernel(deps: KernelDeps): Kernel {
@@ -115,6 +117,55 @@ export function createKernel(deps: KernelDeps): Kernel {
       actor: 'human',
     });
     return taskId;
+  }
+
+  /**
+   * 取消任务（幂等、可解释、状态不悬挂）。
+   *
+   * 语义：
+   *  - 未知任务抛错（HTTP 层据此返回 404），绝不静默成功；
+   *  - 已是终态（completed / failed / cancelled）时**不写入任何事件**，原样返回状态（幂等，
+   *    重复点击取消不会制造垃圾事件）；
+   *  - active 任务：逐个把 running / queued 节点写成 `node.cancelled`，再写 `task.cancelled`
+   *    把任务落到明确的 cancelled 终态；
+   *  - running 节点同时通知 runner 杀掉其进程组（`runner.cancel(runId)`，内部 SIGTERM → 3s → SIGKILL）。
+   *    这一步是 fire-and-forget：不阻塞响应；内核状态只由事件决定，不依赖进程是否已死。
+   *    不杀进程的"取消"会继续烧钱，等于没取消，故这里必须调。
+   *  - 取消是**终态**：投影器对 cancelled 做粘滞处理，在途节点的迟到成功/失败不会翻转它；
+   *    `runTask` 主循环遇到非 active 会丢弃待启动队列（见 runTask 内注释）。
+   *
+   * 已知边界（如实记录）：取消**不撤销**已发生的花费，也不清理已写入工作区的改动；
+   * 在途节点自然收尾后仍会走既有的合并流程（与失败路径同）。
+   */
+  function cancel(taskId: string): TaskState {
+    const events = store.readTask(taskId);
+    if (events.length === 0) throw new Error(`找不到任务：${taskId}`);
+
+    const state = project(events);
+    if (state.status !== 'active') return state;
+
+    for (const node of Object.values(state.nodes)) {
+      if (node.status !== 'running' && node.status !== 'queued') continue;
+      if (node.status === 'running' && node.runId !== null) {
+        void deps.runner.cancel(node.runId).catch(() => {
+          // 进程可能已经退出：取消失败不改变取消语义，状态仍由事件决定
+        });
+      }
+      store.append({
+        task_id: taskId,
+        type: 'node.cancelled',
+        payload: { node_id: node.nodeId, run_id: node.runId, reason: '任务被取消' },
+        actor: 'human',
+      });
+    }
+
+    store.append({
+      task_id: taskId,
+      type: 'task.cancelled',
+      payload: { reason: '任务被用户取消' },
+      actor: 'human',
+    });
+    return project(store.readTask(taskId));
   }
 
   async function runTask(taskId: string): Promise<TaskState> {
@@ -214,6 +265,12 @@ export function createKernel(deps: KernelDeps): Kernel {
         steps += 1;
 
         // 1) 就绪节点入队后按上限尽量多启动；超限的留在队列里排队，等有空位再启动。
+        //    任务已离开 active（例如被 cancel）：**丢弃待启动队列**，不再启动新节点——取消的意义
+        //    就是停止继续花钱。这里刻意不提前 return：在途节点仍需自然收尾（其工作区不能在被
+        //    finally 回收时还在被写入），收尾后由下面的「非 active → return」统一结束。
+        if (queue.length > 0 && getState(taskId).status !== 'active') {
+          queue = [];
+        }
         while (queue.length > 0 && running.size < batchLimit) {
           launch(queue.shift()!);
         }
@@ -687,7 +744,7 @@ export function createKernel(deps: KernelDeps): Kernel {
     return result(true);
   }
 
-  return { startTask, getState, getEvents, runTask };
+  return { startTask, getState, getEvents, runTask, cancel };
 }
 
 /** 从载荷里抽取一段短摘要，作为唯一进入下游 prompt 的产物内容 */

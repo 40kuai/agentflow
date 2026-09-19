@@ -1450,3 +1450,203 @@ describe('worktree 隔离与确定性合并（Task 11）', () => {
     store.close();
   });
 });
+
+/**
+ * 取消能力的语义（Task 12 遗留项：内核此前没有 cancel）。
+ *
+ * 三条必须成立的性质：
+ *  1) 取消后状态明确：node → cancelled、task → cancelled，不是悬挂的 active；
+ *  2) 取消是终态：在途节点的迟到成功不翻转它（幂等，重复取消不写事件）；
+ *  3) 取消真的止损：通知 runner 杀进程组，且主循环不再启动队列里排队的节点。
+ */
+describe('取消任务（cancel 的语义与止损）', () => {
+  async function waitFor(predicate: () => boolean, label: string, timeoutMs = 3000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate()) {
+      if (Date.now() > deadline) throw new Error(`等待超时：${label}`);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  }
+
+  /**
+   * 可挂起的 runner：`holdFor` 命中的 run 会停在 started 之后。
+   * 被 cancel 过的 run 不再挂起（cancel 可能早于 run 真正开始——内核是先落 node.started 再迭代
+   * runner 的），从而两条时序都能收敛：cancel 在挂起中 → 放行；cancel 在挂起前 → 不挂起。
+   */
+  function createHoldingRunner(holdFor: (req: RunRequest) => boolean): AgentRunner & {
+    cancelled: string[];
+  } {
+    const gates: Array<() => void> = [];
+    const cancelled: string[] = [];
+    const cancelledRuns = new Set<string>();
+    const gateFor = (): Promise<void> =>
+      new Promise<void>((resolve) => {
+        gates.push(resolve);
+      });
+    return {
+      id: 'holding',
+      capabilities: { structuredOutput: true, budgetCap: true, sessionResume: false, builtinReview: false },
+      cancelled,
+      async *run(req: RunRequest): AsyncIterable<RunnerEvent> {
+        yield { kind: 'started', pid: 7, sessionId: `holding-${req.runId}` };
+        if (holdFor(req) && !cancelledRuns.has(req.runId)) await gateFor();
+        yield { kind: 'artifact', raw: ARTIFACTS[req.artifactType] };
+        yield { kind: 'usage', tokensIn: 1, tokensOut: 1, costUsd: 0.001 };
+        yield { kind: 'exited', code: 0 };
+      },
+      async cancel(runId: string): Promise<void> {
+        cancelled.push(runId);
+        cancelledRuns.add(runId);
+        while (gates.length > 0) gates.shift()!();
+      },
+    };
+  }
+
+  function makeCancelableKernel(
+    runner: AgentRunner,
+    repoPath: string,
+    logDir: string,
+    opts?: { workflow?: WorkflowDef; roles?: Map<string, RoleDef>; globalConcurrency?: number },
+  ) {
+    const store = createEventStore(':memory:');
+    const kernel = createKernel({
+      store,
+      runner,
+      workflow: opts?.workflow ?? workflow,
+      roles: opts?.roles ?? roles(),
+      maxPromptTokens: 30_000,
+      workspaceRoot: join(repoPath, '.agentflow-ws'),
+      logDir,
+      repoPath,
+      maxSteps: 20,
+      ...(opts?.globalConcurrency === undefined ? {} : { globalConcurrency: opts.globalConcurrency }),
+    });
+    return { kernel, store };
+  }
+
+  it('取消运行中的任务：节点与任务都落到 cancelled，且 runner 收到 cancel(runId)', async () => {
+    const repo = makeRepo();
+    const logs = makeLogDir();
+    const runner = createHoldingRunner(() => true);
+    const { kernel, store } = makeCancelableKernel(runner, repo, logs);
+
+    const taskId = kernel.startTask({ title: '取消我', requirementRaw: 'r', baseBranch: 'main' });
+    const running = kernel.runTask(taskId);
+    await waitFor(() => kernel.getState(taskId).currentNodeIds.length === 1, '起始节点开始运行');
+    const activeRunId = kernel.getState(taskId).nodes['pm_analyze']!.runId!;
+
+    const state = kernel.cancel(taskId);
+
+    expect(state.status).toBe('cancelled');
+    expect(state.currentNodeIds).toEqual([]);
+    expect(state.nodes['pm_analyze']!.status).toBe('cancelled');
+    expect(runner.cancelled).toEqual([activeRunId]);
+    const types = kernel.getEvents(taskId).map((e) => e.type);
+    expect(types).toContain('node.cancelled');
+    expect(types).toContain('task.cancelled');
+
+    // 幂等：再次取消不产生任何新事件
+    const countBefore = kernel.getEvents(taskId).length;
+    expect(kernel.cancel(taskId).status).toBe('cancelled');
+    expect(kernel.getEvents(taskId).length).toBe(countBefore);
+
+    // 终态粘滞：在途节点的迟到成功**不得**把任务或节点翻转回 succeeded/completed
+    const final = await running;
+    expect(final.status).toBe('cancelled');
+    expect(final.nodes['pm_analyze']!.status).toBe('cancelled');
+    expect(final.completedNodeIds).toEqual([]);
+    store.close();
+  });
+
+  it('取消后主循环不再启动排队中的节点（止损：剩余节点没有 run）', async () => {
+    const repo = makeRepo();
+    const logs = makeLogDir();
+    // 只挂起 dev_a（排在前面的那个），dev_b 不被挂起——若队列未被丢弃，dev_b 会立刻跑完并留下事件
+    const runner = createHoldingRunner((req) => /你是\s*dev_a/.test(req.systemPrompt));
+    const fanWorkflow: WorkflowDef = {
+      id: 'fan_out_cancel',
+      start: 'pm_analyze',
+      nodes: [
+        { id: 'pm_analyze', title: '需求分析', role: 'pm', consumes: [], produces: 'requirement', isolate: false },
+        { id: 'dev_a', title: 'dev_a', role: 'dev_a', consumes: ['requirement'], produces: 'code_diff', isolate: false },
+        { id: 'dev_b', title: 'dev_b', role: 'dev_b', consumes: ['requirement'], produces: 'code_diff', isolate: false },
+      ],
+      edges: [
+        { from: 'pm_analyze', to: 'dev_a', when: "all(artifacts.requirement.status == 'ok')", description: '需求已澄清 → dev_a', onMissing: 'fail' },
+        { from: 'pm_analyze', to: 'dev_b', when: "all(artifacts.requirement.status == 'ok')", description: '需求已澄清 → dev_b', onMissing: 'fail' },
+      ],
+    };
+    const make = (id: string, owns: string[]): RoleDef => ({
+      id,
+      displayName: id,
+      systemPrompt: `你是 ${id}`,
+      inputs: [],
+      outputs: ['code_diff'],
+      owns,
+      reads: [],
+      responsibilities: ['实现'],
+      prohibitions: ['不越界'],
+      doneCriteria: ['产出 code_diff'],
+      model: 'sonnet',
+      maxRetries: 1,
+      maxWallTimeMs: 60_000,
+    });
+    const fanRoles = new Map<string, RoleDef>([
+      ['pm', roles().get('pm')!],
+      ['dev_a', make('dev_a', ['src/a/**'])],
+      ['dev_b', make('dev_b', ['src/b/**'])],
+    ]);
+    // 并发上限 1：扇出批次里 dev_a 先跑、dev_b 留在队列里排队 → 取消时队列非空
+    const { kernel, store } = makeCancelableKernel(runner, repo, logs, {
+      workflow: fanWorkflow,
+      roles: fanRoles,
+      globalConcurrency: 1,
+    });
+
+    const taskId = kernel.startTask({ title: '取消排队', requirementRaw: 'r', baseBranch: 'main' });
+    const running = kernel.runTask(taskId);
+    await waitFor(
+      () => kernel.getEvents(taskId).some((e) => e.type === 'node.started' && e.payload['node_id'] === 'dev_a'),
+      'dev_a 开始运行',
+    );
+
+    kernel.cancel(taskId);
+    const final = await running;
+
+    expect(final.status).toBe('cancelled');
+    // 队列里排队的 dev_b 从未被启动（没有 node.started / node.queued 事件）
+    const devBEvents = kernel
+      .getEvents(taskId)
+      .filter((e) => e.payload['node_id'] === 'dev_b')
+      .map((e) => e.type);
+    expect(devBEvents).toEqual([]);
+    expect(kernel.getEvents(taskId).filter((e) => e.type === 'node.started')).toHaveLength(2);
+    store.close();
+  });
+
+  it('取消未知任务抛错（不静默成功）', () => {
+    const repo = makeRepo();
+    const logs = makeLogDir();
+    const runner = createHoldingRunner(() => false);
+    const { kernel, store } = makeCancelableKernel(runner, repo, logs);
+    expect(() => kernel.cancel('task_ghost')).toThrow(/找不到任务/);
+    store.close();
+  });
+
+  it('已终态的任务取消是幂等的：不写事件、状态不变、不通知 runner', async () => {
+    const repo = makeRepo();
+    const logs = makeLogDir();
+    const runner = createHoldingRunner(() => false);
+    const { kernel, store } = makeCancelableKernel(runner, repo, logs);
+
+    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    await kernel.runTask(taskId);
+    const countBefore = kernel.getEvents(taskId).length;
+
+    const state = kernel.cancel(taskId);
+    expect(state.status).toBe('completed');
+    expect(kernel.getEvents(taskId).length).toBe(countBefore);
+    expect(runner.cancelled).toEqual([]);
+    store.close();
+  });
+});

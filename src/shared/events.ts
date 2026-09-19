@@ -5,6 +5,7 @@ export const KERNEL_EVENT_TYPES = [
   'task.created',
   'task.completed',
   'task.failed',
+  'task.cancelled',
   'wp.declared',
   'wp.started',
   'wp.merged',

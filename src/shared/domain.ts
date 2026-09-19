@@ -1,4 +1,8 @@
-export type TaskStatus = 'active' | 'completed' | 'failed';
+/**
+ * 任务状态。`cancelled` 是**终态**：由人工取消产生（`task.cancelled`），
+ * 与 failed 区分开——取消不是失败，不应让使用者以为流程走错了。
+ */
+export type TaskStatus = 'active' | 'completed' | 'failed' | 'cancelled';
 
 export type NodeRunStatus =
   | 'queued'

@@ -998,3 +998,91 @@ describe('Task 6：角色编辑 API', () => {
     expect(existsSync(join(configDir, 'roles', 'ghost.yaml'))).toBe(false);
   });
 });
+
+describe('取消任务端点（内核 cancel 的 HTTP 入口）', () => {
+  it('取消运行中的任务：任务与节点都落到 cancelled，返回 cancelled: true 与完整 state', async () => {
+    const b = boot();
+    const { taskId, nodeId } = seedRunningNode(b, 'run_cancel');
+
+    const res = await b.server.app.inject({
+      method: 'POST',
+      url: `/api/tasks/${taskId}/cancel`,
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      cancelled: boolean;
+      reason?: string;
+      state: { status: string; currentNodeIds: string[]; nodes: Record<string, { status: string }> };
+    };
+    expect(body.cancelled).toBe(true);
+    expect(body.reason).toBeUndefined();
+    expect(body.state.status).toBe('cancelled');
+    expect(body.state.currentNodeIds).toEqual([]);
+    expect(body.state.nodes[nodeId]!.status).toBe('cancelled');
+
+    // 事件库里的凭据：node.cancelled + task.cancelled（服务重启后同样读得到）
+    const detail = await b.server.app.inject({ method: 'GET', url: `/api/tasks/${taskId}` });
+    expect((detail.json() as { status: string }).status).toBe('cancelled');
+  });
+
+  it('取消后到达的 task.failed 是终止余波：流转视图不得同时报告"已取消"和"失败原因"', async () => {
+    const b = boot();
+    const { taskId, nodeId } = seedRunningNode(b, 'run_late');
+    await b.server.app.inject({ method: 'POST', url: `/api/tasks/${taskId}/cancel` });
+    // 模拟"进程被杀后节点收尾"：在途节点迟到的 node.failed + task.failed
+    b.store.append({
+      task_id: taskId,
+      type: 'node.failed',
+      payload: { node_id: nodeId, run_id: 'run_late', error: 'CLI 退出码 -1' },
+      actor: 'kernel',
+    });
+    b.store.append({
+      task_id: taskId,
+      type: 'task.failed',
+      payload: { reason: `节点 ${nodeId} 执行失败`, reason_category: 'other', reason_label: '其他' },
+      actor: 'kernel',
+    });
+
+    const res = await b.server.app.inject({ method: 'GET', url: `/api/tasks/${taskId}/flow` });
+    const body = res.json() as {
+      status: string;
+      taskFailure: unknown;
+      nodes: Array<{ id: string; status: string }>;
+    };
+    expect(body.status).toBe('cancelled');
+    expect(body.taskFailure).toBeNull();
+    expect(body.nodes.find((n) => n.id === nodeId)!.status).toBe('cancelled');
+  });
+
+  it('已终态的任务：幂等返回 cancelled: false 与中文原因，不写新事件', async () => {
+    const b = boot();
+    const taskId = await startAndRun(b);
+    const before = b.store.readTask(taskId).length;
+
+    const res = await b.server.app.inject({
+      method: 'POST',
+      url: `/api/tasks/${taskId}/cancel`,
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { cancelled: boolean; reason?: string; state: { status: string } };
+    expect(body.cancelled).toBe(false);
+    expect(body.reason).toContain('终态');
+    expect(body.state.status).toBe('completed');
+    expect(b.store.readTask(taskId).length).toBe(before);
+  });
+
+  it('未知任务返回 404（不静默成功）', async () => {
+    const { server } = boot();
+    const res = await server.app.inject({ method: 'POST', url: '/api/tasks/task_ghost/cancel' });
+    expect(res.statusCode).toBe(404);
+    expect(res.json()).toMatchObject({ code: 'TASK_NOT_FOUND' });
+  });
+
+  it('health 声明 task-cancel 能力（前端据此判断后端是否落后）', async () => {
+    const { server } = boot();
+    const res = await server.app.inject({ method: 'GET', url: '/api/health' });
+    expect((res.json() as { features: string[] }).features).toContain('task-cancel');
+  });
+});

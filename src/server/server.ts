@@ -45,7 +45,12 @@ const PROCESS_STARTED_AT = Date.now() - Math.round(process.uptime() * 1000);
  * 前端缺少必需能力时应提示「后端版本落后于前端，请重启服务」，
  * 而不是把日志端点的 404 误读成「日志不存在」。
  */
-const SERVER_FEATURES: readonly string[] = ['log-by-node', 'log-by-run', 'live-stats'];
+const SERVER_FEATURES: readonly string[] = [
+  'log-by-node',
+  'log-by-run',
+  'live-stats',
+  'task-cancel',
+];
 
 /** claude 进程探测结果的缓存时长：health 会被前端高频轮询，避免每次都 spawn ps */
 const CLAUDE_PROC_CACHE_MS = 3000;
@@ -659,6 +664,10 @@ function buildFlowView(
     };
   }
 
+  // 取消是终态：取消后到达的 task.failed 是"在途节点被终止"的余波，不是"为什么失败"。
+  // 若照实透出，界面会同时显示"已取消"和"失败原因：xxx"，反而让人以为流程走错了。
+  if (state.status === 'cancelled') taskFailure = null;
+
   return {
     taskId: state.taskId,
     title: state.title,
@@ -1053,6 +1062,29 @@ export function createServer(deps: ServerDeps): AgentFlowServer {
         .send({ error: `写入后无法读回角色文件：${target}`, code: 'RELOAD_FAILED' });
     }
     return { role: roleView(reloaded), path: target };
+  });
+
+  // ---- 取消任务：内核已有 cancel 能力，此前没有 HTTP 入口（Task 12 遗留项）----
+  //
+  // 语义（与 kernel.cancel 一致）：
+  //  - 未知任务 404（判据同其它端点：事件库里有事件才算存在）；
+  //  - 已终态（completed/failed/cancelled）→ 200 且 `cancelled: false` + 中文 `reason`，
+  //    幂等且**如实说明为什么没取消**，不伪装成"取消成功"；
+  //  - active → 200 `cancelled: true`，`state.status === 'cancelled'`（明确的终态，不悬挂）；
+  //    同时通知 runner 杀掉在途进程组，取消才真的停止花钱。
+  app.post('/api/tasks/:taskId/cancel', async (request, reply) => {
+    const { taskId } = request.params as { taskId: string };
+    if (deps.store.readTask(taskId).length === 0) {
+      return reply.status(404).send({ error: `找不到任务：${taskId}`, code: 'TASK_NOT_FOUND' });
+    }
+    const before = deps.kernel.getState(taskId);
+    const state = deps.kernel.cancel(taskId);
+    const cancelled = before.status === 'active' && state.status === 'cancelled';
+    return {
+      cancelled,
+      ...(cancelled ? {} : { reason: `任务已处于终态（${before.status}），无需取消` }),
+      state,
+    };
   });
 
   app.get('/api/tasks/:taskId/nodes/:nodeId/log', async (request, reply) => {

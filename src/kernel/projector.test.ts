@@ -202,4 +202,43 @@ describe('project', () => {
     ];
     expect(project(events)).toEqual(project(events));
   });
+
+  it('task.cancelled 把任务置为 cancelled 终态，并清空当前节点', () => {
+    const s = project([
+      ev('task.created', { title: 't', requirement_raw: 'r', base_branch: 'main' }),
+      ev('node.started', { node_id: 'pm_analyze', role_id: 'pm', run_id: 'run_1', attempt: 1 }),
+      ev('node.cancelled', { node_id: 'pm_analyze', run_id: 'run_1', reason: '任务被取消' }),
+      ev('task.cancelled', { reason: '任务被用户取消' }),
+    ]);
+    expect(s.status).toBe('cancelled');
+    expect(s.currentNodeIds).toEqual([]);
+    expect(s.nodes['pm_analyze']!.status).toBe('cancelled');
+  });
+
+  it('取消是终态：在途节点的迟到 succeeded / failed 与 task.completed 都不翻转 cancelled', () => {
+    // 取消时 CLI 可能刚好跑完，迟到事件不得让界面从"已取消"跳回"已完成"
+    const s = project([
+      ev('task.created', { title: 't', requirement_raw: 'r', base_branch: 'main' }),
+      ev('node.started', { node_id: 'pm_analyze', role_id: 'pm', run_id: 'run_1', attempt: 1 }),
+      ev('node.cancelled', { node_id: 'pm_analyze', run_id: 'run_1', reason: '任务被取消' }),
+      ev('task.cancelled', { reason: '任务被用户取消' }),
+      ev('node.succeeded', { node_id: 'pm_analyze', run_id: 'run_1', log_ref: 'x' }),
+      ev('task.completed', { reason: '流程图走完' }),
+    ]);
+    expect(s.status).toBe('cancelled');
+    expect(s.nodes['pm_analyze']!.status).toBe('cancelled');
+    expect(s.completedNodeIds).toEqual([]);
+  });
+
+  it('未取消的节点不受粘滞规则影响：迟到 failed 仍按 failed 记录', () => {
+    // 反向断言：确保"取消粘滞"没有把普通失败路径的行为一起改掉
+    const s = project([
+      ev('task.created', { title: 't', requirement_raw: 'r', base_branch: 'main' }),
+      ev('node.started', { node_id: 'pm_analyze', role_id: 'pm', run_id: 'run_1', attempt: 1 }),
+      ev('node.failed', { node_id: 'pm_analyze', run_id: 'run_1', error: '超时' }),
+      ev('task.failed', { reason: '失败' }),
+    ]);
+    expect(s.status).toBe('failed');
+    expect(s.nodes['pm_analyze']!.status).toBe('failed');
+  });
 });

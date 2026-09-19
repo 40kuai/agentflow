@@ -132,12 +132,16 @@ export function project(events: KernelEvent[]): TaskState {
       case 'node.succeeded': {
         const nodeId = str(p, 'node_id');
         const node = state.nodes[nodeId];
-        if (node) {
+        // 取消是终态：被取消的节点不被**在途的迟到成功**翻转（取消时 CLI 可能刚跑完，
+        // 若允许翻转，界面会先显示"已取消"再跳回"succeeded"，使用者无从判断到底怎么了）。
+        // 非取消节点行为与此前逐字一致。
+        const cancelled = node?.status === 'cancelled';
+        if (node && !cancelled) {
           node.status = 'succeeded';
           node.lastLogRef = str(p, 'log_ref') || node.lastLogRef;
         }
         state.currentNodeIds = state.currentNodeIds.filter((id) => id !== nodeId);
-        if (!state.completedNodeIds.includes(nodeId)) {
+        if (!cancelled && !state.completedNodeIds.includes(nodeId)) {
           state.completedNodeIds.push(nodeId);
         }
         break;
@@ -147,7 +151,8 @@ export function project(events: KernelEvent[]): TaskState {
         const nodeId = str(p, 'node_id');
         const node = state.nodes[nodeId];
         if (node) {
-          node.status = 'failed';
+          // 同上：错误文本照记（便于排查），但状态不被取消后到达的失败翻转
+          if (node.status !== 'cancelled') node.status = 'failed';
           node.lastError = str(p, 'error', '未知错误');
           node.lastLogRef = str(p, 'log_ref') || node.lastLogRef;
         }
@@ -241,12 +246,20 @@ export function project(events: KernelEvent[]): TaskState {
       }
 
       case 'task.completed': {
-        state.status = 'completed';
+        // 取消是终态：取消后不再被在途结果翻转
+        if (state.status !== 'cancelled') state.status = 'completed';
         break;
       }
 
       case 'task.failed': {
-        state.status = 'failed';
+        if (state.status !== 'cancelled') state.status = 'failed';
+        break;
+      }
+
+      case 'task.cancelled': {
+        // 人工取消：状态明确落到 cancelled（既不悬挂在 active，也不伪装成 failed）
+        state.status = 'cancelled';
+        state.currentNodeIds = [];
         break;
       }
 
