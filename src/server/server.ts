@@ -1,7 +1,12 @@
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { resolve, sep } from 'node:path';
 import websocket from '@fastify/websocket';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import type { EventStore } from '../kernel/event-store.js';
 import type { Kernel } from '../kernel/kernel.js';
+import { project } from '../kernel/projector.js';
+import type { KernelEvent } from '../shared/events.js';
 
 const CreateTaskSchema = z.object({
   title: z.string().min(1),
@@ -9,8 +14,19 @@ const CreateTaskSchema = z.object({
   baseBranch: z.string().min(1).default('main'),
 });
 
+/** 日志尾行的默认条数 */
+const DEFAULT_LOG_TAIL = 200;
+/** 日志尾行下限 */
+const MIN_LOG_TAIL = 1;
+/** 日志尾行上限：单文件可达数 MB，2000 行是刻意的体积保护 */
+const MAX_LOG_TAIL = 2000;
+
 export type ServerDeps = {
   kernel: Kernel;
+  /** 事件库：列表聚合与任务存在性判据的数据源（不再依赖进程内存登记） */
+  store: EventStore;
+  /** 日志根目录：内核拼 log_ref 用的同一个值，日志端点据此做目录穿越校验 */
+  logDir: string;
   host: string;
   port: number;
 };
@@ -22,11 +38,43 @@ export type AgentFlowServer = {
 
 type PushSocket = { send(data: string): void; readyState: number };
 
+/** 任务列表摘要：从事件库聚合出的持久化视图，服务重启后依然可见 */
+type TaskSummary = {
+  taskId: string;
+  title: string;
+  status: string;
+  budgetUsedUsd: number;
+  nodeCount: number;
+  completedNodeCount: number;
+  createdAt: number;
+  updatedAt: number;
+};
+
+/**
+ * 把 tail 查询参数钳制到 [1, 2000]、缺省或非数字回退默认值。
+ * 采用"钳制"而非报错：日志端点的目的是尽力让用户看到诊断信息，非法参数不应成为阻碍。
+ */
+function normalizeTail(raw: unknown): number {
+  if (raw === undefined) return DEFAULT_LOG_TAIL;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return DEFAULT_LOG_TAIL;
+  return Math.min(MAX_LOG_TAIL, Math.max(MIN_LOG_TAIL, Math.trunc(n)));
+}
+
+/** 按 task_id 分组事件（保持 seq 顺序） */
+function groupByTask(events: KernelEvent[]): Map<string, KernelEvent[]> {
+  const byTask = new Map<string, KernelEvent[]>();
+  for (const event of events) {
+    const bucket = byTask.get(event.task_id);
+    if (bucket) bucket.push(event);
+    else byTask.set(event.task_id, [event]);
+  }
+  return byTask;
+}
+
 export function createServer(deps: ServerDeps): AgentFlowServer {
   const app = Fastify({ logger: false });
   const sockets = new Set<PushSocket>();
-  const knownTaskIds = new Set<string>();
-  const taskSummaries = new Map<string, { taskId: string; title: string; status: string }>();
 
   function broadcast(message: unknown): void {
     const payload = JSON.stringify(message);
@@ -45,18 +93,13 @@ export function createServer(deps: ServerDeps): AgentFlowServer {
       return reply.status(400).send({ error: '请求体不合法', detail: parsed.error.message });
     }
 
+    // task.created 已在 startTask 内同步落库，列表/详情接口无需任何内存登记即可立刻读到
     const taskId = deps.kernel.startTask(parsed.data);
-    knownTaskIds.add(taskId);
-    taskSummaries.set(taskId, { taskId, title: parsed.data.title, status: 'active' });
 
     // 异步推进任务，不阻塞 HTTP 响应
     void deps.kernel
       .runTask(taskId)
-      .then((state) => {
-        const summary = taskSummaries.get(taskId);
-        if (summary) summary.status = state.status;
-        broadcast({ type: 'task_state', state });
-      })
+      .then((state) => broadcast({ type: 'task_state', state }))
       .catch((error: unknown) => {
         broadcast({ type: 'task_error', taskId, message: (error as Error).message });
       });
@@ -64,11 +107,40 @@ export function createServer(deps: ServerDeps): AgentFlowServer {
     return reply.status(201).send({ taskId });
   });
 
-  app.get('/api/tasks', async () => ({ tasks: [...taskSummaries.values()] }));
+  app.get('/api/tasks', async () => {
+    // Phase 1 取舍：readAll() 是全量读事件库，任务/事件规模大了需要改为分页或专门的
+    // 任务索引表；当前规模下可接受，换来"服务重启后列表不丢、内核直建任务也可见"的正确性。
+    const summaries: TaskSummary[] = [];
+
+    for (const [taskId, events] of groupByTask(deps.store.readAll())) {
+      const state = project(events);
+      let createdAt = events[0]!.created_at;
+      let updatedAt = events[0]!.created_at;
+      for (const event of events) {
+        if (event.created_at < createdAt) createdAt = event.created_at;
+        if (event.created_at > updatedAt) updatedAt = event.created_at;
+      }
+      summaries.push({
+        taskId,
+        title: state.title,
+        status: state.status,
+        budgetUsedUsd: state.budgetUsedUsd,
+        nodeCount: Object.keys(state.nodes).length,
+        completedNodeCount: state.completedNodeIds.length,
+        createdAt,
+        updatedAt,
+      });
+    }
+
+    // 按 updatedAt 倒序：最新任务排最前
+    summaries.sort((a, b) => b.updatedAt - a.updatedAt);
+    return { tasks: summaries };
+  });
 
   app.get('/api/tasks/:taskId', async (request, reply) => {
     const { taskId } = request.params as { taskId: string };
-    if (!knownTaskIds.has(taskId)) {
+    // 判据改到事件库：有事件即可读，不再要求经 POST 登记
+    if (deps.store.readTask(taskId).length === 0) {
       return reply.status(404).send({ error: `找不到任务：${taskId}` });
     }
     return deps.kernel.getState(taskId);
@@ -76,10 +148,60 @@ export function createServer(deps: ServerDeps): AgentFlowServer {
 
   app.get('/api/tasks/:taskId/events', async (request, reply) => {
     const { taskId } = request.params as { taskId: string };
-    if (!knownTaskIds.has(taskId)) {
+    if (deps.store.readTask(taskId).length === 0) {
       return reply.status(404).send({ error: `找不到任务：${taskId}` });
     }
     return { events: deps.kernel.getEvents(taskId) };
+  });
+
+  app.get('/api/tasks/:taskId/nodes/:nodeId/log', async (request, reply) => {
+    const { taskId, nodeId } = request.params as { taskId: string; nodeId: string };
+    const query = request.query as { tail?: string };
+
+    if (deps.store.readTask(taskId).length === 0) {
+      return reply.status(404).send({ error: `找不到任务：${taskId}` });
+    }
+
+    const state = deps.kernel.getState(taskId);
+    const node = state.nodes[nodeId];
+    if (!node) {
+      return reply.status(404).send({ error: `找不到节点：${nodeId}` });
+    }
+    if (!node.lastLogRef) {
+      return reply.status(404).send({ error: `节点 ${nodeId} 没有日志引用` });
+    }
+
+    // lastLogRef 来自事件库、属于数据驱动的路径：必须先做目录穿越校验，绝不能直接读任意文件。
+    // 校验不通过时直接返回 400，且不读取任何文件内容。
+    const resolvedRoot = resolve(deps.logDir);
+    const resolved = resolve(node.lastLogRef);
+    if (!resolved.startsWith(resolvedRoot + sep)) {
+      return reply.status(400).send({ error: `日志路径越界：不在允许的日志根目录内（${resolved}）` });
+    }
+
+    if (!existsSync(resolved) || !statSync(resolved).isFile()) {
+      return reply.status(404).send({ error: `日志文件不存在：${resolved}` });
+    }
+
+    // 只读、不修改任何文件。服务端不做 JSON 解析/格式化：原样返回字符串行，
+    // 由前端决定如何展示 stream-json。tail 上限 2000 行是刻意的体积保护。
+    const raw = readFileSync(resolved, 'utf8');
+    const allLines = raw.split('\n');
+    // 丢弃文件末尾换行产生的空元素
+    while (allLines.length > 0 && allLines[allLines.length - 1] === '') allLines.pop();
+
+    const totalLines = allLines.length;
+    const tail = normalizeTail(query.tail);
+    const lines = totalLines <= tail ? allLines : allLines.slice(totalLines - tail);
+
+    return {
+      nodeId,
+      logRef: resolved,
+      totalLines,
+      returnedLines: lines.length,
+      truncated: lines.length < totalLines,
+      lines,
+    };
   });
 
   app.register(async (instance) => {

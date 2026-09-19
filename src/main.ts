@@ -28,7 +28,13 @@ const kernel = createKernel({
   maxSteps: 50,
 });
 
-const server = createServer({ kernel, host: env.host, port: env.port });
+const server = createServer({
+  kernel,
+  store,
+  logDir: resolve(env.logDir),
+  host: env.host,
+  port: env.port,
+});
 
 await server.app.listen({ host: env.host, port: env.port });
 console.log(`AgentFlow 已启动：http://${env.host}:${env.port}`);
