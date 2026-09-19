@@ -112,4 +112,39 @@ describe('EventStore', () => {
     // 返回值的 payload 是落库后的重读值：JSON 往返会丢掉 undefined 键
     expect(appended.payload).toStrictEqual({ b: 1 });
   });
+
+  it('并发 append 不破坏 append-only 与 seq 单调性（多"逻辑任务"交错写入）', async () => {
+    // 模拟内核主循环并发推进多个节点：多个 async 任务交错调用 append。
+    // better-sqlite3 是同步 API，seq 由 AUTOINCREMENT 在 INSERT 时分配（无"读 lastSeq → 写"竞态），
+    // 本用例把这一点钉死：seq 全局唯一、严格递增、无丢失、无覆盖。
+    const writers = Array.from({ length: 5 }, (_, i) => i);
+    await Promise.all(
+      writers.map(async (i) => {
+        for (let j = 0; j < 20; j += 1) {
+          store.append({
+            task_id: `t${i}`,
+            type: 'node.queued',
+            payload: { node_id: `n${i}`, seq_in_task: j },
+            actor: 'kernel',
+          });
+          // 让出执行权，制造多任务之间的真实交错
+          await Promise.resolve();
+        }
+      }),
+    );
+
+    const all = store.readAll();
+    expect(all).toHaveLength(100);
+    const seqs = all.map((e) => e.seq);
+    // readAll 按 seq 升序返回
+    expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
+    // 严格递增（等价于唯一且无空洞）
+    expect(seqs).toEqual(Array.from({ length: 100 }, (_, k) => k + 1));
+    // 每个逻辑任务的自身事件序列保持升序
+    for (const i of writers) {
+      const own = store.readTask(`t${i}`).map((e) => e.seq);
+      expect(own).toHaveLength(20);
+      expect(own).toEqual([...own].sort((a, b) => a - b));
+    }
+  });
 });

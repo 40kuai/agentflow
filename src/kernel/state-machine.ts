@@ -158,7 +158,14 @@ export function decideNext(input: DecideInput): Decision {
     };
   }
 
+  // Task 9（fan-out）：一个节点可**同时激活其全部条件成立的出边**指向的目标。
+  // 与旧实现（取第一条匹配边即返回）的差别**仅在存在多条匹配边时**：只有一条匹配边时，
+  // 返回的 nodeIds / selectedEdges / skippedEdges / reason 与旧实现逐字一致（串行等价性）。
+  // join 语义不在此处强制——它由「有节点在运行时一律 wait」这一上层规则保证：
+  // join 节点的任一上游仍在运行即导致 wait，全部上游进入终态后才可能被激活。
   const skippedEdges: EdgeEvaluation[] = [];
+  const nodeIds: string[] = [];
+  const selectedEdges: EdgeEvaluation[] = [];
   for (const edge of outgoing) {
     const evaluation = evaluateEdge(edge, facts);
     if (!evaluation.matched) {
@@ -177,12 +184,26 @@ export function decideNext(input: DecideInput): Decision {
         failure: { category: 'other', unmetConditions: [], artifactStatuses },
       };
     }
+    // 同一目标被多条入边同时命中时只激活一次，保证 selectedEdges[i] 与 nodeIds[i] 一一对齐
+    // （内核主循环用 `selectedEdges[i]` 取第 i 个节点所用的边）。
+    if (nodeIds.includes(edge.to)) continue;
+    nodeIds.push(edge.to);
+    selectedEdges.push(evaluation);
+  }
+
+  if (nodeIds.length > 0) {
     return {
       kind: 'start',
-      nodeIds: [edge.to],
-      selectedEdges: [evaluation],
+      nodeIds,
+      selectedEdges,
       skippedEdges,
-      reason: evaluation.reason,
+      // 单节点批次沿用该边的选中原因（既有行为不变）；多节点批次给出汇总说明
+      reason:
+        selectedEdges.length === 1
+          ? selectedEdges[0]!.reason
+          : `同时激活 ${nodeIds.length} 个节点（${nodeIds.join(', ')}）：${selectedEdges
+              .map((e) => e.reason)
+              .join(' | ')}`,
     };
   }
 

@@ -27,6 +27,7 @@ const kernel = createKernel({
   repoPath: process.cwd(),
   maxSteps: 50,
   batchConflictPolicy: env.batchConflictPolicy,
+  globalConcurrency: env.globalConcurrency,
 });
 
 const server = createServer({

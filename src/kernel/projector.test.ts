@@ -70,6 +70,25 @@ describe('project', () => {
     expect(s.nodes.pm_analyze?.lastLogRef).toBeNull();
   });
 
+  it('并发产生多个 node.started 时 currentNodeIds 同时含多个节点，逐个结束后各自移除', () => {
+    const s = project([
+      ev('node.started', { node_id: 'dev_a', role_id: 'dev_a', run_id: 'run_a', attempt: 1 }),
+      ev('node.started', { node_id: 'dev_b', role_id: 'dev_b', run_id: 'run_b', attempt: 1 }),
+    ]);
+    expect(s.currentNodeIds).toEqual(['dev_a', 'dev_b']);
+    expect(s.nodes.dev_a?.status).toBe('running');
+    expect(s.nodes.dev_b?.status).toBe('running');
+
+    // 只重放到 dev_a 的成功：dev_b 仍在运行，currentNodeIds 只移除 dev_a
+    const midway = project([
+      ev('node.started', { node_id: 'dev_a', role_id: 'dev_a', run_id: 'run_a', attempt: 1 }),
+      ev('node.started', { node_id: 'dev_b', role_id: 'dev_b', run_id: 'run_b', attempt: 1 }),
+      ev('node.succeeded', { node_id: 'dev_a', run_id: 'run_a', log_ref: 'x' }),
+    ]);
+    expect(midway.currentNodeIds).toEqual(['dev_b']);
+    expect(midway.completedNodeIds).toEqual(['dev_a']);
+  });
+
   it('node.succeeded 把节点移出当前节点并加入已完成', () => {
     const s = project([
       ev('node.started', { node_id: 'pm_analyze', role_id: 'pm', run_id: 'run_1', attempt: 1 }),

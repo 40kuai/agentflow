@@ -7,6 +7,7 @@ import { createKernel } from './kernel.js';
 import { project } from './projector.js';
 import { createEventStore } from './event-store.js';
 import { createFakeRunner, type FakeRunner, type FakeScriptItem } from '../runner/fake-runner.js';
+import type { AgentRunner, RunRequest, RunnerEvent } from '../runner/types.js';
 import type { RoleDef, WorkflowDef } from '../shared/domain.js';
 
 const workflow: WorkflowDef = {
@@ -745,6 +746,307 @@ describe('owns 路径级强制与越界检出（Task 7）', () => {
     const failed = kernel.getEvents(taskId).find((e) => e.type === 'node.failed');
     expect(failed?.payload['reason_category']).toBe('permission_denied');
     expect(failed?.payload['out_of_bounds_paths']).toEqual(['pm-note.md']);
+    store.close();
+  });
+});
+
+describe('fan-out / join / 并发上限（Task 9 + Task 10）', () => {
+  /** 可观测时序的 runner：记录峰值并发与各角色进出时序，并支持挂起指定角色的执行 */
+  type TimedRunner = AgentRunner & {
+    peak: () => number;
+    timeline: { role: string; phase: 'start' | 'end' }[];
+  };
+
+  function createTimedRunner(options: {
+    /** 返回 promise 时该次 run 挂起，直到 promise resolve（模拟"上游仍在运行"） */
+    hold?: (req: RunRequest) => Promise<void> | undefined;
+    delayMs?: number;
+  }): TimedRunner {
+    let active = 0;
+    let peak = 0;
+    const timeline: { role: string; phase: 'start' | 'end' }[] = [];
+    // 角色标识取自 systemPrompt（roles 约定为 `你是 <id>`）
+    const roleOf = (req: RunRequest): string => /你是\s*(\S+)/.exec(req.systemPrompt)?.[1] ?? 'unknown';
+    return {
+      id: 'timed',
+      capabilities: { structuredOutput: true, budgetCap: true, sessionResume: false, builtinReview: false },
+      peak: () => peak,
+      timeline,
+      async *run(req: RunRequest): AsyncIterable<RunnerEvent> {
+        const role = roleOf(req);
+        active += 1;
+        peak = Math.max(peak, active);
+        timeline.push({ role, phase: 'start' });
+        try {
+          yield { kind: 'started', pid: 111, sessionId: `timed-${req.runId}` };
+          const held = options.hold?.(req);
+          if (held) await held;
+          else if (options.delayMs) await new Promise((r) => setTimeout(r, options.delayMs));
+          yield { kind: 'artifact', raw: ARTIFACTS[req.artifactType] };
+          yield { kind: 'usage', tokensIn: 10, tokensOut: 5, costUsd: 0.001 };
+          yield { kind: 'exited', code: 0 };
+        } finally {
+          active -= 1;
+          timeline.push({ role, phase: 'end' });
+        }
+      },
+      async cancel(): Promise<void> {},
+    };
+  }
+
+  function deferred(): { promise: Promise<void>; resolve: () => void } {
+    let resolve!: () => void;
+    const promise = new Promise<void>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  }
+
+  async function waitFor(predicate: () => boolean, label: string, timeoutMs = 3000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate()) {
+      if (Date.now() > deadline) throw new Error(`等待超时：${label}`);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  }
+
+  /** 扇出工作流：pm_analyze 同时激活全部 dev 节点，dev 节点在 qa_verify 汇聚（join） */
+  function fanOutWorkflow(devNodeIds: string[]): WorkflowDef {
+    return {
+      id: 'fan_out_demo',
+      start: 'pm_analyze',
+      nodes: [
+        { id: 'pm_analyze', title: '需求分析', role: 'pm', consumes: [], produces: 'requirement', isolate: false },
+        ...devNodeIds.map((id) => ({
+          id,
+          title: id,
+          role: id,
+          consumes: ['requirement'],
+          produces: 'code_diff',
+          isolate: false,
+        })),
+        { id: 'qa_verify', title: '汇总验证', role: 'qa_engineer', consumes: ['code_diff'], produces: 'test_report', isolate: false },
+      ],
+      edges: [
+        ...devNodeIds.map((id) => ({
+          from: 'pm_analyze',
+          to: id,
+          when: "all(artifacts.requirement.status == 'ok')",
+          description: `需求已澄清 → ${id}`,
+          onMissing: 'fail' as const,
+        })),
+        ...devNodeIds.map((id) => ({
+          from: id,
+          to: 'qa_verify',
+          description: `${id} 完成 → 汇总`,
+          onMissing: 'fail' as const,
+        })),
+      ],
+    };
+  }
+
+  function fanOutRoles(devNodeIds: string[], ownsFor?: (id: string) => string[]): Map<string, RoleDef> {
+    const make = (id: string, outputs: string[], owns: string[]): RoleDef => ({
+      id,
+      displayName: id,
+      systemPrompt: `你是 ${id}`,
+      inputs: [],
+      outputs,
+      owns,
+      reads: [],
+      responsibilities: [`${id} 的职责`],
+      prohibitions: [`${id} 的禁止事项`],
+      doneCriteria: [`${id} 的完成判据`],
+      model: 'sonnet',
+      maxRetries: 1,
+      maxWallTimeMs: 60_000,
+    });
+    const map = new Map<string, RoleDef>([
+      ['pm', make('pm', ['requirement'], [])],
+      ['qa_engineer', make('qa_engineer', ['test_report'], ['tests/**'])],
+    ]);
+    for (const id of devNodeIds) {
+      map.set(id, make(id, ['code_diff'], ownsFor ? ownsFor(id) : [`src/${id}/**`]));
+    }
+    return map;
+  }
+
+  function makeFanOutKernel(opts: {
+    devNodeIds: string[];
+    runner: AgentRunner;
+    repoPath: string;
+    logDir: string;
+    globalConcurrency?: number;
+    batchConflictPolicy?: 'serialize' | 'reject';
+    ownsFor?: (id: string) => string[];
+  }) {
+    const store = createEventStore(':memory:');
+    const kernel = createKernel({
+      store,
+      runner: opts.runner,
+      workflow: fanOutWorkflow(opts.devNodeIds),
+      roles: fanOutRoles(opts.devNodeIds, opts.ownsFor),
+      maxPromptTokens: 30_000,
+      workspaceRoot: join(opts.repoPath, '.agentflow-ws'),
+      logDir: opts.logDir,
+      repoPath: opts.repoPath,
+      maxSteps: 40,
+      globalConcurrency: opts.globalConcurrency,
+      batchConflictPolicy: opts.batchConflictPolicy,
+    });
+    return { kernel, store };
+  }
+
+  it('fan-out：pm 完成后 dev_a 与 dev_b 被同一批次同时激活并真并发执行', async () => {
+    const repo = makeRepo();
+    const logs = makeLogDir();
+    const runner = createTimedRunner({ delayMs: 15 });
+    const { kernel, store } = makeFanOutKernel({
+      devNodeIds: ['dev_a', 'dev_b'],
+      runner,
+      repoPath: repo,
+      logDir: logs,
+      globalConcurrency: 2,
+    });
+
+    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    const state = await kernel.runTask(taskId);
+
+    expect(state.status).toBe('completed');
+    // 两个 dev 节点都被启动，且峰值并发达到 2（并行是真发生的，而非串行假象）
+    expect(runner.timeline.filter((t) => t.phase === 'start').map((t) => t.role)).toEqual(
+      expect.arrayContaining(['dev_a', 'dev_b']),
+    );
+    expect(runner.peak()).toBe(2);
+    // 转移记录：两个节点都由 pm_analyze 扇出（from 取自激活所用的边，不会相互串味）
+    const transfers = kernel.getState(taskId).transfers.map((t) => `${t.from}→${t.to}`);
+    expect(transfers).toContain('pm_analyze→dev_a');
+    expect(transfers).toContain('pm_analyze→dev_b');
+    expect(state.completedNodeIds).toEqual(
+      expect.arrayContaining(['pm_analyze', 'dev_a', 'dev_b', 'qa_verify']),
+    );
+    store.close();
+  });
+
+  it('join：上游未全部进入终态时不启动；全部终态后启动（两个方向都有断言）', async () => {
+    const repo = makeRepo();
+    const logs = makeLogDir();
+    const release = deferred();
+    const runner = createTimedRunner({
+      hold: (req) => (req.systemPrompt.includes('dev_b') ? release.promise : undefined),
+    });
+    const { kernel, store } = makeFanOutKernel({
+      devNodeIds: ['dev_a', 'dev_b'],
+      runner,
+      repoPath: repo,
+      logDir: logs,
+      globalConcurrency: 2,
+    });
+
+    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    const running = kernel.runTask(taskId);
+
+    // 方向一：dev_a 已成功、dev_b 仍在运行 → join 节点 qa_verify 不得启动
+    await waitFor(() => {
+      const s = project(kernel.getEvents(taskId));
+      return s.nodes['dev_a']?.status === 'succeeded' && s.nodes['dev_b']?.status === 'running';
+    }, 'dev_a 成功且 dev_b 运行中');
+    const midway = project(kernel.getEvents(taskId));
+    expect(midway.currentNodeIds).toEqual(['dev_b']);
+    expect(midway.nodes['qa_verify']).toBeUndefined();
+    expect(
+      kernel
+        .getEvents(taskId)
+        .some((e) => e.type === 'node.started' && e.payload['node_id'] === 'qa_verify'),
+    ).toBe(false);
+
+    // 方向二：放行 dev_b，全部上游进入终态后 qa_verify 启动并完成
+    release.resolve();
+    const state = await running;
+    expect(state.status).toBe('completed');
+    expect(state.nodes['qa_verify']?.status).toBe('succeeded');
+    store.close();
+  });
+
+  it('并发上限被遵守：3 个就绪节点在上限 2 下峰值并发为 2，超限节点排队等待', async () => {
+    const repo = makeRepo();
+    const logs = makeLogDir();
+    const runner = createTimedRunner({ delayMs: 15 });
+    const devNodeIds = ['dev_a', 'dev_b', 'dev_c'];
+    const { kernel, store } = makeFanOutKernel({
+      devNodeIds,
+      runner,
+      repoPath: repo,
+      logDir: logs,
+      globalConcurrency: 2,
+    });
+
+    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    const state = await kernel.runTask(taskId);
+
+    expect(state.status).toBe('completed');
+    // 三个 dev 节点都执行了（超限者排队，未被丢弃）
+    expect(runner.timeline.filter((t) => t.phase === 'start').map((t) => t.role)).toEqual(
+      expect.arrayContaining(devNodeIds),
+    );
+    // 上限被遵守：峰值并发恰好等于 2
+    expect(runner.peak()).toBe(2);
+
+    // 排队证据：dev_c 的启动发生在某个 dev 节点结束之后
+    const firstDevEnd = runner.timeline.findIndex(
+      (t) => t.phase === 'end' && devNodeIds.includes(t.role),
+    );
+    const devCStart = runner.timeline.findIndex((t) => t.phase === 'start' && t.role === 'dev_c');
+    expect(firstDevEnd).toBeGreaterThanOrEqual(0);
+    expect(devCStart).toBeGreaterThan(firstDevEnd);
+    store.close();
+  });
+
+  it('占用检查仍是并行的前置闸：owns 重叠时该批次改为串行（峰值并发为 1）', async () => {
+    const repo = makeRepo();
+    const logs = makeLogDir();
+    const runner = createTimedRunner({ delayMs: 15 });
+    const { kernel, store } = makeFanOutKernel({
+      devNodeIds: ['dev_a', 'dev_b'],
+      runner,
+      repoPath: repo,
+      logDir: logs,
+      globalConcurrency: 2,
+      // 两个节点都声明可写 src/**：占用检查必须判定重叠并阻止并行
+      ownsFor: () => ['src/**'],
+    });
+
+    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    const state = await kernel.runTask(taskId);
+
+    expect(state.status).toBe('completed');
+    expect(runner.peak()).toBe(1);
+    store.close();
+  });
+
+  it('占用检查：reject 策略下重叠批次在这些节点启动之前被拒绝', async () => {
+    const repo = makeRepo();
+    const logs = makeLogDir();
+    const runner = createTimedRunner({});
+    const { kernel, store } = makeFanOutKernel({
+      devNodeIds: ['dev_a', 'dev_b'],
+      runner,
+      repoPath: repo,
+      logDir: logs,
+      globalConcurrency: 2,
+      batchConflictPolicy: 'reject',
+      ownsFor: () => ['src/**'],
+    });
+
+    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    const state = await kernel.runTask(taskId);
+
+    expect(state.status).toBe('failed');
+    // 被拒绝的批次里两个 dev 节点一个都没启动，只有 pm 跑过
+    const started = kernel.getEvents(taskId).filter((e) => e.type === 'node.started');
+    expect(started.map((e) => e.payload['node_id'])).toEqual(['pm_analyze']);
+    const failed = kernel.getEvents(taskId).find((e) => e.type === 'task.failed');
+    expect(failed?.payload['owns_overlaps']).toBeDefined();
     store.close();
   });
 });

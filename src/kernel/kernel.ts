@@ -32,6 +32,12 @@ export type KernelDeps = {
    * 取自 `AGENTFLOW_BATCH_CONFLICT_POLICY`（默认 serialize）。属 Task 8 的「配置中可指定」。
    */
   batchConflictPolicy?: BatchConflictPolicy;
+  /**
+   * 全局并发上限：同一时刻最多同时推进的就绪节点数。
+   * 取自 `AGENTFLOW_GLOBAL_CONCURRENCY`（由 `src/main.ts` 注入，默认 4）；未显式配置时缺省为 1，
+   * 即"不配置就不并发"——保守缺省不改变既有的单节点串行行为（Task 10 首次消费该配置）。
+   */
+  globalConcurrency?: number;
 };
 
 export type StartTaskInput = {
@@ -79,6 +85,27 @@ export function createKernel(deps: KernelDeps): Kernel {
 
   async function runTask(taskId: string): Promise<TaskState> {
     let steps = 0;
+    // Task 10：全局并发上限首次被消费。未显式配置时缺省为 1（串行），保证既有行为不变。
+    const concurrencyLimit = Math.max(1, deps.globalConcurrency ?? 1);
+    // 本批次待启动节点（保持决策给出的顺序）与本批次生效的并发上限。
+    // 批次之间会重新赋值：`serialize` 策略把该批次上限降为 1（改为串行）。
+    let queue: { nodeId: string; edge: EdgeEvaluation | null }[] = [];
+    let batchLimit = concurrencyLimit;
+    // 在途节点：nodeId → 其 runNode 的「结束即自我移除」包装 promise
+    const running = new Map<string, Promise<void>>();
+
+    /** 启动一个就绪节点；其 runNode 结束后自动从在途集合移除（成功/失败都移除） */
+    function launch(item: { nodeId: string; edge: EdgeEvaluation | null }): void {
+      const tracked = runNode(taskId, item.nodeId, item.edge).then(
+        () => {
+          running.delete(item.nodeId);
+        },
+        () => {
+          running.delete(item.nodeId);
+        },
+      );
+      running.set(item.nodeId, tracked);
+    }
 
     for (;;) {
       if (steps >= deps.maxSteps) {
@@ -96,6 +123,20 @@ export function createKernel(deps: KernelDeps): Kernel {
       }
       steps += 1;
 
+      // 1) 就绪节点入队后按上限尽量多启动；超限的留在队列里排队，等有空位再启动。
+      while (queue.length > 0 && running.size < batchLimit) {
+        launch(queue.shift()!);
+      }
+
+      // 2) 有在途节点：等至少一个结束再重新评估。
+      //    这正是 **join 语义**的实现——上游未全部进入终态前，主循环不会去求解下一批次，
+      //    因此 join 节点不会在任一上游仍在运行时被启动。
+      if (running.size > 0) {
+        await Promise.race(running.values());
+        continue;
+      }
+
+      // 3) 无在途、无待启动：求解下一批次（`decideNext` 在无运行节点时才会给出 start/end）
       const state = getState(taskId);
       if (state.status !== 'active') {
         return state;
@@ -126,8 +167,8 @@ export function createKernel(deps: KernelDeps): Kernel {
         return getState(taskId);
       }
 
-      // Task 8：占用检查必须在**批次启动之前**执行。当前决策恒激活 1 个节点（fan-out 属 Task 9），
-      // 检查对单节点天然放行；代码路径已就绪，待多节点批次出现时即生效。
+      // Task 8：占用检查必须在**批次启动之前**执行（fan-out 后批次可含多个节点）。
+      // 这道闸不可绕过：重叠时按配置改为串行（本批次上限降为 1）或拒绝该批次。
       const batchNodes = decision.nodeIds.map((id) => {
         const node = workflow.nodes.find((n) => n.id === id);
         const batchRole = node ? roles.get(node.role) : undefined;
@@ -150,12 +191,11 @@ export function createKernel(deps: KernelDeps): Kernel {
         return getState(taskId);
       }
 
-      // 串行消费**激活节点集合**：当前决策恒激活 1 个（fan-out 由后续任务引入），
-      // 逐个 await 保证与改动前的单节点行为等价。`serialize` 策略下亦是此串行行为；
-      // 真正的并发调度属 Task 10（`guard.mode === 'parallel'` 时才会并发）。
-      for (let i = 0; i < decision.nodeIds.length; i += 1) {
-        await runNode(taskId, decision.nodeIds[i]!, decision.selectedEdges[i] ?? null);
-      }
+      batchLimit = guard.mode === 'serialize' ? 1 : concurrencyLimit;
+      queue = decision.nodeIds.map((id, i) => ({
+        nodeId: id,
+        edge: decision.selectedEdges[i] ?? null,
+      }));
     }
   }
 
@@ -207,11 +247,14 @@ export function createKernel(deps: KernelDeps): Kernel {
 
     // 转移记录必须是可解释的：所用边、条件表达式原文、该表达式的人类可读说明（直接取自边配置的
     // description，不在引擎里另造）、以及判定依据（相关产物的实际状态）。
+    // `from` 取自**本次激活所用的边**（而非"上一条转移的目标"）：并发批次内的多个节点由同一条
+    // 上游节点扇出，若读上一条转移目标会相互串味（第二个节点会误记为第一个节点扇出）。
+    // 单节点串行时两者恒等，故不改动既有转移序列。
     store.append({
       task_id: taskId,
       type: 'transfer.decided',
       payload: {
-        from: stateBefore.transfers.at(-1)?.to ?? '',
+        from: selectedEdge?.from ?? '',
         to: nodeId,
         reason: selectedEdge?.reason ?? '任务开始，进入起始节点',
         decided_by: 'rule',

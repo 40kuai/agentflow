@@ -287,3 +287,104 @@ describe('decideNext', () => {
     }
   });
 });
+
+describe('fan-out 与 join（Task 9）', () => {
+  // 钻石拓扑：pm_analyze 同时扇出 dev_a / dev_b，两者再在 qa_verify 汇聚（join）。
+  const diamond: WorkflowDef = {
+    id: 'fan_out_demo',
+    start: 'pm_analyze',
+    nodes: [
+      { id: 'pm_analyze', title: '需求分析', role: 'pm', consumes: [], produces: 'requirement', isolate: false },
+      { id: 'dev_a', title: '开发 A', role: 'dev_a', consumes: ['requirement'], produces: 'code_diff', isolate: false },
+      { id: 'dev_b', title: '开发 B', role: 'dev_b', consumes: ['requirement'], produces: 'code_diff', isolate: false },
+      { id: 'qa_verify', title: '汇总验证', role: 'qa_engineer', consumes: ['code_diff'], produces: 'test_report', isolate: false },
+    ],
+    edges: [
+      { from: 'pm_analyze', to: 'dev_a', when: "all(artifacts.requirement.status == 'ok')", description: '需求已澄清 → 开发 A', onMissing: 'fail' },
+      { from: 'pm_analyze', to: 'dev_b', when: "all(artifacts.requirement.status == 'ok')", description: '需求已澄清 → 开发 B', onMissing: 'fail' },
+      { from: 'dev_a', to: 'qa_verify', description: 'A 完成 → 汇总', onMissing: 'fail' },
+      { from: 'dev_b', to: 'qa_verify', description: 'B 完成 → 汇总', onMissing: 'fail' },
+    ],
+  };
+
+  function decideDiamond(events: KernelEvent[]) {
+    const state = project(events);
+    const facts = buildFacts({ state, workflow: diamond, roles: new Map() });
+    return decideNext({ workflow: diamond, state, facts });
+  }
+
+  /** pm 产出 ok 的 requirement 并成功完成 */
+  const pmDone: KernelEvent[] = [
+    ev('task.created', {}, 1),
+    ev('node.started', { node_id: 'pm_analyze', role_id: 'pm', run_id: 'run_pm', attempt: 1 }, 2),
+    ev('artifact.created', {
+      artifact_id: 'a_pm', run_id: 'run_pm', node_id: 'pm_analyze',
+      type: 'requirement', status: 'ok', summary: 's',
+    }, 3),
+    ev('node.succeeded', { node_id: 'pm_analyze', run_id: 'run_pm', log_ref: 'x' }, 4),
+  ];
+
+  it('多出边同时激活：pm 的两条出边条件均成立时一次激活 dev_a 与 dev_b', () => {
+    const d = decideDiamond(pmDone);
+    expect(d.kind).toBe('start');
+    if (d.kind === 'start') {
+      expect(d.nodeIds).toEqual(['dev_a', 'dev_b']);
+      expect(d.selectedEdges.map((e) => e.to)).toEqual(['dev_a', 'dev_b']);
+      expect(d.selectedEdges.every((e) => e.matched)).toBe(true);
+      expect(d.skippedEdges).toEqual([]);
+    }
+  });
+
+  it('join 未满足：dev_a 已完成但 dev_b 仍在运行时，qa_verify 不启动（wait）', () => {
+    const d = decideDiamond([
+      ...pmDone,
+      ev('node.started', { node_id: 'dev_a', role_id: 'dev_a', run_id: 'run_a', attempt: 1 }, 5),
+      ev('artifact.created', {
+        artifact_id: 'a_a', run_id: 'run_a', node_id: 'dev_a',
+        type: 'code_diff', status: 'ok', summary: 's',
+      }, 6),
+      ev('node.succeeded', { node_id: 'dev_a', run_id: 'run_a', log_ref: 'x' }, 7),
+      ev('node.started', { node_id: 'dev_b', role_id: 'dev_b', run_id: 'run_b', attempt: 1 }, 8),
+    ]);
+    expect(d.kind).toBe('wait');
+    if (d.kind === 'wait') {
+      expect(d.runningNodeIds).toEqual(['dev_b']);
+    }
+  });
+
+  it('join 满足：全部上游进入终态后 qa_verify 才被激活', () => {
+    const d = decideDiamond([
+      ...pmDone,
+      ev('node.started', { node_id: 'dev_a', role_id: 'dev_a', run_id: 'run_a', attempt: 1 }, 5),
+      ev('artifact.created', {
+        artifact_id: 'a_a', run_id: 'run_a', node_id: 'dev_a',
+        type: 'code_diff', status: 'ok', summary: 's',
+      }, 6),
+      ev('node.succeeded', { node_id: 'dev_a', run_id: 'run_a', log_ref: 'x' }, 7),
+      ev('node.started', { node_id: 'dev_b', role_id: 'dev_b', run_id: 'run_b', attempt: 1 }, 8),
+      ev('artifact.created', {
+        artifact_id: 'a_b', run_id: 'run_b', node_id: 'dev_b',
+        type: 'code_diff', status: 'ok', summary: 's',
+      }, 9),
+      ev('node.succeeded', { node_id: 'dev_b', run_id: 'run_b', log_ref: 'x' }, 10),
+    ]);
+    expect(d).toMatchObject({ kind: 'start', nodeIds: ['qa_verify'] });
+  });
+
+  it('同一目标被多条出边同时命中时只激活一次（nodeIds 去重且与 selectedEdges 对齐）', () => {
+    const dup: WorkflowDef = {
+      ...diamond,
+      edges: [
+        { from: 'pm_analyze', to: 'dev_a', when: "all(artifacts.requirement.status == 'ok')" },
+        { from: 'pm_analyze', to: 'dev_a', when: 'true' },
+      ],
+    };
+    const state = project(pmDone);
+    const facts = buildFacts({ state, workflow: dup, roles: new Map() });
+    const d = decideNext({ workflow: dup, state, facts });
+    expect(d).toMatchObject({ kind: 'start', nodeIds: ['dev_a'] });
+    if (d.kind === 'start') {
+      expect(d.selectedEdges).toHaveLength(1);
+    }
+  });
+});
