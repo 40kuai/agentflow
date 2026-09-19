@@ -4,10 +4,15 @@ start: pm_analyze
 # 原因：本阶段还没有"合并"能力，若 dev 在 worktree 里写代码，跑完 worktree 会被回收，
 # 代码即丢失，随后 qa_verify（在主工作区运行）看不到任何改动，闭环就断了。
 # worktree 隔离必须与合并能力一起引入，属于 Phase 2。
+#
+# 契约唯一来源：本文件节点的 consumes/produces 是**派生**字段，权威来源是 config/roles/*.yaml
+# 的 inputs/outputs。二者不一致时加载期报错（详见 src/config/loader.ts）。
 nodes:
   - id: pm_analyze
     title: 需求分析
     role: pm
+    description: 把原始需求转写成可验收的需求文档，是整条流程的起点。
+    entry_condition: 任务开始即进入（起始节点）。
     consumes: []
     produces: requirement
     isolate: false
@@ -15,6 +20,8 @@ nodes:
   - id: dev_implement
     title: 编码实现
     role: backend_dev
+    description: 依据需求文档在 src/** 内完成实现并自测，产出可被测试的代码改动。
+    entry_condition: 上游 pm_analyze 产出 requirement 且其 status 为 ok。
     consumes:
       - requirement
     produces: code_diff
@@ -23,6 +30,8 @@ nodes:
   - id: qa_verify
     title: 测试验证
     role: qa_engineer
+    description: 针对需求验收标准与代码改动编写并运行测试，如实汇总结果；缺陷通过产物报告，不改实现。
+    entry_condition: 上游 dev_implement 产出 code_diff 且其 status 为 ok。
     consumes:
       - requirement
       - code_diff
@@ -33,7 +42,11 @@ edges:
   - from: pm_analyze
     to: dev_implement
     when: "all(artifacts.requirement.status == 'ok')"
+    description: 需求已澄清（status=ok）时才进入编码实现；否则不应带着歧义开工。
+    on_missing: fail
 
   - from: dev_implement
     to: qa_verify
     when: "all(artifacts.code_diff.status == 'ok')"
+    description: 代码改动自测通过（code_diff.status=ok）时才进入测试验证。
+    on_missing: fail

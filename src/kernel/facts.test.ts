@@ -12,7 +12,7 @@ const workflow: WorkflowDef = {
     { id: 'pm_analyze', title: '需求分析', role: 'pm', consumes: [], produces: 'requirement', isolate: false },
     { id: 'dev_implement', title: '编码实现', role: 'backend_dev', consumes: ['requirement'], produces: 'code_diff', isolate: true },
   ],
-  edges: [{ from: 'pm_analyze', to: 'dev_implement', when: "all(artifacts.requirement.status == 'ok')" }],
+  edges: [{ from: 'pm_analyze', to: 'dev_implement', when: "all(artifacts.requirement.status == 'ok')", description: '需求已澄清', onMissing: 'fail' }],
 };
 
 function ev(type: KernelEvent['type'], payload: Record<string, unknown>, seq: number): KernelEvent {

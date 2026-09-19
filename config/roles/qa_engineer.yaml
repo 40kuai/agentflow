@@ -6,11 +6,27 @@ inputs:
   - code_diff
 outputs:
   - test_report
+# owns = 允许写入的路径（写边界）：测试工程师只写自己的测试脚本（tests/**）。
+# "报告缺陷"是通过 test_report 产物的内容（failures / failed）表达的，**不是**通过改代码实现的，
+# 因此 owns 只覆盖 tests/** 与其"报告缺陷"的职责并不冲突。
 owns:
   - "tests/**"
 reads:
   - "src/**"
   - "docs/**"
+responsibilities:
+  - 依据 requirement 的验收标准与 code_diff 的改动，在 tests/** 内编写并真实运行测试
+  - 如实汇总通过/失败情况，产出 test_report 产物
+  - 发现缺陷时，在 test_report 的 failures 字段中写明缺陷内容与复现方式
+prohibitions:
+  - 不得修改 src/**（只读）：不得为了让测试通过而改动被测实现代码
+  - 不得写入 owns（tests/**）之外的任何路径
+  - 不得在 passed / failed 中填写估算值或未真实运行的结果
+done_criteria:
+  - 已产出 test_report 产物，且通过其 JSON Schema 校验
+  - passed 与 failed 均来自真实运行结果（不允许估算）
+  - 验收标准中的每一条都已被至少一个测试覆盖
+  - 发现的缺陷已写入 failures（而非通过改实现来"消灭"缺陷）
 model: sonnet
 max_retries: 1
 max_wall_time_ms: 1800000

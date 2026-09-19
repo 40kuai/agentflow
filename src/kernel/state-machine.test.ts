@@ -94,8 +94,8 @@ describe('decideNext', () => {
     const wf: WorkflowDef = {
       ...workflow,
       edges: [
-        { from: 'pm_analyze', to: 'qa_verify', when: "all(artifacts.requirement.status == 'ok')" },
-        { from: 'pm_analyze', to: 'dev_implement', when: 'true' },
+        { from: 'pm_analyze', to: 'qa_verify', when: "all(artifacts.requirement.status == 'ok')", description: '先到 qa', onMissing: 'fail' },
+        { from: 'pm_analyze', to: 'dev_implement', when: 'true', description: '再到 dev', onMissing: 'fail' },
       ],
     };
     const state = project([
@@ -134,7 +134,7 @@ describe('decideNext', () => {
     // 的访问次数，若目标是 dev 且从未启动过，访问次数为 0，不会被拦住。
     const loopWorkflow: WorkflowDef = {
       ...workflow,
-      edges: [{ from: 'pm_analyze', to: 'pm_analyze', when: 'true' }],
+      edges: [{ from: 'pm_analyze', to: 'pm_analyze', when: 'true', description: '自环', onMissing: 'fail' }],
     };
 
     const events: KernelEvent[] = [ev('task.created', {}, 1)];
@@ -163,7 +163,7 @@ describe('decideNext', () => {
     // 自环跑 1 次后继续判定，应当仍允许再次进入（1 < 3），而不是直接判死循环
     const loopWorkflow: WorkflowDef = {
       ...workflow,
-      edges: [{ from: 'pm_analyze', to: 'pm_analyze', when: 'true' }],
+      edges: [{ from: 'pm_analyze', to: 'pm_analyze', when: 'true', description: '自环', onMissing: 'fail' }],
     };
     const events: KernelEvent[] = [
       ev('task.created', {}, 1),
@@ -201,7 +201,7 @@ describe('decideNext', () => {
     // 若没有任何节点完成过，decideNext 会按规则 3 回到 start 节点，根本走不到死循环保护。
     const retryWorkflow: WorkflowDef = {
       ...workflow,
-      edges: [{ from: 'dev_implement', to: 'pm_analyze', when: 'true' }],
+      edges: [{ from: 'dev_implement', to: 'pm_analyze', when: 'true', description: '回退重试', onMissing: 'fail' }],
     };
 
     const events: KernelEvent[] = [ev('task.created', {}, 1)];

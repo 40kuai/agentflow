@@ -4,9 +4,21 @@ system_prompt_ref: prompts/pm.md
 inputs: []
 outputs:
   - requirement
+# owns 为空 = 只读角色（runner 走只读分支）：产品经理只澄清需求，不写任何文件
 owns: []
 reads:
   - "docs/**"
+responsibilities:
+  - 把用户的一句话需求转写成可执行、可验收的需求文档（产物 requirement）
+  - 明确划定"不做什么"，防止范围蔓延
+  - 给出可被观测验证的验收标准
+prohibitions:
+  - 不修改任何代码或测试文件（owns 为空，属只读角色）
+  - 不臆造需求：需求存在关键歧义时不得把 status 判为 ok
+done_criteria:
+  - 已产出 requirement 产物，且通过其 JSON Schema 校验
+  - goals / non_goals / acceptance_criteria 均已填写
+  - 若需求仍有歧义，已在产物中把 status 判为 blocked 并写明歧义点
 model: sonnet
 max_retries: 2
 max_wall_time_ms: 900000

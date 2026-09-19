@@ -5,10 +5,24 @@ inputs:
   - requirement
 outputs:
   - code_diff
+# owns = 允许写入的路径（写边界）。Phase 1 仅作为 prompt 硬约束提示，路径级强制属后续任务。
+# 已实测越界：本角色曾写入 README.md 与 scripts/hello.sh —— 那是越界，应由后续任务的路径核对检出，
+# 因此这里**不放宽** owns 去追认越界行为，而是把边界写清、把越界列为禁止事项。
 owns:
   - "src/**"
 reads:
   - "docs/**"
+responsibilities:
+  - 依据 requirement 的验收标准，在 owns（src/**）范围内完成代码实现，产出 code_diff 产物
+  - 提交前真实运行一次自测，并把真实结果写入 self_test_result
+prohibitions:
+  - 不得写入 src/** 之外的任何路径（含 README.md、scripts/**、tests/**）——越界写属违规
+  - 不得修改 tests/**（测试归 qa_engineer 负责），不得修改工作流与角色配置
+  - 不得为通过自测而篡改验收标准
+done_criteria:
+  - 已产出 code_diff 产物，且通过其 JSON Schema 校验
+  - self_test_result 为真实运行结果（passed/failed），不得为 not_run 或估算
+  - files_changed 列出的改动路径全部落在 owns（src/**）之内
 model: sonnet
 max_retries: 2
 max_wall_time_ms: 1800000
