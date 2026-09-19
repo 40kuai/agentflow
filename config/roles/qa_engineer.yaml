@@ -1,0 +1,16 @@
+id: qa_engineer
+display_name: 测试工程师
+system_prompt_ref: prompts/qa_engineer.md
+inputs:
+  - requirement
+  - code_diff
+outputs:
+  - test_report
+owns:
+  - "tests/**"
+reads:
+  - "src/**"
+  - "docs/**"
+model: sonnet
+max_retries: 1
+max_wall_time_ms: 1800000

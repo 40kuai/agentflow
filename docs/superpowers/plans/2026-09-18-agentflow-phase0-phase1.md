@@ -23,6 +23,7 @@
 - 本阶段实现的 Artifact 类型**只有 4 种**：`requirement` / `work_package_plan` / `code_diff` / `test_report`。其余类型在后续阶段补充
 - 本阶段是**单引擎（claude-code）、串行**流程。并行、codex、卡点 G1–G3 均不属于本计划范围
 - **Artifact status 规则（本阶段）**：CLI 退出码为 0 且载荷通过 zod 校验 → 内核写入 `status: 'ok'`；否则节点失败。也就是说 **Phase 1 中 status 恒为 `ok`**，工作流边条件里的 `artifacts.*.status == 'ok'` 实际起的是"确认产物存在且合法"的作用。从载荷内容派生出 `needs_changes` / `blocked` 需要 LLM 判断，留到引入 LLM 决策器的阶段再做
+- **本阶段所有工作流节点的 `isolate` 一律为 `false`**：Phase 1 没有合并能力，若在 worktree 里写代码，worktree 回收后代码即丢失，后续节点看不到改动，闭环就断了。worktree 隔离必须与合并能力一起引入，属于 Phase 2
 
 ## 目录与文件结构
 
@@ -174,9 +175,13 @@ AGENTFLOW_CODEX_BIN=codex
 import { describe, expect, it } from 'vitest';
 import { loadEnv } from './env.js';
 
+// 这些测试必须与真实 .env 隔离：显式传入一个不存在的 env 文件路径，
+// 否则开发者一旦创建了 .env，默认值断言就会失败。
+const NO_ENV_FILE = '/nonexistent/agentflow-test.env';
+
 describe('loadEnv', () => {
   it('未提供环境变量时使用默认值', () => {
-    const env = loadEnv({});
+    const env = loadEnv({}, NO_ENV_FILE);
     expect(env.host).toBe('127.0.0.1');
     expect(env.port).toBe(8787);
     expect(env.maxPromptTokens).toBe(30000);
@@ -185,13 +190,20 @@ describe('loadEnv', () => {
   });
 
   it('环境变量覆盖默认值，且端口被解析为数字', () => {
-    const env = loadEnv({ AGENTFLOW_PORT: '9999', AGENTFLOW_DB_PATH: '/tmp/x.sqlite' });
+    const env = loadEnv(
+      { AGENTFLOW_PORT: '9999', AGENTFLOW_DB_PATH: '/tmp/x.sqlite' },
+      NO_ENV_FILE,
+    );
     expect(env.port).toBe(9999);
     expect(env.dbPath).toBe('/tmp/x.sqlite');
   });
 
   it('端口非法时抛错', () => {
-    expect(() => loadEnv({ AGENTFLOW_PORT: 'abc' })).toThrow(/AGENTFLOW_PORT/);
+    expect(() => loadEnv({ AGENTFLOW_PORT: 'abc' }, NO_ENV_FILE)).toThrow(/AGENTFLOW_PORT/);
+  });
+
+  it('env 文件不存在时静默使用默认值，不抛错', () => {
+    expect(() => loadEnv({}, '/nonexistent/definitely-missing.env')).not.toThrow();
   });
 });
 ```
@@ -268,8 +280,11 @@ function readStr(source: Record<string, string | undefined>, key: string, fallba
 }
 
 /** 合并 .env 文件与显式传入的环境变量（后者优先），产出类型安全的配置 */
-export function loadEnv(overrides: Record<string, string | undefined> = {}): AppEnv {
-  const merged = { ...readDotEnvFile(), ...process.env, ...overrides };
+export function loadEnv(
+  overrides: Record<string, string | undefined> = {},
+  envFilePath = resolve(process.cwd(), '.env'),
+): AppEnv {
+  const merged = { ...readDotEnvFile(envFilePath), ...process.env, ...overrides };
   return {
     dbPath: readStr(merged, 'AGENTFLOW_DB_PATH', DEFAULTS.dbPath),
     logDir: readStr(merged, 'AGENTFLOW_LOG_DIR', DEFAULTS.logDir),
@@ -296,7 +311,7 @@ npm install --registry=https://registry.npmmirror.com
 - [ ] **Step 9: 运行测试与类型检查，确认通过**
 
 Run: `npx vitest run src/config/env.test.ts && npx tsc --noEmit`
-Expected: 3 个测试 PASS，类型检查无错误
+Expected: 4 个测试 PASS，类型检查无错误
 
 - [ ] **Step 10: 提交**
 
@@ -672,7 +687,7 @@ describe('Artifact payload schema', () => {
     expect(r.success).toBe(false);
   });
 
-  it('work_package_plan 要求每个工作包必须有 owns 与 interface_contract', () => {
+  it('work_package_plan 缺少 interface_contract 或 acceptance_refs 时拒绝', () => {
     const bad = ARTIFACT_PAYLOAD_SCHEMAS.work_package_plan.safeParse({
       packages: [{ id: 'wp1', name: '后端接口', owns: [], reads: [], depends_on: [] }],
     });
@@ -692,6 +707,42 @@ describe('Artifact payload schema', () => {
       ],
     });
     expect(good.success).toBe(true);
+  });
+
+  it('工作包缺少 owns 键时拒绝', () => {
+    // 单独隔离 owns 的必填性：其余字段全部合法，只缺 owns
+    const r = ARTIFACT_PAYLOAD_SCHEMAS.work_package_plan.safeParse({
+      packages: [
+        {
+          id: 'wp1',
+          name: '无写入范围',
+          reads: ['docs/**'],
+          depends_on: [],
+          interface_contract: {},
+          acceptance_refs: [],
+        },
+      ],
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it('owns: [] 合法——代表该工作包没有写入范围（只读），这是有意为之', () => {
+    // 这条用例用测试固定住「空 owns = 只读」的语义，
+    // 防止将来有人误给 owns 加上 .min(1)（那会让「只读」无法在 schema 层表达）
+    const r = ARTIFACT_PAYLOAD_SCHEMAS.work_package_plan.safeParse({
+      packages: [
+        {
+          id: 'wp1',
+          name: '只读工作包',
+          owns: [],
+          reads: ['docs/**'],
+          depends_on: [],
+          interface_contract: {},
+          acceptance_refs: [],
+        },
+      ],
+    });
+    expect(r.success).toBe(true);
   });
 
   it('jsonSchemaForArtifact 产出可序列化的 JSON Schema 且顶层为 object', () => {
@@ -825,7 +876,7 @@ npm install zod-to-json-schema --registry=https://registry.npmmirror.com
 - [ ] **Step 7: 运行测试，确认通过**
 
 Run: `npx vitest run src/shared/artifacts.test.ts`
-Expected: 4 个测试 PASS
+Expected: 6 个测试 PASS
 
 - [ ] **Step 8: 写失败的测试 `src/shared/events.test.ts`**
 
@@ -1019,6 +1070,59 @@ describe('EventStore', () => {
     expect(before.length).toBe(1);
     expect(after.length).toBe(2);
   });
+
+  it('空库时 lastSeq 为 0 且 readAll 为空数组', () => {
+    expect(store.lastSeq()).toBe(0);
+    expect(store.readAll()).toEqual([]);
+  });
+
+  it('readAll 跨任务返回全部事件，按 seq 升序', () => {
+    store.append({ task_id: 't2', type: 'task.created', payload: {}, actor: 'human' });
+    store.append({ task_id: 't1', type: 'task.created', payload: {}, actor: 'human' });
+    store.append({ task_id: 't2', type: 'node.started', payload: {}, actor: 'kernel' });
+    expect(store.readAll().map((e) => [e.seq, e.task_id])).toEqual([
+      [1, 't2'],
+      [2, 't1'],
+      [3, 't2'],
+    ]);
+  });
+
+  it('非法事件不留「幽灵行」，且不会毒化读接口（护栏）', () => {
+    // NewEvent 把 task_id / actor 声明为普通 string，而 KernelEventSchema 要求 .min(1)，
+    // 所以下面这行能通过编译。若 append 先落库后校验，就会留下违反 schema 的残留行，
+    // 使 readAll() 永久抛错——真相库被毒化。本用例是防止该缺陷复现的护栏。
+    expect(() =>
+      store.append({ task_id: '', type: 'task.created', payload: {}, actor: 'human' }),
+    ).toThrow();
+    expect(() =>
+      store.append({ task_id: 't1', type: 'task.created', payload: {}, actor: '' }),
+    ).toThrow();
+
+    // 库里必须一行都没有
+    expect(store.lastSeq()).toBe(0);
+    expect(store.readAll()).toEqual([]);
+    expect(store.readTask('')).toEqual([]);
+
+    // 后续合法写入仍能正常进行，seq 从 1 开始
+    const ok = store.append({ task_id: 't1', type: 'task.created', payload: {}, actor: 'human' });
+    expect(ok.seq).toBe(1);
+    expect(store.readAll()).toHaveLength(1);
+  });
+
+  it('append 的返回值与从库里读出的事件严格相等', () => {
+    // 用含 undefined 的 payload 暴露「入参回显」与「落库重读」的差异：
+    // JSON.stringify 会把 {a: undefined, b: 1} 落成 {"b":1}，
+    // 而 toStrictEqual 把「含 undefined 键」与「缺该键」视为不等。
+    const appended = store.append({
+      task_id: 't1',
+      type: 'artifact.created',
+      payload: { a: undefined, b: 1 },
+      actor: 'kernel',
+    });
+    expect(appended.payload).toStrictEqual({ b: 1 });
+    const [read] = store.readTask('t1');
+    expect(appended).toStrictEqual(read);
+  });
 });
 ```
 
@@ -1098,20 +1202,29 @@ export function createEventStore(dbPath: string): EventStore {
 
   return {
     append(event: NewEvent): KernelEvent {
-      const row = {
+      const candidate = {
         event_id: newId('evt'),
         task_id: event.task_id,
         type: event.type,
-        payload: JSON.stringify(event.payload),
+        payload: event.payload,
         actor: event.actor,
         created_at: Date.now(),
       };
-      const info = insertStmt.run(row);
-      return KernelEventSchema.parse({
-        seq: Number(info.lastInsertRowid),
-        ...row,
-        payload: event.payload,
-      });
+
+      // 关键：先校验再落库。
+      // 若反过来先 INSERT 再 parse，非法输入（例如 task_id 为空串——NewEvent 把它声明为普通
+      // string，而 schema 要求 .min(1)，所以这行能通过编译）会留下"幽灵行"：
+      // 调用方以为写入失败、库里已有一行，且该行违反 schema，导致之后 readAll() 解析它时
+      // 永久抛错——真相库被毒化成不可读。先用占位 seq 走一遍 schema 即可杜绝。
+      KernelEventSchema.parse({ seq: 0, ...candidate });
+
+      const payload = JSON.stringify(candidate.payload);
+      const info = insertStmt.run({ ...candidate, payload });
+
+      // 返回值走 rowToEvent（与 readTask 同一条解析路径），
+      // 保证「append 返回的事件」与「之后从库里读出的事件」严格相等。
+      // 若直接把入参 payload 回显出去，{a: undefined} 这类值会与落库后的 {} 不一致。
+      return rowToEvent({ seq: Number(info.lastInsertRowid), ...candidate, payload });
     },
 
     readTask(taskId: string): KernelEvent[] {
@@ -1136,7 +1249,7 @@ export function createEventStore(dbPath: string): EventStore {
 - [ ] **Step 4: 运行测试，确认通过**
 
 Run: `npx vitest run src/kernel/event-store.test.ts`
-Expected: 5 个测试 PASS
+Expected: 9 个测试 PASS
 
 - [ ] **Step 5: 提交**
 
@@ -1502,6 +1615,14 @@ export function project(events: KernelEvent[]): TaskState {
       case 'artifact.invalidated': {
         const artifactId = str(p, 'artifact_id');
         state.artifacts = state.artifacts.filter((a) => a.artifact_id !== artifactId);
+        // 必须同步清理节点上的索引。否则 TaskState 内部自相矛盾：
+        // artifacts 里已无此产物，而 nodes[].artifactIds 仍指向它，
+        // 下游按 node.artifactIds 取产物时会拿到不存在的 id（解析出 undefined 或静默丢内容），
+        // 且投影器自身不报错——不一致被无声交付出口。
+        // 该失效事件不含 node_id，因此只能全量扫描（Phase 1 规模下无性能顾虑）。
+        for (const node of Object.values(state.nodes)) {
+          node.artifactIds = node.artifactIds.filter((id) => id !== artifactId);
+        }
         break;
       }
 
@@ -1547,7 +1668,7 @@ export function project(events: KernelEvent[]): TaskState {
 - [ ] **Step 4: 运行测试，确认通过**
 
 Run: `npx vitest run src/kernel/projector.test.ts`
-Expected: 10 个测试 PASS
+Expected: 11 个测试 PASS
 
 - [ ] **Step 5: 提交**
 
@@ -1676,6 +1797,44 @@ describe('evaluateExpression', () => {
   it('拒绝任意 JS 求值（安全性）', () => {
     expect(() => evaluateExpression('process.exit(1)', facts)).toThrow(ExpressionError);
     expect(() => evaluateExpression("require('fs')", facts)).toThrow(ExpressionError);
+  });
+
+  it('白名单外的函数名在解析期就被拒（而非靠注册表查空兜住）', () => {
+    // 这条用例专门钉住解析期的函数白名单。若只用 process.exit(1) 去验证，
+    // 是测不出白名单是否还存在：删掉白名单后，facts.__functions['process.exit']
+    // 为 undefined，仍会因「未注册的函数」抛错，用例照样通过。
+    // 所以这里用一个**注册表里已经存在**的名字：只有白名单能拦住它。
+    const custom: Facts = {
+      wp: { id: 'wp1' },
+      __functions: {
+        customFn: () => true,
+      },
+    };
+    expect(() => evaluateExpression('customFn(1)', custom)).toThrow(/不允许调用函数/);
+    // 反证：白名单内的名字若没注册，报的是另一种错，两者文案可区分
+    expect(() => evaluateExpression('deps(wp)', { wp: { id: 'wp1' } })).toThrow(/未注册的函数/);
+  });
+
+  it('数组元素的字段缺失时抛错，而不是静默变成 undefined', () => {
+    // 防的是一类危险情形：若把缺失字段静默映射为 undefined，
+    // 在 any(...) / count(...) == 0 / not 这些形态下会翻到「放行」一侧，
+    // 即工作流边可能在本不该走时走。
+    const f: Facts = {
+      wp: { id: 'wp1' },
+      __functions: {
+        deps: () => [{ id: 'wp0' }, { id: 'wpX', status: 'merged' }],
+      },
+    };
+    expect(() => evaluateExpression("all(deps(wp).status == 'merged')", f)).toThrow(ExpressionError);
+    expect(() => evaluateExpression("any(deps(wp).status == 'merged')", f)).toThrow(ExpressionError);
+  });
+
+  it('数组元素字段齐全时正常逐元素比较', () => {
+    const f: Facts = {
+      wp: { id: 'wp1' },
+      __functions: { deps: () => [{ id: 'wp0', status: 'merged' }] },
+    };
+    expect(evaluateExpression("all(deps(wp).status == 'merged')", f)).toBe(true);
   });
 });
 ```
@@ -1907,8 +2066,21 @@ function resolvePath(root: unknown, path: string[]): unknown {
   let current: unknown = root;
   for (const seg of path) {
     if (Array.isArray(current)) {
-      current = current.map((item) => {
-        if (!isPlainObject(item)) return undefined;
+      // 数组分支必须对「非对象元素」与「缺字段」直接抛错，不能静默映射成 undefined。
+      // 否则「路径不存在必抛错」的契约在这里被绕过：deps(x).status 会得到 [undefined]，
+      // 在 all(...) 下后果与抛错相同，但在 any(...) / count(...) == 0 / not 这些形态下
+      // 会翻到「放行」一侧 —— 即工作流边可能在本不该走时走。
+      current = current.map((item, index) => {
+        if (!isPlainObject(item)) {
+          throw new ExpressionError(
+            `路径 "${path.join('.')}" 在数组第 ${index} 个元素处无法继续取值（元素不是对象）`,
+          );
+        }
+        if (!(seg in item)) {
+          throw new ExpressionError(
+            `路径 "${path.join('.')}" 在数组第 ${index} 个元素处缺少字段 "${seg}"`,
+          );
+        }
         return item[seg];
       });
       continue;
@@ -1980,6 +2152,16 @@ function evalValue(ast: Ast, facts: Facts): unknown {
       const r = evalValue(ast.r, facts);
       return compare(ast.op, l, r);
     }
+
+    default: {
+      // 穷尽性守卫。它不是为了兜底，而是为了让「新增 Ast 变体却漏处理」变成编译错误。
+      // 这一点必须显式做：tsconfig 没有 noImplicitReturns，且 evalValue 的返回类型是
+      // unknown，所以漏掉 case 只会静默返回 undefined，tsc 不会报错。
+      // 加了本守卫后，default 分支里的 ast 类型会扣除已处理的变体；若某个变体没被
+      // 任何 case 覆盖，它就必然不是 never，赋给 never 即触发 TS2322。
+      const exhaustive: never = ast;
+      throw new Error(`未处理的 Ast 变体：${JSON.stringify(exhaustive)}`);
+    }
   }
 }
 
@@ -2032,9 +2214,9 @@ export function evaluateExpression(src: string, facts: Facts): boolean {
 - [ ] **Step 4: 运行测试与类型检查，确认通过**
 
 Run: `npx vitest run src/kernel/expression.test.ts && npx tsc --noEmit`
-Expected: 12 个测试 PASS，类型检查无错误
+Expected: 15 个测试 PASS，类型检查无错误
 
-注意：`evalValue` 的 `switch` 必须在 `Ast` 的 4 个变体上穷尽（`lit` / `ref` / `not` / `bin`），否则 `tsc` 会报缺少返回。若报错，说明有变体未处理——**补实现，不要在末尾加 `default` 兜底**。
+注意：`evalValue` 的 `switch` 必须在 `Ast` 的 4 个变体上穷尽（`lit` / `ref` / `not` / `bin`），并靠 `default` 里的 `const exhaustive: never = ast` 守卫把「漏处理变体」变成**编译错误**。**验证方法**：临时删掉 `case 'bin'`，然后跑 `npx tsc --noEmit`——必须报 `TS2322 ... is not assignable to type 'never'`。若删掉后 tsc 仍 exit 0，说明守卫没生效（tsconfig 没有 `noImplicitReturns`，`evalValue` 返回 `unknown`，单靠 switch 是拦不住的）。验证完记得还原。
 
 - [ ] **Step 5: 创建 `src/kernel/facts.ts`**
 
@@ -2147,7 +2329,14 @@ describe('buildFacts', () => {
 
     const facts = buildFacts({ state, workflow, roles: new Map() });
     expect(evaluateExpression("all(artifacts.requirement.status == 'ok')", facts)).toBe(true);
-    expect(evaluateExpression("all(artifacts.code_diff.status == 'ok')", facts)).toBe(false);
+    // 未产出的产物类型：路径不存在，按「不静默返回 undefined」的契约必须抛错，
+    // 而不是返回 false。边匹配的「不匹配」语义由 Task 7 的 edgeMatches 用 try/catch 承担：
+    // 它捕获 ExpressionError 并返回 { matched: false }，效果与「边不放行」一致。
+    // 这里不能期望 false —— 因为若给未产出的类型预置 status: []，all([]) 会因空真而得到
+    // true，那反而会让边在产物尚未产出时就放行，比抛错更危险。
+    expect(() => evaluateExpression("all(artifacts.code_diff.status == 'ok')", facts)).toThrow(
+      ExpressionError,
+    );
     expect(evaluateExpression("node.visit_count == 1", facts)).toBe(true);
   });
 
@@ -2198,7 +2387,8 @@ type Decision =
 3. 若无当前节点且无已完成节点 → `start` 工作流的 `start` 节点
 4. 否则取**最后完成的节点**，按声明顺序遍历其出边，第一条 `when` 为真（或 `when` 为空）的边胜出 → `start` 目标节点
 5. 若某条边的 `when` 求值抛错 → 该边视为不匹配，但错误原因要记录进结果（通过 `wait` 的 reason 暴露）。**任何一条边都不匹配 → `end` 且 `status: 'failed'`**
-6. 目标节点若已在 `completedNodeIds` 中且 `visitCounts >= 3` → `end` 且 `failed`，理由是死循环保护
+6. 目标节点若 `visitCounts >= 3` → `end` 且 `failed`，理由是死循环保护。
+   **刻意不要求「该节点曾成功完成」**：判据是「被反复进入」这件事本身，否则在反复失败重试场景下保护会失效（spec §9.4：`node.visit_count` 检测同状态反复进入 → 升级）
 
 - [ ] **Step 1: 写失败的测试 `src/kernel/state-machine.test.ts`**
 
@@ -2335,6 +2525,13 @@ describe('decideNext', () => {
   });
 
   it('同一节点访问超过 3 次时判定死循环', () => {
+    // 必须用真正的自环（pm→pm）来触发保护：保护机制检查的是"即将启动的目标节点"
+    // 的访问次数，若目标是 dev 且从未启动过，访问次数为 0，不会被拦住。
+    const loopWorkflow: WorkflowDef = {
+      ...workflow,
+      edges: [{ from: 'pm_analyze', to: 'pm_analyze', when: 'true' }],
+    };
+
     const events: KernelEvent[] = [ev('task.created', {}, 1)];
     let seq = 2;
     for (let i = 0; i < 4; i += 1) {
@@ -2345,12 +2542,33 @@ describe('decideNext', () => {
       }, seq++));
       events.push(ev('node.succeeded', { node_id: 'pm_analyze', run_id: `run_${i}`, log_ref: 'x' }, seq++));
     }
-    const d = decide(events);
+
+    const state = project(events);
+    const facts = buildFacts({ state, workflow: loopWorkflow, roles: new Map() });
+    const d = decideNext({ workflow: loopWorkflow, state, facts });
+
     expect(d.kind).toBe('end');
     if (d.kind === 'end') {
       expect(d.status).toBe('failed');
       expect(d.reason).toContain('访问次数');
     }
+  });
+
+  it('目标节点访问次数未超限时不会误判为死循环', () => {
+    // 自环跑 1 次后继续判定，应当仍允许再次进入（1 < 3），而不是直接判死循环
+    const loopWorkflow: WorkflowDef = {
+      ...workflow,
+      edges: [{ from: 'pm_analyze', to: 'pm_analyze', when: 'true' }],
+    };
+    const events: KernelEvent[] = [
+      ev('task.created', {}, 1),
+      ev('node.started', { node_id: 'pm_analyze', role_id: 'pm', run_id: 'run_0', attempt: 1 }, 2),
+      ev('node.succeeded', { node_id: 'pm_analyze', run_id: 'run_0', log_ref: 'x' }, 3),
+    ];
+    const state = project(events);
+    const facts = buildFacts({ state, workflow: loopWorkflow, roles: new Map() });
+    const d = decideNext({ workflow: loopWorkflow, state, facts });
+    expect(d).toMatchObject({ kind: 'start', nodeId: 'pm_analyze' });
   });
 
   it('条件表达式求值失败时不会崩溃，而是判为不匹配', () => {
@@ -2366,6 +2584,56 @@ describe('decideNext', () => {
     const facts = buildFacts({ state, workflow: wf, roles: new Map() });
     const d = decideNext({ workflow: wf, state, facts });
     expect(d.kind).toBe('end');
+  });
+
+  it('目标节点反复进入但从未成功完成时，同样判定为死循环', () => {
+    // 钉住「死循环保护的判据是反复进入本身，而非完成过再进入」。
+    // 若将来有人给保护加上「且已在 completedNodeIds 中」这个条件，本用例会变红——
+    // 那正是要防止的退化：在反复失败重试场景下会导致保护失效。
+    //
+    // 事件编排要点：**只产生 node.failed 是到不了保护分支的**。
+    // node.failed 不写入 completedNodeIds，于是 completedNodeIds 为空，
+    // decideNext 会走规则 3（无当前节点且无已完成节点）直接回起点。
+    // 所以必须让另一个节点完成，使「即将启动的目标节点」恰是那个反复失败的节点。
+    const loopWorkflow: WorkflowDef = {
+      id: 'loop',
+      start: 'pm_analyze',
+      nodes: [
+        { id: 'pm_analyze', title: '需求分析', role: 'pm', consumes: [], produces: 'requirement', isolate: false },
+        { id: 'dev_implement', title: '编码实现', role: 'backend_dev', consumes: ['requirement'], produces: 'code_diff', isolate: false },
+      ],
+      edges: [{ from: 'dev_implement', to: 'pm_analyze', when: 'true' }],
+    };
+
+    const events: KernelEvent[] = [ev('task.created', {}, 1)];
+    let seq = 2;
+
+    // pm_analyze 反复失败 3 次，从未 succeeded → 不在 completedNodeIds 中
+    for (let i = 0; i < 3; i += 1) {
+      events.push(
+        ev('node.started', { node_id: 'pm_analyze', role_id: 'pm', run_id: `run_pm_${i}`, attempt: i + 1 }, seq++),
+      );
+      events.push(ev('node.failed', { node_id: 'pm_analyze', run_id: `run_pm_${i}`, error: '模拟失败' }, seq++));
+    }
+
+    // dev_implement 成功一次，使 lastCompletedNodeId = dev_implement
+    events.push(ev('node.started', { node_id: 'dev_implement', role_id: 'backend_dev', run_id: 'run_dev', attempt: 1 }, seq++));
+    events.push(ev('node.succeeded', { node_id: 'dev_implement', run_id: 'run_dev', log_ref: 'x' }, seq++));
+
+    const state = project(events);
+    // 前提断言：这个节点确实从未完成过，但它被进入了 3 次
+    expect(state.completedNodeIds).toEqual(['dev_implement']);
+    expect(state.visitCounts['pm_analyze']).toBe(3);
+    expect(state.currentNodeIds).toEqual([]);
+
+    const facts = buildFacts({ state, workflow: loopWorkflow, roles: new Map() });
+    const d = decideNext({ workflow: loopWorkflow, state, facts });
+
+    expect(d.kind).toBe('end');
+    if (d.kind === 'end') {
+      expect(d.status).toBe('failed');
+      expect(d.reason).toContain('访问次数');
+    }
   });
 });
 ```
@@ -2457,6 +2725,9 @@ export function decideNext(input: DecideInput): Decision {
     }
     const visits = state.visitCounts[edge.to] ?? 0;
     if (visits >= MAX_NODE_VISITS) {
+      // 死循环保护：判据是「目标节点被反复进入」这件事本身，
+      // 刻意**不**要求该节点曾经成功完成——否则在「反复失败重试」场景下保护会失效，
+      // 而那正是最该拦住的场景（spec §9.4：visit_count 检测同状态反复进入 → 升级）。
       return {
         kind: 'end',
         status: 'failed',
@@ -2477,7 +2748,7 @@ export function decideNext(input: DecideInput): Decision {
 - [ ] **Step 4: 运行测试，确认通过**
 
 Run: `npx vitest run src/kernel/state-machine.test.ts`
-Expected: 10 个测试 PASS
+Expected: 12 个测试 PASS
 
 - [ ] **Step 5: 提交**
 
@@ -2650,6 +2921,19 @@ describe('FakeRunner', () => {
     expect(first.at(-1)).toEqual({ kind: 'exited', code: 0 });
     expect(second.at(-1)).toEqual({ kind: 'exited', code: 3 });
   });
+
+  it('脚本队列耗尽时抛错，而不是静默返回成功', async () => {
+    // 防的是一类测试假绿：脚本份数少于 run 次数时，
+    // 若兜底返回成功，测试编排错误会被伪装成「测试通过」。
+    // 注意先消费掉唯一那份脚本，这样测的才是「队列耗尽」而不是「创建时队列为空」。
+    const runner = createFakeRunner({ script: [{ kind: 'exited', code: 0 }] });
+
+    // 第一次正常消费
+    await collect(runner.run(req));
+
+    // 第二次没有脚本了，必须响亮失败
+    await expect(collect(runner.run(req))).rejects.toThrow(/脚本队列已耗尽/);
+  });
 });
 ```
 
@@ -2663,12 +2947,10 @@ Expected: FAIL —— 找不到模块 `./fake-runner.js`
 ```ts
 import type { AgentRunner, RunRequest, RunnerEvent } from './types.js';
 
-/** 脚本项：runner 不产生 started（由实现自动补），其余按顺序回放 */
-export type FakeScriptItem =
-  | { kind: 'log'; chunk: string }
-  | { kind: 'usage'; tokensIn: number; tokensOut: number; costUsd: number }
-  | { kind: 'artifact'; raw: unknown }
-  | { kind: 'exited'; code: number | null };
+/** 脚本项：runner 不产生 started（由实现自动补），其余按顺序回放。
+ *  刻意从 RunnerEvent 派生而非手写联合：这样 RunnerEvent 字段漂移时会在编译期报错，
+ *  而不是被一个 `as RunnerEvent` 断言悄悄绕过去。 */
+export type FakeScriptItem = Exclude<RunnerEvent, { kind: 'started' }>;
 
 export type FakeRunnerOptions = {
   /** 单次 run 的脚本 */
@@ -2724,7 +3006,7 @@ export function createFakeRunner(options: FakeRunnerOptions): FakeRunner {
 - [ ] **Step 5: 运行测试，确认通过**
 
 Run: `npx vitest run src/runner/fake-runner.test.ts`
-Expected: 5 个测试 PASS
+Expected: 6 个测试 PASS
 
 - [ ] **Step 6: 提交**
 
@@ -2835,7 +3117,7 @@ describe('assemblePrompt', () => {
     expect(r.prompt).toContain('让多角色自动流转');
     expect(r.prompt).toContain('code_diff');
     expect(r.prompt).toContain('src/server/**');
-    expect(r.worktreePath).toBe('/tmp/ws');
+    expect(r.prompt).toContain('/tmp/ws');
   });
 
   it('只放输入产物的 summary 与 refs，不放 payload 正文', () => {
@@ -2869,7 +3151,10 @@ describe('assemblePrompt', () => {
   });
 
   it('超出 token 上限时整体丢弃低优先级产物 summary，并记录 droppedArtifactIds', () => {
-    const big = 'x'.repeat(4000); // 约 1000 token
+    // 每条大摘要 20_000 字符 ≈ 5000 token，上限 1500，base prompt ≈ 250 token。
+    // 必须让"丢掉最后一条后仍然超限"，才能验证出多条被连续丢弃；
+    // 若摘要只有 1000 token，丢掉一条就满足了，断言会与预期不符。
+    const big = 'x'.repeat(20_000);
     const r = assemblePrompt({
       role,
       node,
@@ -2888,18 +3173,21 @@ describe('assemblePrompt', () => {
     expect(r.prompt).toContain('docs/drop1.md');
   });
 
-  it('即使单条摘要就超限，也不会截断内容，而是丢弃它', () => {
+  it('即使单条摘要就超限，也不会截断内容，而是整体丢弃它', () => {
     const huge = 'y'.repeat(20_000);
+    // 上限必须大于"不含任何产物摘要的 base prompt"本身（其中内嵌了 code_diff 的完整 JSON Schema，
+    // 约 300~400 token）。设成 200 会导致断言不可能成立。
+    // 20_000 字符 ≈ 5000 token，远大于 1500，因此必然被丢弃。
     const r = assemblePrompt({
       role,
       node,
       state: baseState([artifact('huge', 'requirement', huge)]),
       worktreePath: '/tmp/ws',
-      maxPromptTokens: 200,
+      maxPromptTokens: 1500,
     });
     expect(r.prompt).not.toContain('yyyy');
     expect(r.droppedArtifactIds).toEqual(['huge']);
-    expect(r.estimatedTokens).toBeLessThanOrEqual(200);
+    expect(r.estimatedTokens).toBeLessThanOrEqual(1500);
   });
 
   it('无输入产物时也能装配出合法 prompt', () => {
@@ -2992,7 +3280,7 @@ function buildPrompt(
   sections.push(['## 工作区', `工作目录：${input.worktreePath}`, '所有文件读写都必须在上述目录内完成。'].join('\n'));
 
   if (artifacts.length > 0) {
-    sections.push(['## 输入材料', ...artifacts.map((a) => renderArtifactBlock(a, true))].join('\n\n'));
+    sections.push(['## 输入材料', ...artifacts.map((a) => renderArtifactBlock(a))].join('\n\n'));
   }
 
   if (dropped.length > 0) {
@@ -3088,7 +3376,51 @@ git commit -m "feat: 新增上下文装配器，超限时整体丢弃而非截�
 - Consumes: `AgentRunner` / `RunRequest` / `RunnerEvent`（Task 8）；`parseArtifactPayload`（Task 3）；**Task 2 探针 README 中记录的字段路径**
 - Produces: `createClaudeCodeRunner(options): AgentRunner`，`options = { binPath: string; logDir: string; extraArgs?: string[] }`
 
-**前置条件（硬性）**：必须先完成 Task 2。本任务的所有字段路径都必须来自 `spikes/cli-probe/README.md` 的"对 Task 10 的结论"，**不允许猜测**。
+**前置条件（硬性，来自 Task 2 的实测结论）**：必须先完成 Task 2。本任务的所有字段路径与调用参数都必须来自 `spikes/cli-probe/README.md` 的「对 Task 10 的结论」与其中的 **gate**，**不允许猜测**。
+
+Task 2 用真实 CLI 实测（含 16,403 次重试的可复核证据）推翻了本计划原先的 4 个假设，实现时必须照下面的**修正后**设计做，不要照抄本节早先的写法：
+
+| 原假设 | 实测结论 | 本任务必须怎么做 |
+| --- | --- | --- |
+| 用 `--json-schema` 在 CLI 层强制产物格式 | 凭据耗尽期间：该参数会让 CLI 永不退出（空转 13 分钟、16,403 次 `You MUST call the StructuredOutput tool`、CPU 45%~50%）。**凭据恢复后补跑（2026-09-18）**：rc=0、7.0s 正常退出，`result.structured_output` 为符合 schema 的对象；而**不传**时模型会把 JSON 包进 ` ```json ` 代码块 → 解析失败 → 零 artifact | **默认传 `--json-schema`**（有 `outputSchema` 时）；解析层 `structured_output` 优先、`result` 内 JSON 字符串兜底。**「永不退出」只在请求持续失败时出现**，故 wall-clock 超时 + 按进程组 kill 仍是必需配套 |
+| 用 `subtype == 'success'` 判成功 | 认证失败时 `subtype` 仍为 `"success"`，而 `is_error` 为 `true`、exit=1 | **只用 `is_error` 判定失败**，绝不看 `subtype` |
+| 事件字段可用白名单校验 | 真实事件字段远多于样本（`duration_ms` / `duration_api_ms` / `num_turns` / `stop_reason` / `modelUsage` / `permission_denials` / `uuid`） | 解析层**不做字段白名单**，只取自己需要的字段 |
+| `RunRequest.wallTimeMs` 是提示性字段 | 存在永不退出的路径 | **必须实现硬性 wall-clock 超时并 kill 子进程**，否则任务会永久挂起 |
+| 成功路径的样本可从 `spikes/cli-probe/out/` 取 | 该目录确认为空（claude 额度耗尽，成功路径未跑通） | fixture 改从 `spikes/cli-probe/README.md` **内联的 5 行原始 JSONL** 提取（那是已归档的真实输出） |
+
+另外两条已实测确认、实现时直接采信的事实：
+- `-p` 搭配 `--output-format stream-json` **必须同时给 `--verbose`**，否则没有输出
+- 解析必须对 `result` 是「JSON 字符串」和「对象」两种形态都容错
+
+> **实测修正（2026-09-18，headless 权限预授权，由 Task 15 端到端驱动）**
+>
+> Task 15 真实端到端发现：headless（`-p`）下没有人工审批通道，`--permission-mode acceptEdits` **只自动放行文件编辑**，
+> Bash 里的非白名单命令（`sh x.sh` / `chmod` / `git checkout -b`）一律返回 `This command requires approval`
+> （真实日志里这类拒绝 **461 次**）；而 dev/qa 的 prompt 明确要求「真实运行自测/测试」、`dev_implement` 的产物 schema 要求
+> `self_test_result` —— 契约不可满足 → agent 陷入重试，单节点成本涨到 $1.13~$2.20。
+> 故**可写角色**（`readOnly === false`）在原有参数后追加：
+> `--allowed-tools 'Bash(sh:*),Bash(bash:*),Bash(chmod:*),Bash(git:*),Bash(node:*),Bash(npm:*)'`
+> （探针实测：叠加后上述命令均真实执行、`permission_denials` 为空；`--tools` 与 `--allowed-tools` 并用不冲突）。
+> **只读角色一字未改**，仍为 `--tools=Read,Grep,Glob --permission-mode default`，且**未使用** `--dangerously-skip-permissions`。
+> 本节 Step 4 的 `buildArgs` 代码块是修订前形态，实际实现以 `src/runner/claude-code-runner.ts` 为准。
+>
+> **已知局限 / 已知风险（方案固有，本轮有意不修，收窄属 Phase 2 决策）**
+>
+> 1. **shell 前缀（`sh` / `bash`）等价于任意命令执行 ⇒「精准预授权」在能力层面已退化为「全量放行」。**
+>    `Bash(bash:*)` 允许 `bash -c "<任意命令>"`，因此 `git push --force`、`rm -rf`、`curl … | sh` 都能绕过前缀限制。
+>    前缀白名单实际只约束**不包 shell 的调用**（agent 直接写 `npm test` 受约束，写成 `bash -c 'npm test'` 就不受约束）。
+>    这是满足 dev/qa prompt「真实运行 .sh 脚本」的必要代价。若后续端到端仍见零星的 `requires approval`，
+>    下一步应是**收集被拒命令清单再决定补哪条前缀**，而不是换成 `--dangerously-skip-permissions`（用户已明确否决）。
+> 2. **`Bash(git:*)` / `Bash(npm:*)` 授权面过宽，注释须如实描述。**
+>    `Bash(git:*)` 涵盖**全部** git 子命令（含 `git push` / `git reset --hard` / `git clean -fdx`）；
+>    `Bash(npm:*)` 涵盖 `npm publish` 与任意 install 生命周期脚本。
+>    **Phase 1 的目标仓库是临时目录，尚可控；但同一参数在真实项目里立即生效** —— 真实项目使用前必须按需收窄
+>    （例如收窄到 `Bash(npm test:*)` / `Bash(npm run:*)`）。
+> 3. `--allowed-tools` 不约束 MCP 工具（spec §11.2 的既有实测局限），故「角色权限即沙箱参数」的强度弱于 spec 原意，本次修复未改变这一点。
+>
+> 安全侧的对应断言在 `src/runner/claude-code-runner.args.test.ts`：只读角色不仅断言不含 `--allowed-tools` / `Bash`，
+> 还断言**不含 `--dangerously-skip-permissions`**，并对只读 args 做**整串精确断言**以兜住任何新增参数
+> （原两条子串断言都不含 `dangerously-skip-permissions` 这个子串，等于从洞里漏过去）。
 
 **可测性设计**：解析逻辑与进程管理分离。`parseStreamLine(line)` 是纯函数，可脱离真实 CLI 单测；`createClaudeCodeRunner` 只负责 spawn 与把 stdout 行喂给解析函数。
 
@@ -3098,8 +3430,14 @@ git commit -m "feat: 新增上下文装配器，超限时整体丢弃而非截�
 import { describe, expect, it } from 'vitest';
 import { parseStreamLine } from './claude-code-runner.js';
 
-// 注意：下面每条样本都必须来自 spikes/cli-probe/out/claude-stream.jsonl 的真实输出。
-// 若真实字段与样本不符，以探针结果为准修正本测试与实现——不要修改样本去迁就实现。
+// 注意：下面的样本是**人工构造的**，用于覆盖成功路径（result 为合法 JSON 字符串）。
+// 原因：Task 2 因 claude 额度耗尽，成功路径从未跑通，因此没有成功样本可归档。
+// 真实归档样本（认证失败路径）由 Step 6 的 fixture 契约回归覆盖。
+// 构造样本里的字段名必须与 Task 2 实测结论一致：
+//   - 失败判定用 is_error，不用 subtype
+//   - usage 在 result 事件内，字段为 input_tokens / output_tokens
+//   - 成本字段为 result.total_cost_usd
+// 一旦额度恢复并补录到成功样本，应把本文件的入口测试替换为真实样本。
 const SAMPLE_RESULT = JSON.stringify({
   type: 'result',
   subtype: 'success',
@@ -3108,6 +3446,10 @@ const SAMPLE_RESULT = JSON.stringify({
   usage: { input_tokens: 1200, output_tokens: 300 },
   total_cost_usd: 0.0231,
   is_error: false,
+  // 真实事件还有 duration_ms / num_turns / stop_reason / modelUsage 等字段；
+  // 解析层不得对其做白名单校验，这里故意不放全，以验证「未知字段被容忍」
+  duration_ms: 23,
+  num_turns: 2,
 });
 
 describe('parseStreamLine', () => {
@@ -3188,7 +3530,11 @@ Expected: FAIL —— 找不到模块 `./claude-code-runner.js`
 mkdir -p tests/fixtures
 ```
 
-把 `spikes/cli-probe/out/claude-stream.jsonl` 中**真实的 result 行**复制到 `tests/fixtures/claude-stream-sample.jsonl`。**不要手工编造**——这份 fixture 是后续契约回归测试的基线。
+**样本来源已变更**：原计划要求从 `spikes/cli-probe/out/claude-stream.jsonl` 取，但 Task 2 确认该目录为空（claude 额度耗尽，成功路径未跑通）。
+
+改从 `spikes/cli-probe/README.md` 中**内联的 5 行原始 JSONL** 提取——那是已归档的真实输出，已被复审逐行 `JSON.parse` 并核对过键集合。把其中的 `result` 行写入 `tests/fixtures/claude-stream-sample.jsonl`。**不要手工编造**——这份 fixture 是契约回归测试的基线。
+
+写完后先确认它至少包含这些真实字段（缺任何一个都说明你抄错了行）：`type: "result"`、`subtype`、`is_error`、`usage.input_tokens`、`usage.output_tokens`、`total_cost_usd`、`session_id`。
 
 - [ ] **Step 4: 实现 `src/runner/claude-code-runner.ts`**
 
@@ -3242,6 +3588,14 @@ export function parseStreamLine(line: string): RunnerEvent[] {
       return events;
     }
 
+    // 两条产物通道都读，structured_output 优先（2026-09-18 补跑实测：传了 --json-schema 时
+    // 结构化对象在 structured_output；result 形状不确定（散文 / ```json 代码块都出现过），故不能只读它）
+    const structured = obj['structured_output'];
+    if (structured !== null && typeof structured === 'object' && !Array.isArray(structured)) {
+      events.push({ kind: 'artifact', raw: structured });
+      return events;
+    }
+
     if (typeof raw === 'string') {
       try {
         events.push({ kind: 'artifact', raw: JSON.parse(raw) as unknown });
@@ -3262,14 +3616,20 @@ export type ClaudeCodeRunnerOptions = {
   logDir: string;
   /** 追加的额外参数，用于探针阶段调试 */
   extraArgs?: string[];
+  /**
+   * 是否启用 CLI 层的结构化输出强制（--json-schema）。默认 true（见 Step 5 的 2026-09-18 修订）。
+   * 该参数在请求持续失败时会让 CLI 空转不退出，故 wall-clock 超时 + killTree 是必需配套。
+   */
+  useJsonSchema?: boolean;
 };
 
 /** 根据角色权限和产出要求拼装 claude 命令行参数 */
-export function buildArgs(req: RunRequest): string[] {
+export function buildArgs(req: RunRequest, useJsonSchema = true): string[] {
   const args = [
     '-p', req.prompt,
     '--output-format', 'stream-json',
     '--include-partial-messages',
+    // 实测：-p 搭配 stream-json 必须同时给 --verbose，否则没有输出
     '--verbose',
     '--model', req.model,
   ];
@@ -3277,7 +3637,8 @@ export function buildArgs(req: RunRequest): string[] {
   if (req.systemPrompt) {
     args.push('--system-prompt', req.systemPrompt);
   }
-  if (req.outputSchema) {
+  // 默认传 --json-schema（有 outputSchema 时），解析层两通道兼容
+  if (useJsonSchema && req.outputSchema) {
     args.push('--json-schema', JSON.stringify(req.outputSchema));
   }
   if (req.readOnly) {
@@ -3294,6 +3655,62 @@ export function buildArgs(req: RunRequest): string[] {
   return args;
 }
 
+/**
+ * 按**进程组**终止子进程树。
+ *
+ * 为什么必须组杀而不是只杀直接子进程：实测（Phase 0 探针 + 独立对照实验）表明，
+ * `#!/bin/sh` 这类脚本会 fork 出孙进程，孙进程**继承了 stdout 管道的写端**，
+ * 因此只杀掉直接子进程时，Node 的 `close` 事件永不触发 → 异步生成器永久卡在 await。
+ * 这正是「加了超时保护但保护自己挂住」的情形。
+ *
+ * 前提：spawn 时必须带 `detached: true`，子进程才会成为新进程组的组长，
+ * `process.kill(-pid)` 才能命中整组。
+ */
+function killTree(pid: number | undefined): void {
+  if (pid === undefined || !Number.isInteger(pid) || pid <= 0) return;
+  try {
+    process.kill(-pid, 'SIGKILL');
+  } catch {
+    // 进程组可能已不存在；退回只杀该 pid，再失败就说明它已经退出
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      // 已退出，忽略
+    }
+  }
+}
+
+/**
+ * 模块级：登记活跃的子进程组，供退出钩子统一清理。
+ *
+ * 必要性：spawn 用了 `detached: true`（为了让 killTree 能按进程组杀），代价是子进程
+ * 脱离父进程组——父进程异常退出时它不会随终端信号一起消失。
+ * 若不清理，孤儿的 claude 进程会继续消耗 API 额度。
+ */
+const activeGroups = new Set<number>();
+let exitHookInstalled = false;
+
+function registerGroup(pid: number): void {
+  if (!Number.isInteger(pid) || pid <= 0) return;
+  activeGroups.add(pid);
+  if (!exitHookInstalled) {
+    exitHookInstalled = true;
+    // 用 'exit' 而非 SIGINT/SIGTERM：上层（main.ts）处理完信号并调用 process.exit() 时
+    // 'exit' 同样会触发，且 kill 是同步的，可在此安全执行——这样不会与上层争抢信号处理。
+    // 边界：SIGKILL 这类不可捕获的终止无法覆盖。
+    process.once('exit', () => {
+      for (const groupPid of activeGroups) {
+        killTree(groupPid);
+      }
+    });
+  }
+}
+
+function unregisterGroup(pid: number | undefined): void {
+  if (pid === undefined) return;
+  activeGroups.delete(pid);
+}
+
 export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentRunner {
   const running = new Map<string, ReturnType<typeof spawn>>();
   mkdirSync(options.logDir, { recursive: true });
@@ -3308,7 +3725,7 @@ export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentR
     },
 
     async *run(req: RunRequest): AsyncIterable<RunnerEvent> {
-      const args = [...buildArgs(req), ...(options.extraArgs ?? [])];
+      const args = [...buildArgs(req, options.useJsonSchema ?? true), ...(options.extraArgs ?? [])];
       const logPath = join(options.logDir, `${req.runId}.jsonl`);
       const logStream = createWriteStream(logPath, { flags: 'a' });
 
@@ -3316,11 +3733,26 @@ export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentR
         cwd: req.workdir,
         stdio: ['ignore', 'pipe', 'pipe'],
         env: { ...process.env },
+        // detached: true 让子进程成为新进程组的组长，process.kill(-pid) 才能命中整组。
+        // 这是 killTree 能生效的前提。代价是子进程脱离父进程组，需要退出钩子兜底清理。
+        detached: true,
       });
       running.set(req.runId, child);
+      registerGroup(child.pid ?? -1);
 
-      logStream.write(`${JSON.stringify({ ts: Date.now(), kind: 'spawn', args, cwd: req.workdir })}\n`);
-      yield { kind: 'started', pid: child.pid ?? -1 };
+      // 硬性 wall-clock 超时保护。
+      // Task 2 实测存在「CLI 永不退出」的路径（--json-schema 挂起 13 分钟），
+      // 没有这层保护，任务会永久卡住且后续节点永不执行。
+      // 注意必须**组杀**：只杀直接子进程时，孙进程仍持有 stdout 管道写端，
+      // close 事件不触发，异步生成器会卡在 await —— 保护本身就失效了。
+      let timedOut = false;
+      const timeoutTimer = setTimeout(() => {
+        timedOut = true;
+        logStream.write(
+          JSON.stringify({ ts: Date.now(), kind: 'timeout', wallTimeMs: req.wallTimeMs }) + '\n',
+        );
+        killTree(child.pid);
+      }, req.wallTimeMs);
 
       const queue: RunnerEvent[] = [];
       let notify: (() => void) | null = null;
@@ -3332,6 +3764,24 @@ export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentR
         notify?.();
         notify = null;
       };
+
+      // ⚠️ 'error' 监听**必须**在第一个 yield 之前挂上（2026-09-19 终审修复）。
+      // spawn 失败（binPath 不存在 → ENOENT）时 Node 经 process.nextTick 投递 'error'，
+      // 而 nextTick 队列先于 await 的微任务执行：若此刻还没有监听器，Node 会抛
+      // `Unhandled 'error' event` 并**直接杀掉整个进程**（实测真实 main.ts + 一次 POST /api/tasks
+      // 即崩溃、exit 1，任务永久卡在 active 且用户看不到任何错误）。
+      // 若把本段挪回第一个 yield 之后，`claude-code-runner.spawn-error.test.ts` 会变红。
+      child.on('error', (error) => {
+        clearTimeout(timeoutTimer);
+        push({ kind: 'log', chunk: `进程启动失败：${error.message}` });
+        closed = true;
+        push({ kind: 'exited', code: -1 });
+        logStream.end();
+        running.delete(req.runId);
+      });
+
+      logStream.write(`${JSON.stringify({ ts: Date.now(), kind: 'spawn', args, cwd: req.workdir })}\n`);
+      yield { kind: 'started', pid: child.pid ?? -1 };
 
       child.stdout.setEncoding('utf8');
       child.stdout.on('data', (chunk: string) => {
@@ -3351,19 +3801,19 @@ export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentR
       });
 
       child.on('close', (code) => {
+        clearTimeout(timeoutTimer);
         if (buffered.trim() !== '') {
           for (const e of parseStreamLine(buffered)) push(e);
         }
+        if (timedOut) {
+          push({
+            kind: 'log',
+            chunk: `调用超过 wall-clock 上限 ${req.wallTimeMs}ms，已被强制终止`,
+          });
+        }
         closed = true;
-        push({ kind: 'exited', code });
-        logStream.end();
-        running.delete(req.runId);
-      });
-
-      child.on('error', (error) => {
-        push({ kind: 'log', chunk: `进程启动失败：${error.message}` });
-        closed = true;
-        push({ kind: 'exited', code: -1 });
+        // 被 SIGKILL 终止时 code 为 null，统一归一为 -1，避免上层把 null 当成功
+        push({ kind: 'exited', code: timedOut ? -1 : code });
         logStream.end();
         running.delete(req.runId);
       });
@@ -3386,23 +3836,149 @@ export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentR
     async cancel(runId: string): Promise<void> {
       const child = running.get(runId);
       if (!child) return;
-      child.kill('SIGTERM');
+      // 与超时路径共用 killTree：只杀直接子进程会留下持有管道的孙进程
+      killTree(child.pid);
       await new Promise((resolve) => setTimeout(resolve, 3000));
       if (running.has(runId)) {
-        child.kill('SIGKILL');
+        killTree(child.pid);
         running.delete(runId);
+        unregisterGroup(child.pid);
       }
     },
   };
 }
 ```
 
-- [ ] **Step 5: 运行测试与类型检查**
+- [ ] **Step 5: 补两条针对实测缺陷的回归测试**
+
+这两条测试是 Task 2 最有价值产出的直接防护：一条把守 `--json-schema` 的默认取值，一条防止 wall-clock 超时被删掉。
+
+⚠️ **2026-09-18 修订（凭据恢复后补跑实测）**：`--json-schema` 的默认值由「不传」**反转为「传」**——
+证据是：不传时模型会把 JSON 包进 ` ```json ` 代码块，真实端到端跑出**零 artifact**；
+传了则 rc=0、15.9s 退出、产物字段齐全且成本更低。下面代码块已按修订后的规则更新
+（实现见 `src/runner/claude-code-runner.ts`，测试见 `src/runner/claude-code-runner.args.test.ts`）。
+
+先写 `src/runner/claude-code-runner.args.test.ts`：
+
+```ts
+import { describe, expect, it } from 'vitest';
+import { buildArgs } from './claude-code-runner.js';
+import type { RunRequest } from './types.js';
+
+const base: RunRequest = {
+  runId: 'run_1',
+  prompt: '做点事',
+  systemPrompt: '你是后端开发',
+  workdir: '/tmp',
+  model: 'sonnet',
+  artifactType: 'code_diff',
+  readOnly: false,
+  wallTimeMs: 60_000,
+};
+
+describe('buildArgs', () => {
+  it('默认传 --json-schema（实测：不传时模型常把 JSON 包进代码块，导致解析失败、零产物）', () => {
+    const args = buildArgs({ ...base, outputSchema: { type: 'object' } });
+    const idx = args.indexOf('--json-schema');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe(JSON.stringify({ type: 'object' }));
+  });
+
+  it('没有 outputSchema 时不传 --json-schema', () => {
+    const args = buildArgs(base);
+    expect(args).not.toContain('--json-schema');
+  });
+
+  it('显式关闭 useJsonSchema 时不传 --json-schema', () => {
+    const args = buildArgs({ ...base, outputSchema: { type: 'object' } }, false);
+    expect(args).not.toContain('--json-schema');
+  });
+
+  it('stream-json 必须同时带 --verbose（实测缺它则无输出）', () => {
+    const args = buildArgs(base);
+    expect(args).toContain('--output-format');
+    expect(args[args.indexOf('--output-format') + 1]).toBe('stream-json');
+    expect(args).toContain('--verbose');
+  });
+
+  it('只读角色不给写权限（permission-mode 为 default，且不开放写工具）', () => {
+    const args = buildArgs({ ...base, readOnly: true });
+    expect(args).toContain('--tools=Read,Grep,Glob');
+    expect(args[args.indexOf('--permission-mode') + 1]).toBe('default');
+    expect(args.join(' ')).not.toContain('Write');
+    expect(args.join(' ')).not.toContain('acceptEdits');
+  });
+
+  it('非只读角色使用 acceptEdits 并开放写工具', () => {
+    const args = buildArgs(base);
+    expect(args[args.indexOf('--permission-mode') + 1]).toBe('acceptEdits');
+    expect(args.join(' ')).toContain('Write');
+  });
+
+  it('budgetCapUsd 映射到 --max-budget-usd', () => {
+    const args = buildArgs({ ...base, budgetCapUsd: 0.5 });
+    expect(args[args.indexOf('--max-budget-usd') + 1]).toBe('0.5');
+  });
+});
+```
+
+再写 `src/runner/claude-code-runner.timeout.test.ts`。用「忽略参数、永远睡下去」的可执行文件模拟实测到的那条永不退出路径：
+
+```ts
+import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { describe, expect, it } from 'vitest';
+import { createClaudeCodeRunner } from './claude-code-runner.js';
+import type { RunRequest, RunnerEvent } from './types.js';
+
+function makeHangingBin(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'agentflow-hang-'));
+  const bin = join(dir, 'fake-claude.sh');
+  // 忽略所有参数，一直睡下去——复现「CLI 永不退出」
+  writeFileSync(bin, '#!/bin/sh\nsleep 60\n');
+  chmodSync(bin, 0o755);
+  return bin;
+}
+
+const req: RunRequest = {
+  runId: 'run_hang',
+  prompt: 'p',
+  systemPrompt: '',
+  workdir: tmpdir(),
+  model: 'sonnet',
+  artifactType: 'code_diff',
+  readOnly: false,
+  wallTimeMs: 300,
+};
+
+describe('claude runner wall-clock 超时保护', () => {
+  it('超过 wallTimeMs 时强制终止，退出码归一为 -1 并留下日志', async () => {
+    const binPath = makeHangingBin();
+    const logDir = mkdtempSync(join(tmpdir(), 'agentflow-hanglog-'));
+    const runner = createClaudeCodeRunner({ binPath, logDir });
+
+    const events: RunnerEvent[] = [];
+    const startedAt = Date.now();
+    for await (const e of runner.run(req)) events.push(e);
+    const elapsed = Date.now() - startedAt;
+
+    // 必须在远小于 sleep 60 的时间内结束
+    expect(elapsed).toBeLessThan(5_000);
+    expect(events.at(-1)).toEqual({ kind: 'exited', code: -1 });
+    expect(
+      events.some((e) => e.kind === 'log' && e.chunk.includes('wall-clock')),
+    ).toBe(true);
+  }, 10_000);
+});
+```
+
+- [ ] **Step 6: 运行测试与类型检查**
 
 Run: `npx vitest run src/runner && npx tsc --noEmit`
-Expected: 全部 PASS，无类型错误
+Expected: 全部 PASS，无类型错误。超时用例应在约 300ms 内结束，而不是等满 60 秒——**若它跑满 60 秒才结束，说明 kill 逻辑没生效，必须修实现**。
 
-- [ ] **Step 6: 用 fixture 做一次契约回归**
+- [ ] **Step 7: 用 fixture 做一次契约回归**
 
 新增 `src/runner/claude-code-runner.fixture.test.ts`：
 
@@ -3413,7 +3989,7 @@ import { describe, expect, it } from 'vitest';
 import { parseStreamLine } from './claude-code-runner.js';
 
 describe('claude stream-json 契约回归', () => {
-  it('真实样本的每一行都能被解析，且至少产出一个 artifact', () => {
+  it('真实归档样本的每一行都能被解析，且 result 行的处理与 is_error 一致', () => {
     const raw = readFileSync(
       resolve(import.meta.dirname, '../../tests/fixtures/claude-stream-sample.jsonl'),
       'utf8',
@@ -3421,22 +3997,43 @@ describe('claude stream-json 契约回归', () => {
     const lines = raw.split('\n').filter((l) => l.trim() !== '');
     expect(lines.length).toBeGreaterThan(0);
 
-    let sawArtifact = false;
+    // 每一行都必须能被解析且不抛错（解析层不做字段白名单，未知字段一律容忍）
     let sawUsage = false;
+    const kinds: string[] = [];
     for (const line of lines) {
       for (const e of parseStreamLine(line)) {
-        if (e.kind === 'artifact') sawArtifact = true;
+        kinds.push(e.kind);
         if (e.kind === 'usage') sawUsage = true;
       }
     }
-    expect(sawArtifact).toBe(true);
+
     expect(sawUsage).toBe(true);
+
+    // 归档样本是 claude 额度耗尽时的认证失败 result（is_error: true）。
+    // 期望值从样本自身推导，而不是写死——这样将来补录到成功样本时本测试依然正确。
+    const resultLine = lines.find((l) => {
+      try {
+        return (JSON.parse(l) as { type?: unknown }).type === 'result';
+      } catch {
+        return false;
+      }
+    });
+    expect(resultLine).toBeDefined();
+
+    const resultObj = JSON.parse(resultLine!) as { is_error?: unknown };
+
+    if (resultObj.is_error === true) {
+      expect(kinds).not.toContain('artifact');
+      expect(kinds).toContain('log');
+    } else {
+      expect(kinds).toContain('artifact');
+    }
   });
 });
 ```
 
 Run: `npx vitest run src/runner/claude-code-runner.fixture.test.ts`
-Expected: PASS。**若失败，说明实现与真实 CLI 输出不符——修实现，不要改 fixture。**
+Expected: PASS。**若失败，说明实现与真实归档输出不符——修实现，不要改 fixture。**
 
 - [ ] **Step 7: 提交**
 
@@ -3574,6 +4171,10 @@ max_wall_time_ms: 1800000
 ```yaml
 id: simple_dev
 start: pm_analyze
+# 注意：Phase 1 所有节点 isolate 一律为 false。
+# 原因：本阶段还没有"合并"能力，若 dev 在 worktree 里写代码，跑完 worktree 会被回收，
+# 代码即丢失，随后 qa_verify（在主工作区运行）看不到任何改动，闭环就断了。
+# worktree 隔离必须与合并能力一起引入，属于 Phase 2。
 nodes:
   - id: pm_analyze
     title: 需求分析
@@ -3588,7 +4189,7 @@ nodes:
     consumes:
       - requirement
     produces: code_diff
-    isolate: true
+    isolate: false
 
   - id: qa_verify
     title: 测试验证
@@ -3966,7 +4567,9 @@ git commit -m "feat: 新增角色与工作流配置加载"
 
 - [ ] **Step 1: 实现 `src/kernel/scheduler.ts`**
 
-**关于本步骤不走"先写测试"的说明**：`scheduler.ts` 只是一层 git 命令包装（`git worktree add` / `remove`）加上一条非 git 仓库的退化路径，本身不含业务决策逻辑。它的行为在 Step 2 的 `kernel.test.ts` 中通过完整流转被间接覆盖（测试用的仓库未初始化 git，走的正是退化路径）。因此这里先实现、后由集成测试覆盖；若你希望更严格，可在本步骤前补一个只针对退化路径的单测。
+**关于本步骤不走"先写测试"的说明**：`scheduler.ts` 是一层 git 命令包装（`git worktree add` / `remove`）加上非 git 仓库的退化路径，本身不含业务决策逻辑。
+
+**同时注意一个诚实的事实**：Phase 1 的 `simple_dev.yaml` 里所有节点都是 `isolate: false`（见 Task 11 的说明），所以 `createWorktree` 那条分支**在本阶段的集成测试里不会被走到**。它现在是为 Phase 2 预置的骨架。若你希望它在 Phase 1 就被验证，可在本步骤前补一个专门的单测：在临时目录 `git init` + 一次提交，然后断言 `prepareWorkspace({isolate: true})` 返回 `createdWorktree === true` 且目录存在。
 
 ```ts
 import { execFileSync } from 'node:child_process';
@@ -4785,7 +5388,7 @@ git commit -m "feat: 新增调度器与内核主循环，实现三角色串行�
 | `GET` | `/api/tasks/:taskId` | 返回该任务的投影状态 |
 | `GET` | `/api/tasks/:taskId/events` | 返回该任务的原始事件流 |
 | `GET` | `/api/health` | 健康检查 |
-| `WS` | `/ws` | 推送 `{ type: 'event', event }` 与 `{ type: 'task_state', state }` |
+| `WS` | `/ws` | Phase 1 实际只推 `{ type: 'task_state', state }` 与 `{ type: 'task_error', taskId, message }`。**`{ type: 'event' }` 无广播点**（内核无事件订阅接口），为 Phase 2 预留 |
 
 - [ ] **Step 1: 写失败的测试 `src/server/server.test.ts`**
 
@@ -4833,6 +5436,9 @@ const REQUIREMENT = {
 let closers: Array<() => Promise<void>> = [];
 
 afterEach(async () => {
+  // POST /api/tasks 会异步触发 runTask；等它落地再关服务与事件库，
+  // 否则出现"数据库已关闭"的偶发失败
+  await new Promise((resolve) => setTimeout(resolve, 50));
   for (const close of closers) await close();
   closers = [];
 });
@@ -4861,6 +5467,23 @@ function boot() {
     store.close();
   });
   return { server, kernel };
+}
+
+/**
+ * 通过 HTTP 创建任务并返回 taskId。
+ * 必须走 POST：只有它会在服务层登记 knownTaskIds / taskSummaries，
+ * 直接用 kernel.startTask 建出来的任务，HTTP 读取接口一律返回 404。
+ */
+async function postTask(
+  server: ReturnType<typeof boot>['server'],
+  title = '自动流转',
+): Promise<string> {
+  const res = await server.app.inject({
+    method: 'POST',
+    url: '/api/tasks',
+    payload: { title, requirementRaw: '让角色自动流转' },
+  });
+  return (res.json() as { taskId: string }).taskId;
 }
 
 describe('HTTP API', () => {
@@ -4893,11 +5516,11 @@ describe('HTTP API', () => {
   });
 
   it('GET /api/tasks/:id 返回投影状态', async () => {
-    const { server, kernel } = boot();
-    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    const { server } = boot();
+    const taskId = await postTask(server);
     const res = await server.app.inject({ method: 'GET', url: `/api/tasks/${taskId}` });
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toMatchObject({ taskId, status: 'active' });
+    expect(res.json()).toMatchObject({ taskId });
   });
 
   it('GET 未知任务返回 404', async () => {
@@ -4907,17 +5530,18 @@ describe('HTTP API', () => {
   });
 
   it('GET /api/tasks/:id/events 返回原始事件流', async () => {
-    const { server, kernel } = boot();
-    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    const { server } = boot();
+    const taskId = await postTask(server);
     const res = await server.app.inject({ method: 'GET', url: `/api/tasks/${taskId}/events` });
     expect(res.statusCode).toBe(200);
-    const body = res.json() as { events: unknown[] };
-    expect(body.events.length).toBe(1);
+    const body = res.json() as { events: Array<{ type: string }> };
+    expect(body.events[0]?.type).toBe('task.created');
+    expect(body.events.length).toBeGreaterThan(1);
   });
 
   it('GET /api/tasks 返回任务列表', async () => {
-    const { server, kernel } = boot();
-    kernel.startTask({ title: 'A', requirementRaw: 'r', baseBranch: 'main' });
+    const { server } = boot();
+    await postTask(server, 'A');
     const res = await server.app.inject({ method: 'GET', url: '/api/tasks' });
     expect(res.statusCode).toBe(200);
     const body = res.json() as { tasks: Array<{ title: string }> };
@@ -5088,17 +5712,27 @@ process.on('SIGINT', () => void shutdown());
 process.on('SIGTERM', () => void shutdown());
 ```
 
-- [ ] **Step 6: 手工冒烟验证服务能起来**
+- [ ] **Step 6: 手工冒烟验证服务能起来（⚠️ 不要触发真实 agent）**
+
+**先读这条警告**：`main.ts` 接的是 `createClaudeCodeRunner`，`repoPath` 是 `process.cwd()`，而 `simple_dev` 的 `dev_implement` 节点 `owns` 非空 → 内核会把它判为**可写**角色 → runner 给它的权限是 `--permission-mode acceptEdits --tools=...,Edit,Write,Bash`，**且 cwd 就是本项目根目录**。也就是说：**一次 `POST /api/tasks` 会真的启动全链路 agent，并可能直接改写本仓库的工作区文件**，同时真实消耗额度。
+
+因此冒烟**只验证服务层**，不要走真实 agent。用 `AGENTFLOW_CLAUDE_BIN` 指向一个不存在的可执行文件，让真实调用必然失败（spawn error 路径）——这样既不花钱，也不会让 agent 碰到工作区：
 
 ```bash
-npx tsx src/main.ts &
+AGENTFLOW_CLAUDE_BIN=/nonexistent/claude npx tsx src/main.ts &
 sleep 2
 curl -s http://127.0.0.1:8787/api/health
-curl -s -X POST http://127.0.0.1:8787/api/tasks -H 'Content-Type: application/json' -d '{"title":"冒烟","requirementRaw":"验证服务可用"}'
+# 缺必填字段：必须返回 400（这条不会建任务、不会触发 agent）
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8787/api/tasks \
+  -H 'Content-Type: application/json' -d '{"title":"只有标题"}'
 kill %1
 ```
 
-Expected: `/api/health` 返回 `{"ok":true}`；POST 返回 `{"taskId":"task_..."}`
+Expected: `/api/health` 返回 `{"ok":true}`；缺字段的 POST 返回 `400`。
+
+**若你确实想验证「建任务 → 异步推进」这条路**，请**同时**做三件事：① 在**一个临时空 git 仓库**里跑（不要在本项目根目录）② 设 `AGENTFLOW_CLAUDE_BIN=/nonexistent/claude` 使真实调用必失败（验证的是「失败被正确记录为 node.failed」，不是真实产出）③ 确认 `git status` 干净。
+
+**真实端到端（会花钱、会动文件）只在 Task 15 做**，且必须在受控目标仓库里进行。
 
 - [ ] **Step 7: 提交**
 
@@ -5368,7 +6002,7 @@ export function openEventSocket(onMessage: (message: unknown) => void): WebSocke
 - [ ] **Step 7: 创建 `web/src/App.tsx`**
 
 ```tsx
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import {
   createTask,
   getTask,
@@ -5419,7 +6053,7 @@ export function App() {
     return () => clearInterval(timer);
   }, [selectedId, refreshDetail]);
 
-  async function handleSubmit(event: React.FormEvent): Promise<void> {
+  async function handleSubmit(event: FormEvent): Promise<void> {
     event.preventDefault();
     if (!title.trim() || !requirement.trim()) return;
     setSubmitting(true);
@@ -5609,12 +6243,29 @@ bash tests/e2e/smoke.sh
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ⚠️ 安全前提：端到端会真实启动 agent，而 simple_dev 的 dev_implement 拥有写权限
+# （owns 非空 → acceptEdits + Edit/Write/Bash）。若在 AgentFlow 仓库里跑，agent 会
+# 直接改写本项目的工作区。因此必须在一个**独立的临时 git 仓库**里跑：
+# 让 AgentFlow 的 cwd（= 内核的 repoPath）落在这个临时仓库，而配置仍指向 AgentFlow 自己的 config。
+AGENTFLOW_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+
+TARGET_REPO="$(mktemp -d /tmp/agentflow-e2e-target-XXXXXX)"
+cd "$TARGET_REPO"
+git init -q
+git -c user.email=e2e@local -c user.name=e2e commit -q --allow-empty -m "初始提交"
+echo "# 端到端目标仓库" > README.md
+
 HOST="127.0.0.1"
 PORT="${AGENTFLOW_PORT:-8787}"
 BASE="http://${HOST}:${PORT}"
 
+echo "==> 目标仓库：$TARGET_REPO"
 echo "==> 启动 AgentFlow"
-npx tsx src/main.ts > /tmp/agentflow-e2e.log 2>&1 &
+AGENTFLOW_CONFIG_DIR="$AGENTFLOW_ROOT/config" \
+AGENTFLOW_DB_PATH="$TARGET_REPO/data/e2e.sqlite" \
+AGENTFLOW_LOG_DIR="$TARGET_REPO/logs" \
+AGENTFLOW_WORKSPACE_DIR="$TARGET_REPO/workspaces" \
+  npx tsx "$AGENTFLOW_ROOT/src/main.ts" > /tmp/agentflow-e2e.log 2>&1 &
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
 
@@ -5630,7 +6281,7 @@ curl -sf "${BASE}/api/health" > /dev/null || { echo "服务未能启动，日志
 echo "==> 创建任务"
 TASK_ID=$(curl -s -X POST "${BASE}/api/tasks" \
   -H 'Content-Type: application/json' \
-  -d '{"title":"E2E 冒烟","requirementRaw":"在本仓库新增一个 scripts/hello.sh，执行后输出 hello agentflow。附带一句使用说明到 README.md。"}' \
+  -d '{"title":"E2E 冒烟","requirementRaw":"在目标仓库新增一个 scripts/hello.sh，执行后输出 hello agentflow。附带一句使用说明到 README.md。"}' \
   | sed -n 's/.*"taskId":"\([^"]*\)".*/\1/p')
 
 echo "任务 id：${TASK_ID}"
@@ -5655,8 +6306,16 @@ echo "==> 事件类型统计"
 curl -s "${BASE}/api/tasks/${TASK_ID}/events" \
   | grep -o '"type":"[^"]*"' | sort | uniq -c | sort -rn
 
-echo "==> 原始日志文件"
-ls -la logs/runs/ 2>/dev/null || echo "（未找到 logs/runs 目录）"
+echo "==> log_ref 是否真的指向存在的文件（Task 12/13 未在单测里覆盖的这一环在此补验）"
+for ref in $(curl -s "${BASE}/api/tasks/${TASK_ID}/events" | grep -o '"log_ref":"[^"]*"' | sed 's/.*:"//;s/"$//' | sort -u); do
+  if [ -f "$ref" ]; then echo "  OK   $ref"; else echo "  MISS $ref"; fi
+done
+
+echo "==> 目标仓库是否被 agent 改动（隔离是否生效）"
+git -C "$TARGET_REPO" status --short || true
+
+echo "==> 本仓库是否保持干净（不应被 agent 触碰）"
+git -C "$AGENTFLOW_ROOT" status --short || true
 
 echo "==> 判定"
 if echo "$STATE" | grep -q '"status":"completed"'; then

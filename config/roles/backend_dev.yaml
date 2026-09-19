@@ -1,0 +1,14 @@
+id: backend_dev
+display_name: 后端开发
+system_prompt_ref: prompts/backend_dev.md
+inputs:
+  - requirement
+outputs:
+  - code_diff
+owns:
+  - "src/**"
+reads:
+  - "docs/**"
+model: sonnet
+max_retries: 2
+max_wall_time_ms: 1800000

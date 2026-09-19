@@ -295,7 +295,7 @@ system_prompt_ref: prompts/backend_dev.md
 inputs:  [design, work_package_plan]
 outputs: [code_diff]
 scope:
-  owns:  ["src/server/**"]      # 硬约束：不许改 owns 之外的路径
+  owns:  ["src/server/**"]      # 设计意图：不许改 owns 之外的路径（Phase 1 未实现强制，见下方注）
   reads: ["docs/**", "src/shared/**"]
 tools: [read, edit, write, bash]
 budget: { max_tokens: 200000, max_wall_time_ms: 1800000, max_retries: 2 }
@@ -303,6 +303,14 @@ triggers:
   - on: wp.declared
     when: "wp.layer == 'backend'"
 ```
+
+> **Phase 1 实现修正（2026-09-19 终审同步，绑定权威）**：`owns` 在 Phase 1 **零强制**，上一行注释里的「不许改」名不副实。
+> 实况：`owns` **不作为**路径级强制。它只有两个作用：① 拼进 prompt 的硬约束段落（`src/kernel/context-assembler.ts`）；
+> ② 以 `role.owns.length === 0` 粗粒度决定该角色是否只读（`src/kernel/kernel.ts` → runner 走只读分支还是可写分支）。
+> **对可写角色而言，CLI 层是全量放行的**（`--allowed-tools` 不含任何按路径的约束，见 §11.3）；内核层**无变更路径核对**，`artifact.invalidated` 事件**全仓无生产者**。
+> 端到端已实测越界：`config/roles/backend_dev.yaml` 的 `owns` 是 `["src/**"]`，而 agent 真实写了 `README.md` 与 `scripts/hello.sh`，
+> 任务仍正常 `completed`。**路径级强制（调度前占用检查 + 越界写记 `artifact.invalidated`）属 Phase 2**；
+> 在此之前 `owns` 只是提示词层面的建议，**不得当作安全边界**。
 
 ### 7.3 默认组织架构（完整公司）
 
@@ -605,6 +613,36 @@ type RunnerEvent =
 - 无 `structuredOutput` → 用 prompt 强约束 + JSON 提取容错 + zod 校验失败即重试一次
 - 无 `budgetCap` → 由内核的 `budget` 模块记账，超限时主动 `cancel`
 
+> **实测修正（2026-09-18，两轮实测，结论已反转一次，以本条为准）**
+>
+> 第一轮探针（**凭据耗尽期，所有请求 403**）观测到：`--json-schema` 会让 claude CLI **永不退出**（空转 13 分钟、
+> 16,403 次 `You MUST call the StructuredOutput tool` 重试、CPU 45%~50%）。当时据此裁定「Phase 1 默认不传」。
+>
+> 第二轮补跑（**凭据恢复后，请求正常**）推翻了该裁定：
+> - **不传** `--json-schema`：rc=0，但模型把 JSON 包进 ```` ```json ```` 代码块 → `JSON.parse` 失败 → **零 artifact**（实测 29.3s / $0.1159）
+> - **传** `--json-schema`：rc=0、正常退出（实测 7.0s / 15.9s），`result.structured_output` 是 **CLI 校验过的对象**（$0.0507）
+> - 即「永不退出」**不是该参数本身的 bug**，而是**请求持续失败**时 stop hook 反复注入重试导致的空转。凭据正常时不复现
+>
+> **因此 Phase 1 的最终行为是：默认传 `--json-schema`**，且解析层**两条通道都读、`structured_output` 优先、`result` 内的 JSON 字符串兜底**
+> （只读 `structured_output` 会让未开启该参数的调用静默不产出；只读 `result` 会让开启后的调用静默不产出）。
+>
+> **超时必须保留**：「永不退出」那条路径依然真实存在，只是触发条件从「参数」变为「请求持续失败」。
+> 且必须**按进程组 kill** —— 只杀直接子进程会留下继承 stdout 管道写端的孙进程，导致 `close` 永不触发、保护自身挂死。
+>
+> 连带结论（两轮均成立）：
+> 1. **失败判定必须用 `is_error`，不能用 `subtype`** —— 认证失败时 `subtype` 仍为 `"success"`；
+> 2. **解析层不得做字段白名单** —— 真实事件字段远多于文档样本；
+> 3. **`wallTimeMs` 必须被强制实施（超时即 kill 进程组）**；
+> 4. `-p` 搭配 `--output-format stream-json` 必须同时给 `--verbose`，否则无输出。
+>
+> 证据、可复现命令与两轮对照实测表见 `spikes/cli-probe/README.md`；真实成功样本已归档为 `tests/fixtures/claude-stream-structured-sample.jsonl`。
+>
+> **这条反转留一个方法论教训**：第一轮的观测环境是「所有请求都失败」，因此**无法区分**「参数本身有问题」与「参数与失败的请求路径交互不良」。
+> 单环境实测不足以支撑「禁用某能力」这类结论。
+
+> **另一条实测局限**：`--tools` / `--allowed-tools` **不约束 MCP 工具**，因此 11.3「角色权限即沙箱参数」的保证弱于本文档原意；
+> 另本机 claude 走第三方代理且所有模型映射为同一模型，11.4 的「交叉引擎评审」在本机可能退化为同模型互评。
+
 ### 11.3 角色权限即沙箱参数
 
 **安全由 CLI 强制，不靠提示词自觉。**
@@ -616,6 +654,26 @@ type RunnerEvent =
 | 测试（qa_engineer） | `--allowed-tools "Read,Grep,Glob,Bash"` | `-s workspace-write` |
 | 评审（codex 内置） | — | `codex review --base agentflow/<task>/<wp>` |
 | 发布（devops） | 高风险动作**必须 G3 批准后**才执行 | `danger-full-access` 仅限人工批准后 |
+
+> **Phase 1 实现修正（2026-09-19 终审同步，绑定权威）**：上表是设计意图，**Phase 1 的实际实现已偏离**。
+> 实况如下（代码见 `src/runner/claude-code-runner.ts` 的 `buildArgs`，其注释、计划文档 Task 10 段均已如实标注，
+> 本节此前是唯一未同步的一处）：
+>
+> 1. **可写角色的实际参数** = `--permission-mode acceptEdits`
+>    + `--tools=Read,Edit,Write,Grep,Glob,Bash`
+>    + `--allowed-tools 'Bash(sh:*),Bash(bash:*),Bash(chmod:*),Bash(git:*),Bash(node:*),Bash(npm:*)'`（**六前缀**）。
+>    qa_engineer **未单独收窄**，与 dev 用同一组参数；上表给 dev 的 `Bash(npm:*)` 窄授权、给 qa 的 `Read,Grep,Glob,Bash` 均**未落地**。
+> 2. **`Bash(sh:*)` / `Bash(bash:*)` 等价于任意命令执行**：`bash -c "<任意命令>"` 完全落在前缀内，
+>    故 `git push --force` / `rm -rf` / `curl … | sh` 都能绕过前缀限制 —— 前缀白名单实际只约束**不包 shell 的调用**（agent 直接写
+>    `npm test` 会被约束，写成 `bash -c 'npm test'` 就不会）。即「精准预授权」在能力层面**已退化为「全量放行」**，
+>    这是满足 dev/qa prompt「真实运行 .sh 脚本」的必要代价，收窄属 Phase 2 决策。
+> 3. **`Bash(git:*)` / `Bash(npm:*)` 的授权面同样过宽**：含 `push --force` / `reset --hard` / `publish` 等破坏性操作。
+>    Phase 1 的目标仓库是临时目录尚可控，**真实项目使用前必须收窄**（如 `Bash(npm test:*)` / `Bash(npm run:*)`）。
+> 4. **只读角色未被放宽**（仍 `default` + `Read,Grep,Glob`，无任何 Bash 预授权；也未使用用户已否决的
+>    `--dangerously-skip-permissions`，有测试断言把守），但 `--tools` **不约束 MCP 工具**，故其「只读」在 CLI 层并非 airtight
+>    （未加 `--strict-mcp-config` / `--disallowed-tools`）。
+> 5. 因此本节标题的主张「**安全由 CLI 强制，不靠提示词自觉**」在 Phase 1 **只能算部分成立**：
+>    文件编辑边界确由 CLI 强制，命令执行边界则已被前缀白名单实质放宽；完整落地需 Phase 2 收窄前缀或引入真正的沙箱。
 
 ### 11.4 交叉引擎评审（调度时动态选择）
 
@@ -680,6 +738,12 @@ type RunnerEvent =
 ### 13.2 实时通道
 
 - **WebSocket** 推送三类消息：`event`（状态变更，驱动 DAG 刷新）、`log_chunk`（日志流）、`heartbeat`（连接保活）
+
+  > **Phase 1 实现修正**：实际只实现两类 —— `task_state`（任务终态快照）与 `task_error`。
+  > **`{ type: 'event' }` 在 Phase 1 无触发点**：内核的 `runTask` 没有事件订阅/回调接口，Server 层无法感知节点级事件，
+  > 因此它当前是死代码。它保留在端点表里是为 Phase 2 预留（内核加订阅回调时启用）。
+  > 同理 `log_chunk` 的流式推送也需等内核暴露日志订阅才可用。
+  > **前端在 Phase 1 靠轮询 `GET /api/tasks/:id` 兜住实时性**（Task 14 即如此实现）。
 - HTTP 端点只用于**动作**：G3 审批、暂停/恢复/取消任务
 - **前端完全只读**（除审批动作外），不含任何流程逻辑
 
@@ -754,7 +818,7 @@ DAG 泳道图是核心。要看一眼就明白：
 | 网络暴露 | HTTP/WS **仅绑定 127.0.0.1**，无鉴权需求 |
 | 能力边界 | 角色权限由 CLI 沙箱参数强制（见 11.3），不靠提示词 |
 | 危险动作 | `danger-full-access` / 部署类操作必须经 G3 人工批准才执行 |
-| 工作区安全 | 每个工作包独占 worktree；`owns` 之外的路径写入视为违规，记 `artifact.invalidated` |
+| 工作区安全 | 每个工作包独占 worktree；`owns` 之外的路径写入视为违规，记 `artifact.invalidated`。**Phase 1 实现修正（2026-09-19 终审）：未实现路径级强制** —— `owns` 仅作为 prompt 提示（CLI 层全量放行、内核层无变更路径核对、`artifact.invalidated` 无生产者），且 Phase 1 所有节点 `isolate: false`、worktree 隔离未启用；占用检查与越界记录属 Phase 2，详见 §7.2 的注 |
 
 ---
 
