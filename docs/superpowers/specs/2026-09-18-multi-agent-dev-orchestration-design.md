@@ -302,8 +302,12 @@ system_prompt_ref: prompts/backend_dev.md
 inputs:  [design, work_package_plan]
 outputs: [code_diff]
 scope:
-  owns:  ["src/server/**"]      # 设计意图：不许改 owns 之外的路径（Phase 1 未实现强制，见下方注）
+  owns:  ["src/server/**"]      # 允许写入的路径（写边界）：越界写会被内核检出并记为违规（见下方注）
   reads: ["docs/**", "src/shared/**"]
+# 角色自解释的三类字段（配置必填，加载后经 API 可读），使"该做什么/不该做什么/怎样算做完"不再只存在于 prompt 散文里
+responsibilities: ["按验收标准在 owns（src/server/**）内完成实现，产出 code_diff", "提交前真实运行一次自测"]
+prohibitions:    ["不得写入 owns 之外的路径", "不得修改 tests/** 与工作流/角色配置"]
+done_criteria:   ["已产出 code_diff 且通过 JSON Schema 校验", "self_test_result 为真实运行结果", "files_changed 全部落在 owns 之内"]
 tools: [read, edit, write, bash]
 budget: { max_tokens: 200000, max_wall_time_ms: 1800000, max_retries: 2 }
 triggers:
@@ -311,13 +315,20 @@ triggers:
     when: "wp.layer == 'backend'"
 ```
 
-> **Phase 1 实现修正（2026-09-19 终审同步，绑定权威）**：`owns` 在 Phase 1 **零强制**，上一行注释里的「不许改」名不副实。
-> 实况：`owns` **不作为**路径级强制。它只有两个作用：① 拼进 prompt 的硬约束段落（`src/kernel/context-assembler.ts`）；
-> ② 以 `role.owns.length === 0` 粗粒度决定该角色是否只读（`src/kernel/kernel.ts` → runner 走只读分支还是可写分支）。
-> **对可写角色而言，CLI 层是全量放行的**（`--allowed-tools` 不含任何按路径的约束，见 §11.3）；内核层**无变更路径核对**，`artifact.invalidated` 事件**全仓无生产者**。
-> 端到端已实测越界：`config/roles/backend_dev.yaml` 的 `owns` 是 `["src/**"]`，而 agent 真实写了 `README.md` 与 `scripts/hello.sh`，
-> 任务仍正常 `completed`。**路径级强制（调度前占用检查 + 越界写记 `artifact.invalidated`）属 Phase 2**；
-> 在此之前 `owns` 只是提示词层面的建议，**不得当作安全边界**。
+> **实现现状（2026-09-19，Task 1/2 + Task 7/8 同步，绑定权威）**：
+> 1. **契约唯一来源**：角色的 `inputs`/`outputs` 是**权威**声明；工作流节点的 `consumes`/`produces` 由它们**派生**。
+>    加载期逐个节点与角色核对（`src/config/loader.ts`），冲突即报错并**指明角色 id、节点 id、冲突字段**，不静默取一边。
+> 2. **角色自解释**：`responsibilities` / `prohibitions` / `done_criteria` 在配置 schema 中为**必填**（中文校验错误），
+>    加载后经 `GET /api/roles` / `GET /api/roles/:id` 可读。
+> 3. **`owns` 已是路径级强制（不再只是提示）**：内核在节点结束后按其工作区**实际变更路径**
+>    （`git status --porcelain --untracked-files=all`，**覆盖未跟踪新文件**）核对 `owns`，越界即落 `artifact.invalidated`
+>    （附越界路径清单）并把节点判为 `failed`（分类 `permission_denied`）——**越界产物作废、任务不静默继续**；
+>    调度**之前**还会做批次内 `owns` 重叠检查（含通配前缀重叠），重叠时按 `AGENTFLOW_BATCH_CONFLICT_POLICY`
+>    改为串行或拒绝。实现见 `src/kernel/path-guard.ts` + `src/kernel/kernel.ts`。
+> 4. **历史注记（已被取代）**：早期 Phase 1 中 `owns` **零强制**（仅作 prompt 提示，CLI 层对可写角色全量放行、
+>    `artifact.invalidated` 无生产者），端到端曾实测越界写 `README.md` / `scripts/hello.sh` 而任务仍 `completed`。
+>    该状态已被第 3 条取代。**边界提示**：CLI 沙箱层仍不按路径收窄（见 §11.3），`owns` 强制发生在**内核层**
+>    （执行后核对 + 产物作废 + 越界改动不被合并）。
 
 ### 7.3 默认组织架构（完整公司）
 
@@ -458,6 +469,20 @@ deps(wp).status                  # 该工作包的上游依赖状态
 
 **刻意不做通用脚本**：转移条件是一个受限求值器，不是可执行代码。这排除了"流程逻辑本身变成 bug 来源"这一整类问题。
 
+> **实现现状（2026-09-19，Task 2 + Task 4 同步）——工作流即可读说明书、决策结构化**：
+> - **节点自解释**：节点声明 `description`（在流程中的职责）与 `entry_condition`（进入条件，起始节点为"任务开始即进入"）。
+> - **边自解释**：边声明 `description`（在什么情况下、为什么走它）与 `on_missing`（条件不满足时的失败语义：
+>   `fail`=判定任务失败；`wait`=保持等待，**供 join 语义使用**）。二者在配置 schema 中为**必填**。
+> - **契约派生**：节点的 `consumes`/`produces` 是**派生**字段，权威来源是角色的 `inputs`/`outputs`（见 §7.2）。
+> - **`decideNext` 返回结构化、可解释结果**：不再是单个 `nodeId`，而是**被激活节点集合**（`nodeIds[]`，支持 fan-out
+>   同时激活多条出边指向的目标）+ **被选中的边** + **未选中的边及各自原因**；「无法推进」明确区分
+>   `wait`（仍有节点在运行）与 `end/failed`（无条件满足）。无可用转移时，失败原因**同时**给出未满足的条件、
+>   相关产物的实际状态与**分类化原因**。
+> - **失败原因分类化**：失败事件带**稳定枚举**（`permission_denied` 权限被拒 / `timeout` 超时 /
+>   `invalid_payload` 载荷不合规 / `structured_output_retries_exhausted` 结构化输出重试耗尽 /
+>   `condition_unmet` 条件不满足 / `other` 其他）+ 中文说明，使界面**无需解析 CLI 原始文本**即可展示根因；
+>   原始 CLI 文本作为附加信息保留。实现见 `src/kernel/state-machine.ts`、`src/shared/events.ts`。
+
 ### 9.3 三层决策
 
 ```
@@ -476,6 +501,10 @@ deps(wp).status                  # 该工作包的上游依赖状态
 ```
 
 **LLM 决策器只能在受限枚举里选**，不能自由发明下一步。这保证了"灵活"与"可预测"的平衡。
+
+> **实现现状（2026-09-19，Task 4 同步）**：三层决策中**当前只落地第 ① 层（规则求值）**——
+> `decideNext` 做规则求值并返回结构化结果，`transfer.decided` 的 `decided_by` 恒为 `rule`。
+> 第 ② 层（LLM 兜底决策器）与第 ③ 层（G3 人工卡点）**尚未实现**（属后续阶段）。
 
 ### 9.4 防死锁机制
 
@@ -535,6 +564,32 @@ deps(wp).status                  # 该工作包的上游依赖状态
 ### 10.5 并行可视化
 
 DAG 用**横向泳道**展示并行分支，一眼看到"此刻 N 个 agent 在同时干活"，以及卡在哪个 join 上。
+
+> **实现现状（2026-09-19，Task 9/10/11/12 同步）——并发与隔离已落地**：
+> - **fan-out / join**：`decideNext` 支持**多出边同时激活**（一次返回多个就绪节点，`nodeIds[]` ↔ `selectedEdges[i]` 对齐）；
+>   join 由「有节点在运行时一律 `wait`」+ 主循环「只在无在途节点时才求解下一批次」共同保证——
+>   上游未全部进入终态前，join 节点不会启动。**落地形态是按边组织拓扑**（多条出边即扇出、多条入边即汇聚），
+>   上文 §10.2 的 `type: parallel` 声明式节点**尚未引入**。
+> - **并发上限**：主循环改为「就绪队列 + 在途集合 + `Promise.race`」，可同时推进多个就绪节点；
+>   **首次消费 `AGENTFLOW_GLOBAL_CONCURRENCY`**（`.env` → `env.globalConcurrency` → 内核，缺省 `4`；内核缺省为 `1`=串行）。
+>   超限节点**排队等待空位**，实际并发数不超过上限。
+> - **占用检查仍在批次启动之前**（§10.3 第 1 条已实现）：同批次节点 `owns` 重叠（**含通配前缀重叠**）时，按
+>   `AGENTFLOW_BATCH_CONFLICT_POLICY`（`serialize` 默认 / `reject`）把该批次**降为串行**或**拒绝**，并给出涉及的两个节点与重叠路径段。
+> - **worktree 隔离与确定性合并**：**显式 `isolate: true` 的节点**、**或可能真并发的批次**（占用检查后生效上限 ≥2 且批次数 ≥2）
+>   内的节点，各自运行在**独立 git worktree** 中（基于 HEAD + 主工作区当前未提交改动创建）；
+>   批次**全部结束后**按 `owns` 归属把各节点改动**确定性合并**回主工作区（因占用检查保证同批次 `owns` 互不相交，
+>   同一条路径至多一个所有者，无需三方合并）；**失败节点与越界路径的改动不被合并**；结束后回收 worktree。
+>   节点事件记录**改动路径清单与工作区标识**（`wp.merged` 记录合并结论），使"改动来自哪个节点"可追溯。
+>   实现见 `src/kernel/{state-machine,kernel,scheduler,merge,path-guard}.ts`。
+> - **串行等价性**：不产生多就绪节点时行为与改动前等价；`config/workflows/simple_dev.yaml` 保持**串行基线**
+>   （三节点直线、全 `isolate: false`），行为未变。
+> - **并行示例工作流**：`config/workflows/parallel_dev.yaml` —— PM 产出 `work_package_plan`（首次真正用上该产物类型）
+>   → 扇出两个开发节点（`owns` 分别 `src/module_a/**`、`src/module_b/**`，**互不相交**以通过占用检查）
+>   → join 到测试节点。**注意**：并行节点写不同模块目录，与 `simple_dev` 的 `backend_dev`（写整个 `src/**`）语义不同，
+>   这是**演示并行**用的流程。
+> - **仍未覆盖**：PM 工作包拆解质量的**自动保证**（拆得差并行度就低，需人工/G2 介入）；`serialization_key` 与
+>   warm worktree 池；`integrator` + `conflict_report` 的自动化冲突解决（当前靠"同批次 `owns` 不相交"从源头避免冲突）；
+>   每引擎并发上限（仅实现了全局上限）。
 
 ---
 
@@ -707,6 +762,9 @@ type RunnerEvent =
 | 取消 | kernel 持 pid，`cancel()` 先 SIGTERM，3s 后 SIGKILL；清理 worktree 与 lease |
 | 并发上限 | 全局并发 + 每引擎并发双上限（macOS 上大量并发进程有资源风险） |
 
+> **实现现状（2026-09-19，Task 10）**：**全局并发上限已实现并消费 `AGENTFLOW_GLOBAL_CONCURRENCY`**（缺省 4，超限排队）；
+> **每引擎并发上限尚未实现**。其余各行（Lease/心跳、预算准入、取消、幂等）仍属后续阶段。
+
 ---
 
 ## 12. 编排内核模块划分
@@ -825,7 +883,7 @@ DAG 泳道图是核心。要看一眼就明白：
 | 网络暴露 | HTTP/WS **仅绑定 127.0.0.1**，无鉴权需求 |
 | 能力边界 | 角色权限由 CLI 沙箱参数强制（见 11.3），不靠提示词 |
 | 危险动作 | `danger-full-access` / 部署类操作必须经 G3 人工批准才执行 |
-| 工作区安全 | 每个工作包独占 worktree；`owns` 之外的路径写入视为违规，记 `artifact.invalidated`。**Phase 1 实现修正（2026-09-19 终审）：未实现路径级强制** —— `owns` 仅作为 prompt 提示（CLI 层全量放行、内核层无变更路径核对、`artifact.invalidated` 无生产者），且 Phase 1 所有节点 `isolate: false`、worktree 隔离未启用；占用检查与越界记录属 Phase 2，详见 §7.2 的注 |
+| 工作区安全 | 每个工作包独占 worktree；`owns` 之外的路径写入视为违规，记 `artifact.invalidated`。**已实现（2026-09-19，Task 7/8/11）**：内核在节点结束后按工作区**实际变更路径**核对 `owns`，越界即记 `artifact.invalidated`（附越界清单）并把节点判为 `failed`；调度**之前**做批次内 `owns` 重叠检查（含通配前缀重叠），重叠时按 `AGENTFLOW_BATCH_CONFLICT_POLICY` 改为串行或拒绝；`isolate: true` 或可能真并发的批次在**独立 worktree** 中运行，批次结束后按 `owns` 归属**确定性合并**回主工作区。**边界**：CLI 层仍不按路径收窄（见 §11.3），`owns` 强制发生在内核层。详见 §7.2 的注 |
 
 ---
 
@@ -857,6 +915,10 @@ DAG 泳道图是核心。要看一眼就明白：
 
 **验收**：输入一个需求文本，三个角色自动串行流转完成，事件库能重放出完整过程。
 
+> **实现进展（2026-09-19）**：Phase 1 的串行闭环**已跑通**（端到端实测 `completed`，3/3 节点成功）。
+> 此外，原本列为 Phase 2 的**并行内核能力**（fan-out/join、并发上限、`owns` 路径级强制、worktree 隔离与合并）
+> 也已提前落地（见 §10 与下节 Phase 2 的实现进展）；`config/workflows/simple_dev.yaml` 仍是**串行基线**，行为未变。
+
 ### Phase 2：并行
 
 - 工作包拆解（`work_package_plan`）+ `owns` 占用检查
@@ -865,6 +927,17 @@ DAG 泳道图是核心。要看一眼就明白：
 - `integrator` 角色 + `conflict_report`
 
 **验收**：一个需求拆出 3 个工作包，3 条泳道并行跑，自动合并。
+
+> **实现进展（2026-09-19，Task 7–12）**：并行能力的**内核部分已落地**，但**范围小于本节原设计**，逐条对照：
+> - ✅ **已实现**：fan-out/join（按**边**组织拓扑，非 `type: parallel` 声明式节点）；并发执行与全局并发上限
+>   （消费 `AGENTFLOW_GLOBAL_CONCURRENCY`，超限排队）；调度前 `owns` 占用检查（含通配前缀重叠）；`owns` 越界检出与产物作废；
+>   worktree 隔离与**确定性合并**；并行示例工作流 `config/workflows/parallel_dev.yaml`。
+> - ⚠️ **部分/未实现**：`serialization_key` 强制串行；warm worktree **池**（当前每个隔离节点即时建、结束即回收）；
+>   `integrator` 角色与 `conflict_report`（当前靠"同批次 `owns` 不相交"从源头避免冲突，未做自动化冲突解决）；
+>   `type: parallel` 声明式节点语法；**PM 工作包拆解质量的自动保证**（`work_package_plan` 有 JSON Schema 强约束，
+>   但拆解质量仍靠人工评审，`parallel_dev` 是手工切好的示例）。
+> - 因此本节"3 个工作包 × 3 泳道 × 自动合并"的**完整验收**仍属 Phase 2 剩余工作；已可实现的是
+>   "手工声明的钻石拓扑 → 并发执行（不超上限）→ 隔离与合并 → join"这条链路。
 
 ### Phase 3：完整公司与卡点
 

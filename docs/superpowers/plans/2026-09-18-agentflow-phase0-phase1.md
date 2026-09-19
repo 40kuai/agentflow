@@ -24,6 +24,13 @@
 - 本阶段是**单引擎（claude-code）、串行**流程。并行、codex、卡点 G1–G3 均不属于本计划范围
 - **Artifact status 规则（2026-09-19 契约修复后）**：`status` 由**模型在结构化输出里给出**——每个 payload schema 内嵌 `status: ok | needs_changes | blocked`（带 `default('ok')`，兼容不含该字段的历史归档样本）；内核用 `parseArtifactPayload` 把它**提升为 Artifact 行的独立列**并写入 `artifact.created`，**不再写死 `'ok'`**。CLI 退出码为 0、载荷通过 zod 校验、产物写入成功，节点才算成功。工作流边条件 `artifacts.*.status == 'ok'` 因此真正生效：模型判 `blocked` / `needs_changes` → 该边不通过 → 任务落 `failed`，并在错误原因里带出未满足的条件与当前产物状态。**（修复前：内核写死 `ok`，模型的判断被静默吃掉，边条件形同恒真。）**
 - **本阶段所有工作流节点的 `isolate` 一律为 `false`**：Phase 1 没有合并能力，若在 worktree 里写代码，worktree 回收后代码即丢失，后续节点看不到改动，闭环就断了。worktree 隔离必须与合并能力一起引入，属于 Phase 2
+- **2026-09-19 修订（本计划范围之外、但已落地，如实标注）**：本计划最初把"并行"列为不属于本计划范围，并要求所有节点 `isolate: false`。
+  其后由规格 `.trae/specs/clarify-roles-and-flow/spec.md` 落地了**并行内核能力**：fan-out/join、并发执行与全局并发上限
+  （消费 `AGENTFLOW_GLOBAL_CONCURRENCY`，超限排队）、`owns` 路径级强制（越界检出 + 批次启动前占用检查）、
+  worktree 隔离与确定性合并，并新增并行示例工作流 `config/workflows/parallel_dev.yaml`。故：
+  - 上面"所有节点 `isolate: false`"仅**仍适用于 `simple_dev`（串行基线，行为不得改变）**；`isolate: true`（或可能真并发的批次）会在独立 worktree 中运行，批次结束后按 `owns` 归属合并回主工作区；
+  - 本计划的串行闭环验收（`simple_dev` 三角色串行）**行为未变**，仍作回归基线；
+  - codex、卡点 G1–G3 仍未实现，仍不属于已完成范围。
 
 ## 目录与文件结构
 
@@ -4236,6 +4243,10 @@ edges:
     when: "all(artifacts.code_diff.status == 'ok')"
 ```
 
+> **2026-09-19 修订**：上面注释里「worktree 隔离必须与合并能力一起引入，属于 Phase 2」已过时——
+> 合并能力（Task 11）与隔离均已落地。但**本步骤产出的 `simple_dev` 仍保持全部 `isolate: false`**，
+> 它是**串行等价性基线**，行为不得改变；并行示例见 `config/workflows/parallel_dev.yaml`。
+
 - [ ] **Step 8: 写失败的测试 `src/config/loader.test.ts`**
 
 ```ts
@@ -6414,7 +6425,12 @@ git commit -m "test: 新增端到端冒烟测试并记录 Phase 1 实测结果"
 
 ## 本阶段之后仍未做的事（属于后续阶段，不在本计划范围）
 
-- 并行：工作包拆解、`parallel` / `join` 节点、worktree 池、文件级 ownership、integrator 合并
+> **2026-09-19 修订**：`parallel` / `join`、worktree 隔离与合并、文件级 ownership（`owns` 强制）已由后续规格
+> `.trae/specs/clarify-roles-and-flow/spec.md` 落地（见开头「2026-09-19 修订」与 `记录.md`）。下表中它们已标注状态。
+
+- ~~并行：工作包拆解、`parallel` / `join` 节点、worktree 池、文件级 ownership、integrator 合并~~
+  → **已部分落地**：fan-out/join（按边组织）、worktree 隔离与**确定性合并**、`owns` 路径级强制、并行示例工作流 `parallel_dev.yaml`；
+  **仍未做**：PM 工作包拆解质量的自动保证、`serialization_key`、warm worktree **池**、`integrator` 角色 + `conflict_report`、每引擎并发上限
 - 完整角色集与 `full` / `lean` / `solo` profile
 - 卡点 G1 / G2 / G3 与人工审批队列
 - codex adapter 与交叉引擎评审
