@@ -280,7 +280,7 @@ export function livenessAgeMs(liveness: NodeLiveness | undefined, now: number): 
 // 任务级健康判定（D 项）
 // ---------------------------------------------------------------------------
 
-export type TaskHealthLabel = '健康' | '疑似停滞' | '已失败' | '已完成' | '等待中' | '无法判断';
+export type TaskHealthLabel = '健康' | '疑似停滞' | '已失败' | '已完成' | '已取消' | '等待中' | '无法判断';
 export type TaskHealthTone = 'ok' | 'run' | 'fail' | 'warn' | 'muted' | 'blocked';
 export type TaskHealth = { label: TaskHealthLabel; tone: TaskHealthTone; reason: string };
 
@@ -302,6 +302,13 @@ export function computeTaskHealth(args: {
   }
   if (status === 'completed') {
     return { label: '已完成', tone: 'ok', reason: '任务状态为 completed（已进入终态，已停止轮询）。' };
+  }
+  if (status === 'cancelled') {
+    return {
+      label: '已取消',
+      tone: 'warn',
+      reason: '任务已被人工取消（cancelled 终态）；在途节点的迟到结果不会翻转该状态。',
+    };
   }
 
   if (compat.kind === 'down') {

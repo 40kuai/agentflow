@@ -142,7 +142,7 @@ pre {
 }
 
 /* 关键：滚动容器里的 flex 子项不应被压缩。
-   否则带 overflow:hidden 的子项（如 .summary-bar）自动最小尺寸归 0，会被 flex-shrink 压成一条 2px 边框。 */
+   否则带 overflow:hidden 的子项（如状态条 / DAG 容器）自动最小尺寸归 0，会被 flex-shrink 压成一条 2px 边框。 */
 .main > * {
   flex-shrink: 0;
 }
@@ -661,18 +661,7 @@ pre {
   text-overflow: ellipsis;
 }
 
-/* ---------------------------------------------------------------- 汇总条 */
-
-.summary-bar {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-  gap: 1px;
-  background: var(--line);
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  overflow: hidden;
-  flex-shrink: 0;
-}
+/* ---------------------------------------------------------------- 二级 tab */
 
 .tabs {
   display: flex;
@@ -680,6 +669,23 @@ pre {
   border-bottom: 1px solid var(--line);
   padding-bottom: 6px;
   flex-wrap: wrap;
+}
+
+/* 二级 tab：默认弱化——顶层主体是状态条与流程视图，明细不该抢注意力 */
+.tabs-secondary {
+  border-bottom: 1px dashed var(--line);
+  padding-bottom: 5px;
+  margin-top: 4px;
+}
+
+.tabs-secondary .tab-btn {
+  font-size: 11px;
+  opacity: 0.85;
+}
+
+.tabs-secondary .tab-btn.active {
+  opacity: 1;
+  border-color: var(--accent);
 }
 
 .tab-dot {
@@ -1557,4 +1563,428 @@ mark.hit {
   background: var(--panel-2);
   border-radius: 0 4px 4px 0;
   font-size: 12px;
+}
+
+/* ---------------------------------------------------------------- 三层信息架构 */
+
+/* —— 第一层：任务卡片（状态点 + 一句话摘要 + 当前阶段）—— */
+
+.task-card-top .task-title {
+  flex: 1 1 auto;
+}
+
+.task-card-line {
+  font-size: 11.5px;
+  color: var(--text);
+}
+
+.task-card-stage {
+  display: flex;
+  gap: 5px;
+  align-items: baseline;
+  font-size: 11px;
+  min-width: 0;
+}
+
+.task-card-stage .stage-text {
+  color: var(--run);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* —— 第二层·上：状态条 —— */
+
+.status-bar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px 16px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--panel);
+  padding: 10px 12px;
+}
+
+.status-bar.tone-edge-run {
+  border-left-color: var(--run);
+}
+.status-bar.tone-edge-ok {
+  border-left-color: var(--ok);
+}
+.status-bar.tone-edge-fail {
+  border-left-color: var(--fail);
+}
+.status-bar.tone-edge-warn {
+  border-left-color: var(--warn);
+}
+
+.status-main {
+  display: flex;
+  gap: 22px;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  min-width: 0;
+}
+
+.status-stage .kv-value {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.status-detail {
+  font-size: 11px;
+  margin-top: 2px;
+  max-width: 46ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-chips {
+  display: inline-flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.status-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.confirm-row {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  font-size: 11.5px;
+}
+
+.status-note {
+  grid-column: 1 / -1;
+  font-size: 11.5px;
+}
+
+.btn-danger {
+  border-color: var(--fail);
+  color: var(--fail);
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: var(--fail-bg);
+}
+
+.status-failure {
+  grid-column: 1 / -1;
+  border-top: 1px dashed var(--line-strong);
+  padding-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.status-failure-head {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.status-failure-body {
+  font-size: 12px;
+}
+
+.status-failure-node {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+
+/* —— 第二层·中：流程视图（DAG）—— */
+
+.flow-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.flow-head {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.flow-head h3 {
+  margin: 0;
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-strong);
+}
+
+.dag-scroll {
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-2);
+  padding: 14px;
+  max-height: 480px;
+}
+
+.dag {
+  position: relative;
+}
+
+.dag-edges {
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+  overflow: visible;
+}
+
+.dag-edge {
+  fill: none;
+  stroke: var(--line-strong);
+  stroke-width: 1.6;
+}
+
+.dag-edge.is-taken {
+  stroke: var(--run);
+  stroke-width: 2;
+}
+
+.dag-arrow-head {
+  fill: var(--line-strong);
+}
+
+.dag-node {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--panel);
+  padding: 7px 8px;
+  overflow: hidden;
+}
+
+.dag-node.is-done {
+  background: var(--panel-2);
+}
+
+.dag-node.is-active {
+  border-color: var(--run);
+  box-shadow: 0 0 0 1px var(--run-bg), 0 0 12px rgba(53, 184, 224, 0.22);
+}
+
+.dag-node.is-failed {
+  border-color: var(--fail);
+  background: rgba(240, 85, 91, 0.06);
+}
+
+.dag-node.is-waiting {
+  border-style: dashed;
+  border-color: var(--warn);
+}
+
+.dag-node.is-cancelled {
+  opacity: 0.72;
+}
+
+.dag-node.is-stalled {
+  border-color: var(--warn);
+}
+
+.dag-node-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px;
+}
+
+.dag-node-title {
+  font-weight: 600;
+  color: var(--text-strong);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dag-node-sub {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10.5px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.dag-node-id {
+  font-size: 10.5px;
+}
+
+.dag-join-tag {
+  font-size: 9.5px;
+  padding: 0 4px;
+}
+
+.dag-node-metrics {
+  display: flex;
+  gap: 8px;
+  font-size: 10.5px;
+  color: var(--muted);
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.dag-strip {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 18px;
+  padding: 2px 5px;
+  border-radius: 3px;
+  font-size: 11px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.dag-strip b {
+  flex: 0 0 auto;
+}
+
+.dag-strip-fail {
+  background: var(--fail-bg);
+  color: #f6c0c3;
+}
+
+.dag-strip-fail b {
+  color: var(--fail);
+}
+
+.dag-strip-wait {
+  background: var(--warn-bg);
+  color: #f0d5a8;
+}
+
+.dag-strip-wait b {
+  color: var(--warn);
+}
+
+.dag-strip-run {
+  background: var(--run-bg);
+  color: #bfe6f5;
+}
+
+.dag-strip-run b {
+  color: var(--run);
+}
+
+.dag-strip-cancel {
+  background: var(--warn-bg);
+  color: #f0d5a8;
+}
+
+.dag-strip-idle {
+  color: var(--muted);
+}
+
+.dag-node-action {
+  position: absolute;
+  right: 6px;
+  bottom: 4px;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+
+.dag-node:hover .dag-node-action {
+  opacity: 1;
+}
+
+/* —— 角色面板（本次任务角色与花费 + 编辑）—— */
+
+.role-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.role-node-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 3px;
+}
+
+.role-editor {
+  display: grid;
+  grid-template-columns: minmax(200px, 260px) minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.role-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.role-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.role-form-head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.role-form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 8px;
+}
+
+.role-form-grid.two {
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+}
+
+/* 角色表单里的字段是「标签在上、输入框在下」的竖排（与日志工具栏的横排 .field 不同） */
+.role-form .field {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 3px;
+}
+
+.role-form .field textarea {
+  background: var(--panel-2);
+  border: 1px solid var(--line-strong);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 5px 7px;
+  font-size: 12px;
+  font-family: var(--mono);
+  resize: vertical;
+  width: 100%;
+}
+
+.role-form-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
 }

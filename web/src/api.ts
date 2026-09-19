@@ -46,6 +46,14 @@ export type TransferRecord = {
   to: string;
   reason: string;
   decidedBy: string;
+  /** 所用边；进入起始节点（无入边）时缺省 */
+  edge?: { from: string; to: string };
+  /** 条件表达式原文；无条件边或起始进入时为 null */
+  when?: string | null;
+  /** 该条件的人类可读说明（工作流边配置的 description 原文） */
+  edgeDescription?: string | null;
+  /** 判定依据：该次转移时相关产物的实际状态 */
+  artifactStatuses?: { type: string; status: string }[];
 };
 
 export type TaskState = {
@@ -211,6 +219,192 @@ export async function getRunLog(taskId: string, runId: string, tail: number): Pr
   return requestJson<LogTail>(
     `/api/tasks/${encodeURIComponent(taskId)}/runs/${encodeURIComponent(runId)}/log?${qs}`,
   );
+}
+
+// ---------------------------------------------------------------------------
+// 流转视图 / 角色 相关的契约类型（字段形状以 src/server/server.ts 的
+// buildFlowView / buildRoleUsage / roleView 为准，不在前端猜测）
+// ---------------------------------------------------------------------------
+
+/** 节点进入理由：来自 transfer.decided，回答「为什么走到这一步」 */
+export type FlowEnterReason = {
+  from: string;
+  reason: string;
+  edge: { from: string; to: string } | null;
+  when: string | null;
+  edgeDescription: string | null;
+  /** 判定依据：该次转移时相关产物的实际状态 */
+  artifactStatuses: { type: string; status: string }[];
+};
+
+/** 分类化的阻塞原因（来自 node.failed）：界面无需解析 CLI 原文即可展示根因 */
+export type BlockedReason = {
+  category: string | null;
+  label: string | null;
+  error: string;
+};
+
+export type FlowNode = {
+  id: string;
+  title: string;
+  role: string;
+  roleDisplayName: string | null;
+  description: string | null;
+  entryCondition: string | null;
+  consumes: string[];
+  produces: string | null;
+  isolate: boolean | null;
+  /** NodeRunStatus；未进入过的节点为 'not_started' */
+  status: string;
+  attempt: number;
+  /** 是否在 TaskState.currentNodeIds 里（并发时可能多个同时为 true） */
+  current: boolean;
+  enterReason: FlowEnterReason | null;
+  blockedReason: BlockedReason | null;
+  durationMs: number | null;
+  costUsd: number;
+  artifactTypes: string[];
+  invalidatedArtifactTypes: string[];
+  changedPaths: string[];
+  worktreePath: string | null;
+};
+
+export type FlowEdge = {
+  from: string;
+  to: string;
+  when: string | null;
+  description: string | null;
+  onMissing: 'fail' | 'wait' | null;
+};
+
+/** 任务级失败的结构化原因（来自最后一个 task.failed） */
+export type TaskFailure = {
+  reason: string;
+  category: string | null;
+  label: string | null;
+  unmetConditions: string[];
+  artifactStatuses: { type: string; status: string }[];
+};
+
+/** GET /api/tasks/:taskId/flow 的响应 */
+export type FlowView = {
+  taskId: string;
+  title: string;
+  status: string;
+  currentNodeIds: string[];
+  completedNodeIds: string[];
+  budgetUsedUsd: number;
+  nodes: FlowNode[];
+  edges: FlowEdge[];
+  transfers: TransferRecord[];
+  taskFailure: TaskFailure | null;
+};
+
+/** 角色在某任务中的一个节点用量 */
+export type RoleUsageNode = {
+  nodeId: string;
+  status: string;
+  produces: string | null;
+  artifactTypes: string[];
+  invalidatedArtifactTypes: string[];
+  attempt: number;
+  durationMs: number | null;
+  costUsd: number;
+};
+
+/** 某任务里一个角色的用量汇总（GET /api/tasks/:taskId/roles） */
+export type RoleUsage = {
+  roleId: string;
+  displayName: string | null;
+  model: string | null;
+  budget: { maxRetries: number; maxWallTimeMs: number } | null;
+  nodes: RoleUsageNode[];
+  totalDurationMs: number;
+  totalCostUsd: number;
+};
+
+export type TaskRoleUsage = {
+  taskId: string;
+  roles: RoleUsage[];
+  totalCostUsd: number;
+};
+
+/** 角色详情（GET /api/roles、GET /api/roles/:id、PUT /api/roles/:id 的 role 字段） */
+export type RoleView = {
+  id: string;
+  displayName: string;
+  systemPromptRef: string;
+  inputs: string[];
+  outputs: string[];
+  /** 允许写入的路径（写边界；空数组＝只读角色） */
+  owns: string[];
+  /** 允许读取的路径 */
+  reads: string[];
+  responsibilities: string[];
+  prohibitions: string[];
+  doneCriteria: string[];
+  model: string;
+  budget: { maxRetries: number; maxWallTimeMs: number };
+};
+
+/** PUT /api/roles/:id 的请求体（camelCase 形态） */
+export type RoleEditInput = {
+  displayName: string;
+  systemPromptRef: string;
+  inputs: string[];
+  outputs: string[];
+  owns: string[];
+  reads: string[];
+  responsibilities: string[];
+  prohibitions: string[];
+  doneCriteria: string[];
+  model: string;
+  maxRetries: number;
+  maxWallTimeMs: number;
+};
+
+/** POST /api/tasks/:taskId/cancel 的响应 */
+export type CancelTaskResult = {
+  /** true=本次真的取消了；false=任务已在终态，未做任何改动（reason 说明原因） */
+  cancelled: boolean;
+  reason?: string;
+  state: TaskState;
+};
+
+export async function getTaskFlow(taskId: string): Promise<FlowView> {
+  return requestJson<FlowView>(`/api/tasks/${encodeURIComponent(taskId)}/flow`);
+}
+
+export async function getTaskRoles(taskId: string): Promise<TaskRoleUsage> {
+  return requestJson<TaskRoleUsage>(`/api/tasks/${encodeURIComponent(taskId)}/roles`);
+}
+
+export async function listRoles(): Promise<RoleView[]> {
+  const body = await requestJson<{ roles?: RoleView[] }>('/api/roles');
+  return Array.isArray(body?.roles) ? body.roles : [];
+}
+
+export async function getRole(roleId: string): Promise<RoleView> {
+  return requestJson<RoleView>(`/api/roles/${encodeURIComponent(roleId)}`);
+}
+
+/** 编辑角色：后端校验失败时抛 ApiError（422 带中文原因，且不会落盘） */
+export async function updateRole(
+  roleId: string,
+  input: RoleEditInput,
+): Promise<{ role: RoleView; path: string }> {
+  return requestJson<{ role: RoleView; path: string }>(`/api/roles/${encodeURIComponent(roleId)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+}
+
+/** 取消任务。终态任务返回 cancelled=false（幂等），不会误报为"取消成功"。 */
+export async function cancelTask(taskId: string): Promise<CancelTaskResult> {
+  return requestJson<CancelTaskResult>(`/api/tasks/${encodeURIComponent(taskId)}/cancel`, {
+    method: 'POST',
+  });
 }
 
 export type SocketMessage =

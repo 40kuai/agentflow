@@ -1,14 +1,31 @@
-/** AgentFlow 内部管理台：诊断优先的运维控制台（三栏：任务列表 / 主区标签页） */
+/**
+ * AgentFlow 内部管理台（三层信息架构）。
+ *
+ * 顶层只回答两个问题：「现在怎么样」「我该做什么」，原始数据全部降到二级 tab：
+ *   左：任务列表（状态点 + 一句话摘要 + 当前阶段）
+ *   中上：状态条（当前阶段 / 活跃节点 / 花费 / 耗时 / 分类化失败原因 / 取消）
+ *   中中：流程视图（DAG：并发高亮、join 在等谁、失败原因直显）
+ *   下：二级 tab（节点明细 / 角色 / 日志 / 产物 / 事件）
+ *
+ * 数据来源分工：
+ *   - 列表与列表内的「当前阶段」：GET /api/tasks + 每个任务的 GET /api/tasks/:id/flow
+ *   - 选中任务的阶段与 DAG：GET /api/tasks/:id/flow（2 秒轮询，终态后停）
+ *   - 花费/耗时/节点级事实：事件流归集（aggregate.ts，复用既有实现）
+ *   - 运行中节点的活性：日志文件 mtime/size（liveness.ts，复用既有实现）
+ */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  cancelTask,
   createTask,
   getHealth,
   getTask,
   getTaskEvents,
+  getTaskFlow,
   listTasks,
   openEventSocket,
   type CreateTaskInput,
+  type FlowView,
   type KernelEvent,
   type TaskState,
   type TaskSummary,
@@ -16,19 +33,14 @@ import {
 import { aggregateTask, type NodeAggregate } from './aggregate';
 import { ArtifactView } from './components/ArtifactView';
 import { EventView } from './components/EventView';
+import { FlowView as FlowGraph } from './components/FlowView';
 import { LogViewer } from './components/LogViewer';
 import { NodeCostView } from './components/NodeCostView';
+import { RolePanel } from './components/RolePanel';
+import { StatusBar } from './components/StatusBar';
 import { TaskList } from './components/TaskList';
-import {
-  Badge,
-  Collapsible,
-  EmptyState,
-  HealthBadge,
-  PreBlock,
-  StatusBadge,
-  TimeAgo,
-} from './components/common';
-import { formatAbsoluteTime, formatDuration, formatUsd, shortId } from './format';
+import { Collapsible, EmptyState, HealthBadge, PreBlock, StatusBadge } from './components/common';
+import { formatAbsoluteTime, shortId } from './format';
 import {
   backendCompatibility,
   computeTaskHealth,
@@ -37,32 +49,42 @@ import {
   type NodeLiveness,
 } from './liveness';
 
-type TabId = 'nodes' | 'logs' | 'artifacts' | 'events';
+/** 二级 tab：默认「节点明细」，其余为日志/产物/事件等原始数据 */
+type TabId = 'nodes' | 'roles' | 'logs' | 'artifacts' | 'events';
 
 const POLL_DETAIL_MS = 2000;
 const POLL_LIST_MS = 5000;
+/** 列表内批量取流转视图的上限：防止任务很多时把后端打爆（超出部分在列表里显示「—」） */
+const LIST_FLOW_LIMIT = 20;
 
 function isTerminal(status: string | null | undefined): boolean {
-  return status === 'completed' || status === 'failed';
+  return status === 'completed' || status === 'failed' || status === 'cancelled';
 }
 
 export function App() {
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
   const [tasksError, setTasksError] = useState<string | null>(null);
+  /** 列表内每个任务的流转视图（供任务列表显示「当前阶段」） */
+  const [listFlows, setListFlows] = useState<Record<string, FlowView>>({});
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<TaskState | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
+  /** 选中任务的流转视图：状态条与 DAG 的唯一数据源 */
+  const [flow, setFlow] = useState<FlowView | null>(null);
+  const [flowError, setFlowError] = useState<string | null>(null);
   const [events, setEvents] = useState<KernelEvent[]>([]);
   const [eventsError, setEventsError] = useState<string | null>(null);
-  // 后端健康探测结果：包含能力集，用于区分「后端版本落后」与「日志确实不存在」
   const [backend, setBackend] = useState<BackendHealth>({ status: 'unknown' });
-  // 运行中节点的活性快照（日志文件 mtime/size），由轮询刷新
   const [liveness, setLiveness] = useState<Record<string, NodeLiveness>>({});
   const [wsStatus, setWsStatus] = useState<'connecting' | 'open' | 'closed'>('connecting');
   const [taskErrorMessage, setTaskErrorMessage] = useState<string | null>(null);
+  // 二级 tab：「流程 / 状态」是主体，明细默认不抢占注意力，但仍可一键到达
   const [tab, setTab] = useState<TabId>('nodes');
   const [logFocusNodeId, setLogFocusNodeId] = useState<string | null>(null);
   const [listTick, setListTick] = useState(0);
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelNotice, setCancelNotice] = useState<string | null>(null);
+  const [cancelError, setCancelError] = useState<string | null>(null);
 
   // nodes / liveness 用 ref 读，避免把每轮新对象放进轮询 effect 的依赖里造成重复拉取
   const nodesRef = useRef<NodeAggregate[]>([]);
@@ -77,10 +99,31 @@ export function App() {
     }
   }, []);
 
+  /**
+   * 刷新任务列表 + 列表内每个任务的流转视图（用于「当前阶段」）。
+   * 流转视图**逐个失败不影响整体**：单个任务取不到就留空，界面显示「—」。
+   */
   const refreshList = useCallback(async () => {
     try {
-      setTasks(await listTasks());
+      const list = await listTasks();
+      setTasks(list);
       setTasksError(null);
+
+      const targets = list.slice(0, LIST_FLOW_LIMIT);
+      const results = await Promise.all(
+        targets.map(async (task) => {
+          try {
+            return [task.taskId, await getTaskFlow(task.taskId)] as const;
+          } catch {
+            return [task.taskId, null] as const;
+          }
+        }),
+      );
+      const next: Record<string, FlowView> = {};
+      for (const [taskId, item] of results) {
+        if (item) next[taskId] = item;
+      }
+      setListFlows(next);
     } catch (err) {
       // 容错：保留上次数据，下一轮自愈
       setTasksError((err as Error).message);
@@ -93,6 +136,16 @@ export function App() {
       setDetailError(null);
     } catch (err) {
       setDetailError((err as Error).message);
+    }
+  }, []);
+
+  const refreshFlow = useCallback(async (taskId: string) => {
+    try {
+      setFlow(await getTaskFlow(taskId));
+      setFlowError(null);
+    } catch (err) {
+      // 流转视图不可用（404/503/网络）如实上报，界面据此退化为事件流口径
+      setFlowError((err as Error).message);
     }
   }, []);
 
@@ -157,7 +210,7 @@ export function App() {
     void refreshList();
   }, [listTick, refreshList]);
 
-  // 每次列表轮询都重新探测后端能力（A 项：启动与每次轮询都探测）
+  // 每次列表轮询都重新探测后端能力
   useEffect(() => {
     const timer = setInterval(() => {
       void refreshList();
@@ -170,35 +223,34 @@ export function App() {
   useEffect(() => {
     if (!selectedId) {
       setDetail(null);
+      setFlow(null);
       setEvents([]);
       setDetailError(null);
+      setFlowError(null);
       setEventsError(null);
       return;
     }
     void refreshDetail(selectedId);
+    void refreshFlow(selectedId);
     void refreshEvents(selectedId);
-  }, [selectedId, refreshDetail, refreshEvents]);
+  }, [selectedId, refreshDetail, refreshFlow, refreshEvents]);
 
   // 运行中每 2 秒轮询；进入终态后停止
-  const terminal = isTerminal(detail?.status);
+  const terminal = isTerminal(flow?.status ?? detail?.status);
   useEffect(() => {
     if (!selectedId || terminal) return;
     const timer = setInterval(() => {
       void refreshDetail(selectedId);
+      void refreshFlow(selectedId);
       void refreshEvents(selectedId);
     }, POLL_DETAIL_MS);
     return () => clearInterval(timer);
-  }, [selectedId, terminal, refreshDetail, refreshEvents]);
+  }, [selectedId, terminal, refreshDetail, refreshFlow, refreshEvents]);
 
   const aggregate = useMemo(() => aggregateTask(detail, events, Date.now()), [detail, events]);
 
   // 每次渲染都把最新节点列表交给 ref：轮询回调据此决定对哪些节点抓活性
   nodesRef.current = aggregate.nodes;
-
-  const failedNodes = useMemo(
-    () => aggregate.nodes.filter((node) => node.status === 'failed'),
-    [aggregate.nodes],
-  );
 
   // 运行中节点集合的稳定指纹：只有它变化时才重启活性轮询，避免每 2 秒重建定时器
   const runningKey = useMemo(
@@ -218,32 +270,35 @@ export function App() {
     return () => clearInterval(timer);
   }, [selectedId, terminal, runningKey, refreshLiveness]);
 
-  // 后端能力兼容性（缺能力 → 版本落后）+ 任务级健康判定（D 项）
   const compat = useMemo(() => backendCompatibility(backend), [backend]);
   const taskHealth = useMemo(
     () =>
       detail
         ? computeTaskHealth({
-            status: detail.status,
+            status: flow?.status ?? detail.status,
             nodes: aggregate.nodes,
             liveness,
             compat,
             now: Date.now(),
           })
         : null,
-    [detail, aggregate.nodes, liveness, compat],
+    [detail, flow, aggregate.nodes, liveness, compat],
   );
 
   const handleSelect = useCallback((taskId: string) => {
     setSelectedId(taskId);
     setDetail(null);
+    setFlow(null);
     setEvents([]);
     setDetailError(null);
+    setFlowError(null);
     setEventsError(null);
     setTaskErrorMessage(null);
     setLogFocusNodeId(null);
     setLiveness({});
-    // 切任务回到「节点与成本」：新任务未必有日志，留在「日志」标签会看到空态造成误解
+    setCancelNotice(null);
+    setCancelError(null);
+    // 切任务回到「节点明细」：不同任务的工作流可能不同，留在日志 tab 会看到空态造成误解
     setTab('nodes');
   }, []);
 
@@ -257,12 +312,33 @@ export function App() {
     [handleSelect, refreshList],
   );
 
+  const handleCancel = useCallback(async () => {
+    if (!selectedId || cancelling) return;
+    setCancelling(true);
+    setCancelNotice(null);
+    setCancelError(null);
+    try {
+      const result = await cancelTask(selectedId);
+      // 用后端返回的权威状态覆盖本地，避免"界面说取消了、事件库里其实没取消"
+      setDetail(result.state);
+      setCancelNotice(
+        result.cancelled
+          ? '已取消：任务进入 cancelled 终态，内核已通知终止在途 CLI 进程（已花费用不退回）。'
+          : (result.reason ?? '任务已在终态，未做任何改动。'),
+      );
+      await Promise.all([refreshFlow(selectedId), refreshEvents(selectedId), refreshList()]);
+    } catch (err) {
+      setCancelError((err as Error).message);
+    } finally {
+      setCancelling(false);
+    }
+  }, [selectedId, cancelling, refreshFlow, refreshEvents, refreshList]);
+
   const openLog = useCallback((nodeId: string) => {
     setLogFocusNodeId(nodeId);
     setTab('logs');
   }, []);
 
-  // 状态区派生值：后端可达性 + 能力兼容 + claude 进程（E 项）
   const claudeProcCount =
     backend.status === 'ok' ? (backend.info.claudeProcesses?.length ?? 0) : 0;
   const backendClass =
@@ -282,10 +358,13 @@ export function App() {
         ? `后端不可达：${backend.error}`
         : '正在探测后端能力…';
 
+  const failedNodeIds = (flow?.nodes ?? []).filter((node) => node.status === 'failed').map((n) => n.id);
+
   return (
     <div className="layout">
       <TaskList
         tasks={tasks}
+        flows={listFlows}
         selectedId={selectedId}
         error={tasksError}
         onSelect={handleSelect}
@@ -301,12 +380,12 @@ export function App() {
                 <span className="mono muted" title={detail.taskId}>
                   {shortId(detail.taskId, 28)}
                 </span>
-                <StatusBadge status={detail.status} />
+                <StatusBadge status={flow?.status ?? detail.status} />
                 <HealthBadge health={taskHealth} />
-                <Badge tone="muted">baseBranch {detail.baseBranch || 'main'}</Badge>
+                <span className="muted small">baseBranch {detail.baseBranch || 'main'}</span>
               </>
             ) : (
-              <h2>未选择任务</h2>
+              <h2>{selectedId ? '正在加载任务…' : '未选择任务'}</h2>
             )}
           </div>
           <div className="topbar-right">
@@ -331,7 +410,9 @@ export function App() {
                 claude 进程 {claudeProcCount} · 可能有孤儿残留
               </span>
             )}
-            <span className={`health health-${wsStatus === 'open' ? 'ok' : wsStatus === 'closed' ? 'down' : 'unknown'}`}>
+            <span
+              className={`health health-${wsStatus === 'open' ? 'ok' : wsStatus === 'closed' ? 'down' : 'unknown'}`}
+            >
               WS {wsStatus === 'open' ? '已连接' : wsStatus === 'closed' ? '已断开（自动重连）' : '连接中'}
             </span>
           </div>
@@ -344,19 +425,13 @@ export function App() {
           </div>
         )}
 
-        {taskHealth && (taskHealth.label === '疑似停滞' || taskHealth.label === '无法判断') && (
-          <div className="banner banner-warn">
-            <b>流程健康：{taskHealth.label}</b>
-            <span>{taskHealth.reason}</span>
-          </div>
-        )}
-
         {!selectedId && (
           <EmptyState>
             左侧选择一个任务，或填写标题 + 需求原文创建新任务。
             <br />
-            任务失败时优先看「日志」标签：对话视图能还原模型每一步，诊断视图会自动扫描权限拒绝、
-            <code>is_error</code>、<code>subtype</code> 与终局 <code>result</code>。
+            选中后从上到下依次是：<b>状态条</b>（现在怎么样 / 卡在哪 / 分类化失败原因）、
+            <b>流程视图</b>（谁在跑、谁在等谁、谁失败了）；日志 / 产物 / 事件等原始数据在下方二级
+            tab 里。
           </EmptyState>
         )}
 
@@ -370,101 +445,44 @@ export function App() {
               </div>
             )}
 
+            <StatusBar
+              flow={flow}
+              flowError={flowError}
+              aggregate={aggregate}
+              compat={compat}
+              taskHealth={taskHealth}
+              cancelling={cancelling}
+              cancelNotice={cancelNotice}
+              cancelError={cancelError}
+              onCancel={() => void handleCancel()}
+              onOpenLog={openLog}
+            />
+
+            <FlowGraph
+              flow={flow}
+              error={flowError}
+              liveness={liveness}
+              onOpenLog={openLog}
+            />
+
+            {!detail && !detailError && !flow && <EmptyState>正在加载任务详情…</EmptyState>}
+
             {detail && (
               <>
-                <div className="summary-bar">
-                  <div className="kv">
-                    <div className="kv-label">总花费</div>
-                    <div className="kv-value money">{formatUsd(detail.budgetUsedUsd)}</div>
-                  </div>
-                  <div className="kv">
-                    <div className="kv-label">节点进度</div>
-                    <div className="kv-value">
-                      {aggregate.nodes.filter((n) => n.status === 'succeeded').length}/
-                      {aggregate.nodes.length === 0 ? Object.keys(detail.nodes ?? {}).length : aggregate.nodes.length}
-                    </div>
-                  </div>
-                  <div className="kv">
-                    <div className="kv-label">任务状态</div>
-                    <div className="kv-value">
-                      <StatusBadge status={detail.status} />
-                    </div>
-                  </div>
-                  <div className="kv">
-                    <div className="kv-label">开始时间</div>
-                    <div className="kv-value">
-                      <TimeAgo ts={aggregate.taskStartedAt ?? detail.artifacts[0]?.created_at} />
-                    </div>
-                  </div>
-                  <div className="kv">
-                    <div className="kv-label">结束时间</div>
-                    <div className="kv-value">
-                      {aggregate.taskEndedAt ? <TimeAgo ts={aggregate.taskEndedAt} /> : <span className="muted">未结束</span>}
-                    </div>
-                  </div>
-                  <div className="kv">
-                    <div className="kv-label">总耗时</div>
-                    <div className="kv-value">
-                      {formatDuration(
-                        aggregate.taskStartedAt
-                          ? (aggregate.taskEndedAt ?? Date.now()) - aggregate.taskStartedAt
-                          : null,
-                      )}
-                    </div>
-                  </div>
-                  <div className="kv">
-                    <div className="kv-label">当前节点</div>
-                    <div className="kv-value mono">
-                      {detail.currentNodeIds?.length ? detail.currentNodeIds.join(', ') : '—'}
-                    </div>
-                  </div>
-                  <div className="kv">
-                    <div className="kv-label">刷新方式</div>
-                    <div className="kv-value">
-                      {terminal ? (
-                        <span className="muted">已进入终态，已停止轮询</span>
-                      ) : (
-                        <span className="tone-run">运行中 · 每 {POLL_DETAIL_MS / 1000} 秒轮询</span>
-                      )}
-                    </div>
-                  </div>
-                </div>
-
-                <div className="notice">
-                  <code>simple_dev</code> 为串行基线（同一时刻只有一个节点在跑）；内核已消费
-                  <code>env.globalConcurrency</code>，并行批次超上限即排队。本页面暂不展示并行度指标。
-                </div>
-
-                {failedNodes.length > 0 && (
-                  <div className="banner banner-fail">
-                    <div className="banner-body">
-                      <b>{failedNodes.length} 个节点失败</b>
-                      {failedNodes.slice(0, 3).map((node) => (
-                        <div key={node.nodeId} className="banner-detail">
-                          <span className="mono">{node.nodeId}</span>
-                          <span className="node-error-inline" title={node.lastError ?? ''}>
-                            {node.lastError ?? '（无 lastError）'}
-                          </span>
-                          <button type="button" className="btn btn-xs" onClick={() => openLog(node.nodeId)}>
-                            查看日志
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                <Collapsible title={<span>原始需求（requirementRaw）</span>}>
-                  <PreBlock text={detail.requirementRaw || '（空）'} maxHeight={280} />
-                </Collapsible>
-
-                <nav className="tabs">
+                <nav className="tabs tabs-secondary">
                   <button
                     type="button"
                     className={`tab-btn${tab === 'nodes' ? ' active' : ''}`}
                     onClick={() => setTab('nodes')}
                   >
-                    节点与成本 {aggregate.nodes.length}
+                    节点明细 {aggregate.nodes.length}
+                  </button>
+                  <button
+                    type="button"
+                    className={`tab-btn${tab === 'roles' ? ' active' : ''}`}
+                    onClick={() => setTab('roles')}
+                  >
+                    角色与花费
                   </button>
                   <button
                     type="button"
@@ -472,7 +490,7 @@ export function App() {
                     onClick={() => setTab('logs')}
                   >
                     日志
-                    {failedNodes.length > 0 && <span className="tab-dot fail" />}
+                    {failedNodeIds.length > 0 && <span className="tab-dot fail" />}
                   </button>
                   <button
                     type="button"
@@ -492,14 +510,23 @@ export function App() {
                 </nav>
 
                 {tab === 'nodes' && (
-                  <NodeCostView
-                    state={detail}
-                    aggregate={aggregate}
-                    liveness={liveness}
-                    compat={compat}
-                    onOpenLog={openLog}
-                    onOpenArtifacts={() => setTab('artifacts')}
-                  />
+                  <>
+                    <Collapsible title={<span>原始需求（requirementRaw）</span>}>
+                      <PreBlock text={detail.requirementRaw || '（空）'} maxHeight={240} />
+                    </Collapsible>
+                    <NodeCostView
+                      state={detail}
+                      aggregate={aggregate}
+                      liveness={liveness}
+                      compat={compat}
+                      onOpenLog={openLog}
+                      onOpenArtifacts={() => setTab('artifacts')}
+                    />
+                  </>
+                )}
+
+                {tab === 'roles' && (
+                  <RolePanel taskId={detail.taskId} flow={flow} onOpenLog={openLog} />
                 )}
 
                 {tab === 'logs' && (
@@ -526,8 +553,6 @@ export function App() {
                 )}
               </>
             )}
-
-            {!detail && !detailError && <EmptyState>正在加载任务详情…</EmptyState>}
           </>
         )}
       </main>
