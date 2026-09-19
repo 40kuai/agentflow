@@ -305,8 +305,9 @@ triggers:
 ```
 
 > **Phase 1 实现修正（2026-09-19 终审同步，绑定权威）**：`owns` 在 Phase 1 **零强制**，上一行注释里的「不许改」名不副实。
-> 实况：`owns` 只作为 prompt 里的一句话出现（`src/kernel/context-assembler.ts` 的硬约束段落）；CLI 层**全量放行**
-> （`--allowed-tools` 不含任何按路径的约束，见 §11.3），内核层**无变更路径核对**，`artifact.invalidated` 事件**全仓无生产者**。
+> 实况：`owns` **不作为**路径级强制。它只有两个作用：① 拼进 prompt 的硬约束段落（`src/kernel/context-assembler.ts`）；
+> ② 以 `role.owns.length === 0` 粗粒度决定该角色是否只读（`src/kernel/kernel.ts` → runner 走只读分支还是可写分支）。
+> **对可写角色而言，CLI 层是全量放行的**（`--allowed-tools` 不含任何按路径的约束，见 §11.3）；内核层**无变更路径核对**，`artifact.invalidated` 事件**全仓无生产者**。
 > 端到端已实测越界：`config/roles/backend_dev.yaml` 的 `owns` 是 `["src/**"]`，而 agent 真实写了 `README.md` 与 `scripts/hello.sh`，
 > 任务仍正常 `completed`。**路径级强制（调度前占用检查 + 越界写记 `artifact.invalidated`）属 Phase 2**；
 > 在此之前 `owns` 只是提示词层面的建议，**不得当作安全边界**。

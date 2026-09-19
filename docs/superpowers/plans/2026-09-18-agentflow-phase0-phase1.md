@@ -5388,7 +5388,7 @@ git commit -m "feat: 新增调度器与内核主循环，实现三角色串行�
 | `GET` | `/api/tasks/:taskId` | 返回该任务的投影状态 |
 | `GET` | `/api/tasks/:taskId/events` | 返回该任务的原始事件流 |
 | `GET` | `/api/health` | 健康检查 |
-| `WS` | `/ws` | 推送 `{ type: 'event', event }` 与 `{ type: 'task_state', state }` |
+| `WS` | `/ws` | Phase 1 实际只推 `{ type: 'task_state', state }` 与 `{ type: 'task_error', taskId, message }`。**`{ type: 'event' }` 无广播点**（内核无事件订阅接口），为 Phase 2 预留 |
 
 - [ ] **Step 1: 写失败的测试 `src/server/server.test.ts`**
 
