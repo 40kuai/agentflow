@@ -710,6 +710,12 @@ type RunnerEvent =
 ### 13.2 实时通道
 
 - **WebSocket** 推送三类消息：`event`（状态变更，驱动 DAG 刷新）、`log_chunk`（日志流）、`heartbeat`（连接保活）
+
+  > **Phase 1 实现修正**：实际只实现两类 —— `task_state`（任务终态快照）与 `task_error`。
+  > **`{ type: 'event' }` 在 Phase 1 无触发点**：内核的 `runTask` 没有事件订阅/回调接口，Server 层无法感知节点级事件，
+  > 因此它当前是死代码。它保留在端点表里是为 Phase 2 预留（内核加订阅回调时启用）。
+  > 同理 `log_chunk` 的流式推送也需等内核暴露日志订阅才可用。
+  > **前端在 Phase 1 靠轮询 `GET /api/tasks/:id` 兜住实时性**（Task 14 即如此实现）。
 - HTTP 端点只用于**动作**：G3 审批、暂停/恢复/取消任务
 - **前端完全只读**（除审批动作外），不含任何流程逻辑
 

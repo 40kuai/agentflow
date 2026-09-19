@@ -5676,17 +5676,27 @@ process.on('SIGINT', () => void shutdown());
 process.on('SIGTERM', () => void shutdown());
 ```
 
-- [ ] **Step 6: 手工冒烟验证服务能起来**
+- [ ] **Step 6: 手工冒烟验证服务能起来（⚠️ 不要触发真实 agent）**
+
+**先读这条警告**：`main.ts` 接的是 `createClaudeCodeRunner`，`repoPath` 是 `process.cwd()`，而 `simple_dev` 的 `dev_implement` 节点 `owns` 非空 → 内核会把它判为**可写**角色 → runner 给它的权限是 `--permission-mode acceptEdits --tools=...,Edit,Write,Bash`，**且 cwd 就是本项目根目录**。也就是说：**一次 `POST /api/tasks` 会真的启动全链路 agent，并可能直接改写本仓库的工作区文件**，同时真实消耗额度。
+
+因此冒烟**只验证服务层**，不要走真实 agent。用 `AGENTFLOW_CLAUDE_BIN` 指向一个不存在的可执行文件，让真实调用必然失败（spawn error 路径）——这样既不花钱，也不会让 agent 碰到工作区：
 
 ```bash
-npx tsx src/main.ts &
+AGENTFLOW_CLAUDE_BIN=/nonexistent/claude npx tsx src/main.ts &
 sleep 2
 curl -s http://127.0.0.1:8787/api/health
-curl -s -X POST http://127.0.0.1:8787/api/tasks -H 'Content-Type: application/json' -d '{"title":"冒烟","requirementRaw":"验证服务可用"}'
+# 缺必填字段：必须返回 400（这条不会建任务、不会触发 agent）
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8787/api/tasks \
+  -H 'Content-Type: application/json' -d '{"title":"只有标题"}'
 kill %1
 ```
 
-Expected: `/api/health` 返回 `{"ok":true}`；POST 返回 `{"taskId":"task_..."}`
+Expected: `/api/health` 返回 `{"ok":true}`；缺字段的 POST 返回 `400`。
+
+**若你确实想验证「建任务 → 异步推进」这条路**，请**同时**做三件事：① 在**一个临时空 git 仓库**里跑（不要在本项目根目录）② 设 `AGENTFLOW_CLAUDE_BIN=/nonexistent/claude` 使真实调用必失败（验证的是「失败被正确记录为 node.failed」，不是真实产出）③ 确认 `git status` 干净。
+
+**真实端到端（会花钱、会动文件）只在 Task 15 做**，且必须在受控目标仓库里进行。
 
 - [ ] **Step 7: 提交**
 
@@ -6197,12 +6207,29 @@ bash tests/e2e/smoke.sh
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ⚠️ 安全前提：端到端会真实启动 agent，而 simple_dev 的 dev_implement 拥有写权限
+# （owns 非空 → acceptEdits + Edit/Write/Bash）。若在 AgentFlow 仓库里跑，agent 会
+# 直接改写本项目的工作区。因此必须在一个**独立的临时 git 仓库**里跑：
+# 让 AgentFlow 的 cwd（= 内核的 repoPath）落在这个临时仓库，而配置仍指向 AgentFlow 自己的 config。
+AGENTFLOW_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+
+TARGET_REPO="$(mktemp -d /tmp/agentflow-e2e-target-XXXXXX)"
+cd "$TARGET_REPO"
+git init -q
+git -c user.email=e2e@local -c user.name=e2e commit -q --allow-empty -m "初始提交"
+echo "# 端到端目标仓库" > README.md
+
 HOST="127.0.0.1"
 PORT="${AGENTFLOW_PORT:-8787}"
 BASE="http://${HOST}:${PORT}"
 
+echo "==> 目标仓库：$TARGET_REPO"
 echo "==> 启动 AgentFlow"
-npx tsx src/main.ts > /tmp/agentflow-e2e.log 2>&1 &
+AGENTFLOW_CONFIG_DIR="$AGENTFLOW_ROOT/config" \
+AGENTFLOW_DB_PATH="$TARGET_REPO/data/e2e.sqlite" \
+AGENTFLOW_LOG_DIR="$TARGET_REPO/logs" \
+AGENTFLOW_WORKSPACE_DIR="$TARGET_REPO/workspaces" \
+  npx tsx "$AGENTFLOW_ROOT/src/main.ts" > /tmp/agentflow-e2e.log 2>&1 &
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
 
@@ -6218,7 +6245,7 @@ curl -sf "${BASE}/api/health" > /dev/null || { echo "服务未能启动，日志
 echo "==> 创建任务"
 TASK_ID=$(curl -s -X POST "${BASE}/api/tasks" \
   -H 'Content-Type: application/json' \
-  -d '{"title":"E2E 冒烟","requirementRaw":"在本仓库新增一个 scripts/hello.sh，执行后输出 hello agentflow。附带一句使用说明到 README.md。"}' \
+  -d '{"title":"E2E 冒烟","requirementRaw":"在目标仓库新增一个 scripts/hello.sh，执行后输出 hello agentflow。附带一句使用说明到 README.md。"}' \
   | sed -n 's/.*"taskId":"\([^"]*\)".*/\1/p')
 
 echo "任务 id：${TASK_ID}"
@@ -6243,8 +6270,16 @@ echo "==> 事件类型统计"
 curl -s "${BASE}/api/tasks/${TASK_ID}/events" \
   | grep -o '"type":"[^"]*"' | sort | uniq -c | sort -rn
 
-echo "==> 原始日志文件"
-ls -la logs/runs/ 2>/dev/null || echo "（未找到 logs/runs 目录）"
+echo "==> log_ref 是否真的指向存在的文件（Task 12/13 未在单测里覆盖的这一环在此补验）"
+for ref in $(curl -s "${BASE}/api/tasks/${TASK_ID}/events" | grep -o '"log_ref":"[^"]*"' | sed 's/.*:"//;s/"$//' | sort -u); do
+  if [ -f "$ref" ]; then echo "  OK   $ref"; else echo "  MISS $ref"; fi
+done
+
+echo "==> 目标仓库是否被 agent 改动（隔离是否生效）"
+git -C "$TARGET_REPO" status --short || true
+
+echo "==> 本仓库是否保持干净（不应被 agent 触碰）"
+git -C "$AGENTFLOW_ROOT" status --short || true
 
 echo "==> 判定"
 if echo "$STATE" | grep -q '"status":"completed"'; then
