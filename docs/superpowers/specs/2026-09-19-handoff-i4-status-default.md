@@ -119,3 +119,42 @@
 | I2 | 孤儿判定未经数据门控（只要 `claudeProcCount > 0` 就报"可能有孤儿残留"，未结合"当前是否有运行中节点" → 正常运行的 run 就会误报） | `web/src/App.tsx` | 🔴 前端为争用区 |
 | I3 | 前端判定逻辑零自动化测试，且不在仓库级闸门内（根 `tsconfig.json` 的 include 只覆盖 `src/**`/`spikes/**`/`tests/**`，`npm run typecheck` 不覆盖 `web/**`） | `web/src/liveness.ts`、`logparse.ts`、`aggregate.ts` | 🟠 需先决定是否引入前端测试框架（涉及新依赖） |
 | I5 | `canFallback=true` 的异常路径缺断言（现有 spawn-error / timeout 用例的 `req` 不带 `outputSchema`，实际走 `canFallback=false` 分支，故 `events[0] === started` 未覆盖生产配置） | `src/runner/*.test.ts` | 🟢 相对空闲 |
+
+---
+
+## 10. 执行结果（2026-09-19，提交 `2ca46ef`）
+
+### 10.1 §5 判定：**harness 不会应用 default**（I4 不是活 bug）
+
+**依据强度高于真实调用**：反编译本机 `claude 2.1.38`，`--json-schema` 的 `StructuredOutput` 工具使用
+`new Ajv({ allErrors: true })` 校验（`vWR` → `$.jsonSchema`），**未启用 `useDefaults`**（Ajv 默认为 `false`）
+→ 缺失字段走「报错重试」，而非被兜成 `ok`。
+
+- **零真实调用**（比单次 n=1 样本更确定，但结论**绑定 2.1.38**，已写入代码注释）
+- 含义：本单第 2 节担心的静默路径**当时并未被触发**。但第 4 节的修法**依然正确且应当保留**——它消除「必填与默认值并存」的语义含混，并防住未来 CLI 版本启用 `useDefaults`
+
+### 10.2 修法已落地
+
+`jsonSchemaForArtifact` 在输出前剥离 `status` 的 `default`；解析侧 `.default('ok')` 与 `parseArtifactPayload` 行为不变。
+4 个 artifact 类型逐一断言：`required` 均含 `status`、`properties.status` 均无 `default`、`additionalProperties:false` 保留。
+
+### 10.3 双向变异验证（均已变红后还原）
+
+| 方向 | 结果 |
+| --- | --- |
+| A：把 `default` 加回签发路径 | `artifacts.test.ts` 的签发侧断言**精确变红** |
+| B：删掉解析侧 `.default('ok')` | 归档兼容用例**变红** |
+
+### 10.4 ⚠️ 本单 §6.2 的措辞已更正（判断结论不变，机制描述有误）
+
+原文称「3 份归档 fixture 的解析测试」依赖解析侧 default。**实际机制不同**：
+- fixture **文件**只经 `parseStreamLine`，**不经过** `parseArtifactPayload`
+- 真正依赖解析侧 default 的是 `artifacts.test.ts` 里的**内联用例**与 kernel 用例
+
+因此「**不能删解析侧 `.default('ok')`**」这一结论**仍然成立**，但理由是"存在依赖该 default 的解析用例"，而非"fixture 文件本身依赖它"。
+
+### 10.5 遗留
+
+- `tests/fixtures/**` 4 个 blob SHA **逐字未变**（已取证）
+- 全量：`tsc --noEmit` exit 0；`vitest run` **308 passed / 3 failed**，3 条失败**全部**在他人并发的 `tests/website/website.test.ts`（站点落 `src/website/` 而非 `website/`），与本改动无关
+- **本次改动尚未过独立评审**（项目标准要求引擎契约类改动过第三方评审）。改动小且双向变异已验证，但 §10.1 的"反编译结论"属强主张，建议复审时优先核实该主张的可靠性与其版本绑定风险
