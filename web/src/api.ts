@@ -92,7 +92,10 @@ export type KernelEvent = {
 
 /** 日志尾行响应；lines 为未经解析的原始字符串行 */
 export type LogTail = {
-  nodeId: string;
+  /** 节点日志端点返回 */
+  nodeId?: string;
+  /** runId 回退日志端点返回 */
+  runId?: string;
   logRef: string;
   totalLines: number;
   returnedLines: number;
@@ -168,6 +171,17 @@ export async function getNodeLog(taskId: string, nodeId: string, tail: number): 
   const qs = new URLSearchParams({ tail: String(tail) });
   return requestJson<LogTail>(
     `/api/tasks/${encodeURIComponent(taskId)}/nodes/${encodeURIComponent(nodeId)}/log?${qs}`,
+  );
+}
+
+/**
+ * 按 runId 回退拉取日志尾行：运行中的节点在日志引用落库前也能看到活日志。
+ * 服务端复用与节点端点同一套目录穿越校验；400（越界）/ 404（文件不存在）会以 ApiError 抛出。
+ */
+export async function getRunLog(taskId: string, runId: string, tail: number): Promise<LogTail> {
+  const qs = new URLSearchParams({ tail: String(tail) });
+  return requestJson<LogTail>(
+    `/api/tasks/${encodeURIComponent(taskId)}/runs/${encodeURIComponent(runId)}/log?${qs}`,
   );
 }
 

@@ -7,7 +7,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { ApiError, getNodeLog, type LogTail } from '../api';
+import { ApiError, getNodeLog, getRunLog, type LogTail } from '../api';
 import type { NodeAggregate } from '../aggregate';
 import { formatClock, formatDuration, formatUsd, shortId, truncate } from '../format';
 import {
@@ -101,8 +101,10 @@ export function LogViewer({ taskId, nodes, focusNodeId }: Props) {
   useEffect(() => {
     if (!selectedNodeId) return;
     const node = nodesRef.current.find((n) => n.nodeId === selectedNodeId);
-    // 无日志引用时不再发请求：直接展示本地事实，避免制造一条必然 404 的请求
-    if (node && !node.lastLogRef) {
+    const runId = node?.runId ?? null;
+    // 既无日志引用、又无 runId 时才不发请求：直接展示本地事实，避免制造一条必然 404 的请求。
+    // 若已有 runId（节点正在运行），走 runId 回退端点——此时日志文件其实已在写入。
+    if (node && !node.lastLogRef && !runId) {
       setData(null);
       setError(null);
       return;
@@ -111,7 +113,10 @@ export function LogViewer({ taskId, nodes, focusNodeId }: Props) {
     // 切换节点 / tail 时先清空，避免把上一个节点的日志显示在新节点名下
     setData(null);
     setLoading(true);
-    getNodeLog(taskId, selectedNodeId, tail)
+    const request = node?.lastLogRef
+      ? getNodeLog(taskId, selectedNodeId, tail)
+      : getRunLog(taskId, runId!, tail);
+    request
       .then((res) => {
         if (cancelled) return;
         setData(res);
@@ -183,11 +188,18 @@ export function LogViewer({ taskId, nodes, focusNodeId }: Props) {
                 type="button"
                 className={`node-chip${node.nodeId === selectedNodeId ? ' active' : ''}`}
                 onClick={() => setSelectedNodeId(node.nodeId)}
-                title={node.lastLogRef ?? '该节点没有日志引用'}
+                title={
+                  node.lastLogRef ??
+                  (node.runId
+                    ? `日志引用尚未落库，已按 runId 读取活日志（${node.runId}）`
+                    : '该节点没有日志引用')
+                }
               >
                 <span className={`dot tone-${statusTone(node.status)}`} />
                 {node.nodeId}
-                {!node.lastLogRef && <span className="muted"> ·无日志</span>}
+                {!node.lastLogRef && (
+                  <span className="muted">{node.runId ? ' ·活日志' : ' ·无日志'}</span>
+                )}
               </button>
             ))}
           </div>
@@ -290,12 +302,21 @@ export function LogViewer({ taskId, nodes, focusNodeId }: Props) {
 
       {!selectedNodeId && <EmptyState>该任务还没有节点，暂无日志。</EmptyState>}
 
-      {selectedNodeId && selectedNode && !selectedNode.lastLogRef && (
+      {selectedNodeId && selectedNode && !selectedNode.lastLogRef && !selectedNode.runId && (
         <ErrorBox
           title="该节点没有日志引用"
-          message={`节点 ${selectedNodeId} 的 lastLogRef 为空：可能尚未真正执行（还在 queued），或该次运行没有写出日志文件。`}
-          hint="可切到「节点与成本」查看该节点的状态与尝试次数。"
+          message={`节点 ${selectedNodeId} 的 lastLogRef 为空。可能原因（按可能性排序）：1) 节点正在运行，日志引用要等节点结束才会出现在事件里；2) 节点还在 queued（尚未真正执行）；3) 该次运行确实没有写出日志文件。`}
+          hint="该节点没有 runId，尚未真正启动；可切到「节点与成本」查看状态与尝试次数。"
         />
+      )}
+
+      {selectedNode && !selectedNode.lastLogRef && selectedNode.runId && (
+        <div className="notice">
+          节点 {selectedNode.nodeId} 仍在运行：日志引用（lastLogRef）要等节点结束才会写入事件，但日志文件已在写入。
+          已按 runId 直接读取活日志，文件位于{' '}
+          <code className="mono">{data?.logRef ?? `logs/runs/${selectedNode.runId}.jsonl`}</code>；
+          也可等节点结束后在界面查看。
+        </div>
       )}
 
       {error && (

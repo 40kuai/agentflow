@@ -26,6 +26,9 @@ function role(): RoleDef {
     outputs: ['requirement'],
     owns: [],
     reads: [],
+    responsibilities: ['澄清需求'],
+    prohibitions: ['不写代码'],
+    doneCriteria: ['产出 requirement'],
     model: 'sonnet',
     maxRetries: 1,
     maxWallTimeMs: 60_000,
@@ -126,6 +129,28 @@ function seedNodeWithLogRef(b: Boot, logRef: string, title = 't'): { taskId: str
     type: 'node.failed',
     payload: { node_id: nodeId, run_id: 'run_seed', error: '测试构造', log_ref: logRef },
     actor: 'kernel',
+  });
+  return { taskId, nodeId };
+}
+
+/**
+ * 构造一个“正在运行”的节点：只有 node.queued + node.started，没有任何结束事件。
+ * 默认不带 log_ref（模拟较早的历史事件），用于验证按 runId 回退取日志。
+ */
+function seedRunningNode(b: Boot, runId: string): { taskId: string; nodeId: string } {
+  const nodeId = 'pm_analyze';
+  const taskId = b.kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+  b.store.append({
+    task_id: taskId,
+    type: 'node.queued',
+    payload: { node_id: nodeId, role_id: 'pm', run_id: runId, attempt: 1 },
+    actor: 'kernel',
+  });
+  b.store.append({
+    task_id: taskId,
+    type: 'node.started',
+    payload: { node_id: nodeId, role_id: 'pm', run_id: runId, attempt: 1 },
+    actor: 'role:pm',
   });
   return { taskId, nodeId };
 }
@@ -392,6 +417,85 @@ describe('GET /api/tasks/:taskId/nodes/:nodeId/log', () => {
     const res = await b.server.app.inject({
       method: 'GET',
       url: '/api/tasks/task_ghost/nodes/pm_analyze/log',
+    });
+    expect(res.statusCode).toBe(404);
+  });
+});
+
+describe('GET /api/tasks/:taskId/runs/:runId/log（运行中节点的回退日志端点）', () => {
+  const LINES = [
+    '{"type":"system","subtype":"init","n":1}',
+    '{"type":"assistant","n":2}',
+    '{"type":"assistant","n":3}',
+    '{"type":"assistant","n":4}',
+    '{"type":"result","n":5}',
+  ];
+
+  it('运行中节点（事件里没有 log_ref，只有 runId）也能取到活日志，返回 200', async () => {
+    const b = boot();
+    const { taskId, nodeId } = seedRunningNode(b, 'run_live');
+    const logRef = join(b.logDir, 'runs', 'run_live.jsonl');
+    writeLogFile(logRef, LINES);
+
+    // 节点端点仍 404：事件里没有 log_ref，lastLogRef 保持 null
+    const viaNode = await b.server.app.inject({
+      method: 'GET',
+      url: `/api/tasks/${taskId}/nodes/${nodeId}/log`,
+    });
+    expect(viaNode.statusCode).toBe(404);
+
+    // runId 端点按约定路径命中正在写入的日志文件
+    const res = await b.server.app.inject({
+      method: 'GET',
+      url: `/api/tasks/${taskId}/runs/run_live/log?tail=2`,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      runId: string;
+      logRef: string;
+      totalLines: number;
+      returnedLines: number;
+      truncated: boolean;
+      lines: string[];
+    };
+    expect(body.runId).toBe('run_live');
+    expect(body.logRef).toBe(resolve(logRef));
+    expect(body.totalLines).toBe(5);
+    expect(body.returnedLines).toBe(2);
+    expect(body.truncated).toBe(true);
+    expect(body.lines).toEqual(LINES.slice(3));
+  });
+
+  it('目录穿越防护：runId 用 ../../ 逃逸时返回 400，且不泄露文件内容', async () => {
+    const b = boot();
+    const secretPath = join(b.repo, 'secret.txt');
+    writeFileSync(secretPath, 'TOP_SECRET_MARKER\n', 'utf8');
+    const { taskId } = seedRunningNode(b, 'run_any');
+    // logs/runs/../../secret.txt.jsonl → repo/secret.txt.jsonl，已在日志根之外
+    const res = await b.server.app.inject({
+      method: 'GET',
+      url: `/api/tasks/${taskId}/runs/${encodeURIComponent('../../secret.txt')}/log`,
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toContain('越界');
+    expect(res.body).not.toContain('TOP_SECRET_MARKER');
+  });
+
+  it('日志文件尚未写出时返回 404', async () => {
+    const b = boot();
+    const { taskId } = seedRunningNode(b, 'run_missing');
+    const res = await b.server.app.inject({
+      method: 'GET',
+      url: `/api/tasks/${taskId}/runs/run_missing/log`,
+    });
+    expect(res.statusCode).toBe(404);
+  });
+
+  it('未知任务返回 404', async () => {
+    const b = boot();
+    const res = await b.server.app.inject({
+      method: 'GET',
+      url: '/api/tasks/task_ghost/runs/run_x/log',
     });
     expect(res.statusCode).toBe(404);
   });

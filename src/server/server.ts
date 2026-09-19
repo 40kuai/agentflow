@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
-import { resolve, sep } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 import websocket from '@fastify/websocket';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { z } from 'zod';
@@ -70,6 +70,34 @@ function groupByTask(events: KernelEvent[]): Map<string, KernelEvent[]> {
     else byTask.set(event.task_id, [event]);
   }
   return byTask;
+}
+
+/**
+ * 目录穿越防护的唯一入口：把候选日志路径解析后校验是否落在日志根目录内。
+ * 越界返回 null（调用方据此返回 400，且绝不读取任何文件内容）。
+ * 所有依赖“数据驱动路径”的日志端点都必须走这里，不得另写一份更宽松的校验。
+ */
+function resolveWithinLogRoot(logDir: string, candidate: string): string | null {
+  const resolvedRoot = resolve(logDir);
+  const resolved = resolve(candidate);
+  if (!resolved.startsWith(resolvedRoot + sep)) return null;
+  return resolved;
+}
+
+/** 读取已通过穿越校验的日志文件的末 tail 行（原样返回字符串行，不做 JSON 解析） */
+function readLogFileTail(
+  resolved: string,
+  rawTail: unknown,
+): { totalLines: number; returnedLines: number; truncated: boolean; lines: string[] } {
+  const raw = readFileSync(resolved, 'utf8');
+  const allLines = raw.split('\n');
+  // 丢弃文件末尾换行产生的空元素
+  while (allLines.length > 0 && allLines[allLines.length - 1] === '') allLines.pop();
+
+  const totalLines = allLines.length;
+  const tail = normalizeTail(rawTail);
+  const lines = totalLines <= tail ? allLines : allLines.slice(totalLines - tail);
+  return { totalLines, returnedLines: lines.length, truncated: lines.length < totalLines, lines };
 }
 
 export function createServer(deps: ServerDeps): AgentFlowServer {
@@ -173,10 +201,11 @@ export function createServer(deps: ServerDeps): AgentFlowServer {
 
     // lastLogRef 来自事件库、属于数据驱动的路径：必须先做目录穿越校验，绝不能直接读任意文件。
     // 校验不通过时直接返回 400，且不读取任何文件内容。
-    const resolvedRoot = resolve(deps.logDir);
-    const resolved = resolve(node.lastLogRef);
-    if (!resolved.startsWith(resolvedRoot + sep)) {
-      return reply.status(400).send({ error: `日志路径越界：不在允许的日志根目录内（${resolved}）` });
+    const resolved = resolveWithinLogRoot(deps.logDir, node.lastLogRef);
+    if (!resolved) {
+      return reply
+        .status(400)
+        .send({ error: `日志路径越界：不在允许的日志根目录内（${resolve(node.lastLogRef)}）` });
     }
 
     if (!existsSync(resolved) || !statSync(resolved).isFile()) {
@@ -185,23 +214,33 @@ export function createServer(deps: ServerDeps): AgentFlowServer {
 
     // 只读、不修改任何文件。服务端不做 JSON 解析/格式化：原样返回字符串行，
     // 由前端决定如何展示 stream-json。tail 上限 2000 行是刻意的体积保护。
-    const raw = readFileSync(resolved, 'utf8');
-    const allLines = raw.split('\n');
-    // 丢弃文件末尾换行产生的空元素
-    while (allLines.length > 0 && allLines[allLines.length - 1] === '') allLines.pop();
+    return { nodeId, logRef: resolved, ...readLogFileTail(resolved, query.tail) };
+  });
 
-    const totalLines = allLines.length;
-    const tail = normalizeTail(query.tail);
-    const lines = totalLines <= tail ? allLines : allLines.slice(totalLines - tail);
+  // 运行中节点的回退日志端点：node.started 之前的老事件可能没有 log_ref，
+  // 而日志文件其实早已在写入。此时按 runId 直接定位 logs/runs/<runId>.jsonl。
+  app.get('/api/tasks/:taskId/runs/:runId/log', async (request, reply) => {
+    const { taskId, runId } = request.params as { taskId: string; runId: string };
+    const query = request.query as { tail?: string };
 
-    return {
-      nodeId,
-      logRef: resolved,
-      totalLines,
-      returnedLines: lines.length,
-      truncated: lines.length < totalLines,
-      lines,
-    };
+    if (deps.store.readTask(taskId).length === 0) {
+      return reply.status(404).send({ error: `找不到任务：${taskId}` });
+    }
+
+    // runId 来自 URL，属于外部输入：拼接后同样要过“根目录内校验”，绝不能放宽。
+    const candidate = join(deps.logDir, 'runs', `${runId}.jsonl`);
+    const resolved = resolveWithinLogRoot(deps.logDir, candidate);
+    if (!resolved) {
+      return reply
+        .status(400)
+        .send({ error: `日志路径越界：不在允许的日志根目录内（${resolve(candidate)}）` });
+    }
+
+    if (!existsSync(resolved) || !statSync(resolved).isFile()) {
+      return reply.status(404).send({ error: `日志文件不存在：${resolved}` });
+    }
+
+    return { runId, logRef: resolved, ...readLogFileTail(resolved, query.tail) };
   });
 
   app.register(async (instance) => {

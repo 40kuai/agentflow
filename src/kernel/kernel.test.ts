@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { createKernel } from './kernel.js';
+import { project } from './projector.js';
 import { createEventStore } from './event-store.js';
 import { createFakeRunner, type FakeScriptItem } from '../runner/fake-runner.js';
 import type { RoleDef, WorkflowDef } from '../shared/domain.js';
@@ -16,8 +17,8 @@ const workflow: WorkflowDef = {
     { id: 'qa_verify', title: '测试验证', role: 'qa_engineer', consumes: ['requirement', 'code_diff'], produces: 'test_report', isolate: false },
   ],
   edges: [
-    { from: 'pm_analyze', to: 'dev_implement', when: "all(artifacts.requirement.status == 'ok')" },
-    { from: 'dev_implement', to: 'qa_verify', when: "all(artifacts.code_diff.status == 'ok')" },
+    { from: 'pm_analyze', to: 'dev_implement', when: "all(artifacts.requirement.status == 'ok')", description: '需求已澄清', onMissing: 'fail' },
+    { from: 'dev_implement', to: 'qa_verify', when: "all(artifacts.code_diff.status == 'ok')", description: '改动自测通过', onMissing: 'fail' },
   ],
 };
 
@@ -30,6 +31,9 @@ function roles(): Map<string, RoleDef> {
     outputs,
     owns,
     reads: [],
+    responsibilities: [`${id} 的职责`],
+    prohibitions: [`${id} 的禁止事项`],
+    doneCriteria: [`${id} 的完成判据`],
     model: 'sonnet',
     maxRetries: 1,
     maxWallTimeMs: 60_000,
@@ -283,6 +287,38 @@ describe('Kernel 串行闭环', () => {
     store.close();
   });
 
+  it('node.started 落库即带 log_ref：运行中节点 lastLogRef 非空，且与结束时一致', async () => {
+    const repo = makeRepo();
+    const logs = makeLogDir();
+    const { kernel, store } = makeKernel(undefined, repo, logs);
+
+    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    const state = await kernel.runTask(taskId);
+
+    const events = store.readTask(taskId);
+    const started = events.find(
+      (e) => e.type === 'node.started' && e.payload['node_id'] === 'pm_analyze',
+    );
+    expect(started).toBeDefined();
+    const runId = String(started!.payload['run_id']);
+    const expected = join(logs, 'runs', `${runId}.jsonl`);
+    expect(started!.payload['log_ref']).toBe(expected);
+
+    // 只重放到 node.started：模拟“节点正在运行”的投影，lastLogRef 必须已经非空
+    const startedIndex = events.indexOf(started!);
+    const running = project(events.slice(0, startedIndex + 1));
+    expect(running.nodes['pm_analyze']?.status).toBe('running');
+    expect(running.nodes['pm_analyze']?.lastLogRef).toBe(expected);
+
+    // 节点结束后引用不变：succeeded 的 log_ref 与 started 逐字一致
+    const succeeded = events.find(
+      (e) => e.type === 'node.succeeded' && e.payload['node_id'] === 'pm_analyze',
+    );
+    expect(succeeded?.payload['log_ref']).toBe(expected);
+    expect(state.nodes['pm_analyze']?.lastLogRef).toBe(expected);
+    store.close();
+  });
+
   it('自环工作流被死循环保护终止，不会无限重试', async () => {
     const repo = makeRepo();
     const logs = makeLogDir();
@@ -290,7 +326,7 @@ describe('Kernel 串行闭环', () => {
     // 让 pm 每次都成功，但工作流里加一条 pm→pm 的自环，触发节点访问次数保护
     const loopWorkflow: WorkflowDef = {
       ...workflow,
-      edges: [{ from: 'pm_analyze', to: 'pm_analyze', when: 'true' }],
+      edges: [{ from: 'pm_analyze', to: 'pm_analyze', when: 'true', description: '自环', onMissing: 'fail' }],
     };
     const runner = createFakeRunner({
       scripts: Array.from({ length: 30 }, () => scriptFor('requirement')),

@@ -162,14 +162,23 @@ export function createKernel(deps: KernelDeps): Kernel {
       maxPromptTokens: deps.maxPromptTokens,
     });
 
+    // log_ref 只由 deps.logDir 与 ws.runId 决定，不依赖 runner 的任何输出。
+    // 因此必须在 node.started 落库前算出并写进载荷：否则运行中的节点没有日志引用，
+    // 管理台在“最需要看日志”的时刻反而看不到日志（旧实现只在节点结束事件里写 log_ref）。
+    const logRef = join(deps.logDir.replace(/^\.\//, ''), 'runs', `${ws.runId}.jsonl`);
+
     store.append({
       task_id: taskId,
       type: 'node.started',
-      payload: { node_id: nodeId, role_id: role.id, run_id: ws.runId, attempt: previousVisit + 1 },
+      payload: {
+        node_id: nodeId,
+        role_id: role.id,
+        run_id: ws.runId,
+        attempt: previousVisit + 1,
+        log_ref: logRef,
+      },
       actor: `role:${role.id}`,
     });
-
-    const logRef = join(deps.logDir.replace(/^\.\//, ''), 'runs', `${ws.runId}.jsonl`);
 
     let artifactRaw: unknown;
     let hasArtifact = false;

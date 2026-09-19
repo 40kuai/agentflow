@@ -104,7 +104,9 @@ export function project(events: KernelEvent[]): TaskState {
           attempt: num(p, 'attempt', 1),
           runId: str(p, 'run_id') || null,
           artifactIds: previous?.artifactIds ?? [],
-          lastLogRef: previous?.lastLogRef ?? null,
+          // node.started 已带 log_ref（内核在启动前算好）：运行中节点即可拿到日志引用。
+          // 兼容更早的历史事件（无 log_ref）时回退到 previous 的值，保持原有语义。
+          lastLogRef: str(p, 'log_ref') || previous?.lastLogRef || null,
           lastError: null,
         };
         state.visitCounts[nodeId] = (state.visitCounts[nodeId] ?? 0) + 1;

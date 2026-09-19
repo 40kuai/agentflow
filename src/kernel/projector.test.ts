@@ -47,6 +47,29 @@ describe('project', () => {
     expect(s.visitCounts.pm_analyze).toBe(1);
   });
 
+  it('node.started 带 log_ref 时立即写入 lastLogRef（运行中即可见日志）', () => {
+    const s = project([
+      ev('node.queued', { node_id: 'pm_analyze', role_id: 'pm', run_id: 'run_1', attempt: 1 }),
+      ev('node.started', {
+        node_id: 'pm_analyze',
+        role_id: 'pm',
+        run_id: 'run_1',
+        attempt: 1,
+        log_ref: 'logs/runs/run_1.jsonl',
+      }),
+    ]);
+    // queued 先把它重置为 null，started 再写回：重放顺序 queued → started，最终值非空
+    expect(s.nodes.pm_analyze?.status).toBe('running');
+    expect(s.nodes.pm_analyze?.lastLogRef).toBe('logs/runs/run_1.jsonl');
+  });
+
+  it('node.started 缺 log_ref 时回退为 previous 值（历史事件兼容）', () => {
+    const s = project([
+      ev('node.started', { node_id: 'pm_analyze', role_id: 'pm', run_id: 'run_1', attempt: 1 }),
+    ]);
+    expect(s.nodes.pm_analyze?.lastLogRef).toBeNull();
+  });
+
   it('node.succeeded 把节点移出当前节点并加入已完成', () => {
     const s = project([
       ev('node.started', { node_id: 'pm_analyze', role_id: 'pm', run_id: 'run_1', attempt: 1 }),
