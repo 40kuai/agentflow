@@ -295,7 +295,7 @@ system_prompt_ref: prompts/backend_dev.md
 inputs:  [design, work_package_plan]
 outputs: [code_diff]
 scope:
-  owns:  ["src/server/**"]      # 硬约束：不许改 owns 之外的路径
+  owns:  ["src/server/**"]      # 设计意图：不许改 owns 之外的路径（Phase 1 未实现强制，见下方注）
   reads: ["docs/**", "src/shared/**"]
 tools: [read, edit, write, bash]
 budget: { max_tokens: 200000, max_wall_time_ms: 1800000, max_retries: 2 }
@@ -303,6 +303,13 @@ triggers:
   - on: wp.declared
     when: "wp.layer == 'backend'"
 ```
+
+> **Phase 1 实现修正（2026-09-19 终审同步，绑定权威）**：`owns` 在 Phase 1 **零强制**，上一行注释里的「不许改」名不副实。
+> 实况：`owns` 只作为 prompt 里的一句话出现（`src/kernel/context-assembler.ts` 的硬约束段落）；CLI 层**全量放行**
+> （`--allowed-tools` 不含任何按路径的约束，见 §11.3），内核层**无变更路径核对**，`artifact.invalidated` 事件**全仓无生产者**。
+> 端到端已实测越界：`config/roles/backend_dev.yaml` 的 `owns` 是 `["src/**"]`，而 agent 真实写了 `README.md` 与 `scripts/hello.sh`，
+> 任务仍正常 `completed`。**路径级强制（调度前占用检查 + 越界写记 `artifact.invalidated`）属 Phase 2**；
+> 在此之前 `owns` 只是提示词层面的建议，**不得当作安全边界**。
 
 ### 7.3 默认组织架构（完整公司）
 
@@ -647,6 +654,26 @@ type RunnerEvent =
 | 评审（codex 内置） | — | `codex review --base agentflow/<task>/<wp>` |
 | 发布（devops） | 高风险动作**必须 G3 批准后**才执行 | `danger-full-access` 仅限人工批准后 |
 
+> **Phase 1 实现修正（2026-09-19 终审同步，绑定权威）**：上表是设计意图，**Phase 1 的实际实现已偏离**。
+> 实况如下（代码见 `src/runner/claude-code-runner.ts` 的 `buildArgs`，其注释、计划文档 Task 10 段均已如实标注，
+> 本节此前是唯一未同步的一处）：
+>
+> 1. **可写角色的实际参数** = `--permission-mode acceptEdits`
+>    + `--tools=Read,Edit,Write,Grep,Glob,Bash`
+>    + `--allowed-tools 'Bash(sh:*),Bash(bash:*),Bash(chmod:*),Bash(git:*),Bash(node:*),Bash(npm:*)'`（**六前缀**）。
+>    qa_engineer **未单独收窄**，与 dev 用同一组参数；上表给 dev 的 `Bash(npm:*)` 窄授权、给 qa 的 `Read,Grep,Glob,Bash` 均**未落地**。
+> 2. **`Bash(sh:*)` / `Bash(bash:*)` 等价于任意命令执行**：`bash -c "<任意命令>"` 完全落在前缀内，
+>    故 `git push --force` / `rm -rf` / `curl … | sh` 都能绕过前缀限制 —— 前缀白名单实际只约束**不包 shell 的调用**（agent 直接写
+>    `npm test` 会被约束，写成 `bash -c 'npm test'` 就不会）。即「精准预授权」在能力层面**已退化为「全量放行」**，
+>    这是满足 dev/qa prompt「真实运行 .sh 脚本」的必要代价，收窄属 Phase 2 决策。
+> 3. **`Bash(git:*)` / `Bash(npm:*)` 的授权面同样过宽**：含 `push --force` / `reset --hard` / `publish` 等破坏性操作。
+>    Phase 1 的目标仓库是临时目录尚可控，**真实项目使用前必须收窄**（如 `Bash(npm test:*)` / `Bash(npm run:*)`）。
+> 4. **只读角色未被放宽**（仍 `default` + `Read,Grep,Glob`，无任何 Bash 预授权；也未使用用户已否决的
+>    `--dangerously-skip-permissions`，有测试断言把守），但 `--tools` **不约束 MCP 工具**，故其「只读」在 CLI 层并非 airtight
+>    （未加 `--strict-mcp-config` / `--disallowed-tools`）。
+> 5. 因此本节标题的主张「**安全由 CLI 强制，不靠提示词自觉**」在 Phase 1 **只能算部分成立**：
+>    文件编辑边界确由 CLI 强制，命令执行边界则已被前缀白名单实质放宽；完整落地需 Phase 2 收窄前缀或引入真正的沙箱。
+
 ### 11.4 交叉引擎评审（调度时动态选择）
 
 **规则：评审员使用的引擎必须与产出该代码的实例所用引擎不同。** 由内核在调度评审节点时动态分配，而非在角色定义里写死。
@@ -790,7 +817,7 @@ DAG 泳道图是核心。要看一眼就明白：
 | 网络暴露 | HTTP/WS **仅绑定 127.0.0.1**，无鉴权需求 |
 | 能力边界 | 角色权限由 CLI 沙箱参数强制（见 11.3），不靠提示词 |
 | 危险动作 | `danger-full-access` / 部署类操作必须经 G3 人工批准才执行 |
-| 工作区安全 | 每个工作包独占 worktree；`owns` 之外的路径写入视为违规，记 `artifact.invalidated` |
+| 工作区安全 | 每个工作包独占 worktree；`owns` 之外的路径写入视为违规，记 `artifact.invalidated`。**Phase 1 实现修正（2026-09-19 终审）：未实现路径级强制** —— `owns` 仅作为 prompt 提示（CLI 层全量放行、内核层无变更路径核对、`artifact.invalidated` 无生产者），且 Phase 1 所有节点 `isolate: false`、worktree 隔离未启用；占用检查与越界记录属 Phase 2，详见 §7.2 的注 |
 
 ---
 

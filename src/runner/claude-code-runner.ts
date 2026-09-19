@@ -248,9 +248,6 @@ export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentR
         killTree(child.pid, 'SIGKILL');
       }, req.wallTimeMs);
 
-      logStream.write(`${JSON.stringify({ ts: Date.now(), kind: 'spawn', args, cwd: req.workdir })}\n`);
-      yield { kind: 'started', pid: child.pid ?? -1 };
-
       const queue: RunnerEvent[] = [];
       let notify: (() => void) | null = null;
       let closed = false;
@@ -261,6 +258,29 @@ export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentR
         notify?.();
         notify = null;
       };
+
+      // ⚠️ 'error' 监听**必须**在第一个 yield 之前挂上。
+      // spawn 失败（binPath 不存在 → ENOENT）时 Node 经 process.nextTick 投递 'error'，
+      // 而 nextTick 队列先于 await 的微任务续跑执行：若此刻还没有监听器，Node 会抛
+      // `Unhandled 'error' event` 并**直接杀掉整个进程**。已实测（真实 `src/main.ts` + 一次
+      // `POST /api/tasks`，binPath 为 `/nonexistent/claude`）：修复前进程 exit 1
+      // （`throw er; // Unhandled 'error' event` → `spawn /nonexistent/claude ENOENT`），
+      // 任务永久卡在 active；修复后任务正常落 `failed`，`lastError` 为
+      // 「CLI 退出码 -1：进程启动失败：spawn /nonexistent/claude ENOENT」。
+      // 即任何 AGENTFLOW_CLAUDE_BIN 配错 / PATH 变更 / CLI 被卸载都能打死平台进程。
+      // 回归测试：`src/runner/claude-code-runner.spawn-error.test.ts`（把本段挪回 yield 之后即变红）。
+      child.on('error', (error) => {
+        clearTimeout(timeoutTimer);
+        push({ kind: 'log', chunk: `进程启动失败：${error.message}` });
+        closed = true;
+        push({ kind: 'exited', code: -1 });
+        logStream.end();
+        running.delete(req.runId);
+        unregisterGroup(child.pid);
+      });
+
+      logStream.write(`${JSON.stringify({ ts: Date.now(), kind: 'spawn', args, cwd: req.workdir })}\n`);
+      yield { kind: 'started', pid: child.pid ?? -1 };
 
       child.stdout.setEncoding('utf8');
       child.stdout.on('data', (chunk: string) => {
@@ -293,16 +313,6 @@ export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentR
         closed = true;
         // 被 SIGKILL 终止时 code 为 null，统一归一为 -1，避免上层把 null 当成功
         push({ kind: 'exited', code: timedOut ? -1 : code });
-        logStream.end();
-        running.delete(req.runId);
-        unregisterGroup(child.pid);
-      });
-
-      child.on('error', (error) => {
-        clearTimeout(timeoutTimer);
-        push({ kind: 'log', chunk: `进程启动失败：${error.message}` });
-        closed = true;
-        push({ kind: 'exited', code: -1 });
         logStream.end();
         running.delete(req.runId);
         unregisterGroup(child.pid);
