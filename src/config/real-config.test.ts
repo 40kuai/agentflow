@@ -21,11 +21,10 @@ describe('仓库内的真实配置', () => {
     }
   });
 
-  it('simple_dev 所有节点 isolate 均为 false（Phase 1 硬约束护栏）', () => {
-    // 硬约束理由：Phase 1 还没有"合并"能力。若某节点 isolate 为 true，
-    // dev 会在 git worktree 里写代码，跑完 worktree 被回收，代码即丢失，
-    // 随后在主工作区运行的 qa_verify 看不到任何改动，闭环就断了。
-    // worktree 隔离必须与合并能力一起引入（Phase 2），故此处锁死 false。
+  it('simple_dev 所有节点 isolate 均为 false（串行基线护栏）', () => {
+    // 之所以锁死 false：simple_dev 是**串行等价性基线**，其行为不得改变。
+    // Task 11 已引入 worktree 隔离与确定性合并（isolate: true 的节点变得可达），
+    // 但并行示例工作流属 Task 12；simple_dev 保持非隔离，确保串行行为与既有单测逐字一致。
     const workflow = loadWorkflow(CONFIG_DIR, 'simple_dev');
     for (const node of workflow.nodes) {
       expect(node.isolate).toBe(false);

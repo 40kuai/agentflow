@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { createKernel } from './kernel.js';
 import { project } from './projector.js';
@@ -1047,6 +1047,321 @@ describe('fan-out / join / 并发上限（Task 9 + Task 10）', () => {
     expect(started.map((e) => e.payload['node_id'])).toEqual(['pm_analyze']);
     const failed = kernel.getEvents(taskId).find((e) => e.type === 'task.failed');
     expect(failed?.payload['owns_overlaps']).toBeDefined();
+    store.close();
+  });
+});
+
+describe('worktree 隔离与确定性合并（Task 11）', () => {
+  /** 真实临时 git 仓库（含一次提交）：worktree 与合并必须走真实 git / 文件系统 */
+  function makeIsolatedRepo(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'agentflow-git-'));
+    execFileSync('git', ['init'], { cwd: dir, stdio: 'pipe' });
+    mkdirSync(join(dir, 'src', 'shared'), { recursive: true });
+    writeFileSync(join(dir, 'README.md'), '# 基座\n');
+    writeFileSync(join(dir, 'src', 'shared', 'seed.txt'), 'committed\n');
+    execFileSync('git', ['add', '.'], { cwd: dir, stdio: 'pipe' });
+    execFileSync(
+      'git',
+      ['-c', 'user.email=test@example.com', '-c', 'user.name=test', 'commit', '-m', 'init'],
+      { cwd: dir, stdio: 'pipe' },
+    );
+    return dir;
+  }
+
+  function isolatedRoles(): Map<string, RoleDef> {
+    const make = (id: string, inputs: string[], outputs: string[], owns: string[]): RoleDef => ({
+      id,
+      displayName: id,
+      systemPrompt: `你是 ${id}`,
+      inputs,
+      outputs,
+      owns,
+      reads: [],
+      responsibilities: [`${id} 的职责`],
+      prohibitions: [`${id} 的禁止事项`],
+      doneCriteria: [`${id} 的完成判据`],
+      model: 'sonnet',
+      maxRetries: 1,
+      maxWallTimeMs: 60_000,
+    });
+    return new Map([
+      ['pm', make('pm', [], ['requirement'], [])],
+      ['dev_a', make('dev_a', ['requirement'], ['code_diff'], ['src/dev_a/**'])],
+      ['dev_b', make('dev_b', ['requirement'], ['code_diff'], ['src/dev_b/**'])],
+      ['qa_engineer', make('qa_engineer', ['code_diff'], ['test_report'], ['tests/**'])],
+    ]);
+  }
+
+  /** 钻石拓扑：pm 扇出 dev_a/dev_b（owns 互不相交），二者都汇入 qa_verify */
+  function isolatedWorkflow(isolate: boolean): WorkflowDef {
+    return {
+      id: 'isolated_demo',
+      start: 'pm_analyze',
+      nodes: [
+        { id: 'pm_analyze', title: '需求分析', role: 'pm', consumes: [], produces: 'requirement', isolate: false },
+        { id: 'dev_a', title: 'dev_a', role: 'dev_a', consumes: ['requirement'], produces: 'code_diff', isolate },
+        { id: 'dev_b', title: 'dev_b', role: 'dev_b', consumes: ['requirement'], produces: 'code_diff', isolate },
+        { id: 'qa_verify', title: '汇总验证', role: 'qa_engineer', consumes: ['code_diff'], produces: 'test_report', isolate: false },
+      ],
+      edges: [
+        { from: 'pm_analyze', to: 'dev_a', when: "all(artifacts.requirement.status == 'ok')", description: '需求已澄清 → dev_a', onMissing: 'fail' },
+        { from: 'pm_analyze', to: 'dev_b', when: "all(artifacts.requirement.status == 'ok')", description: '需求已澄清 → dev_b', onMissing: 'fail' },
+        { from: 'dev_a', to: 'qa_verify', description: 'dev_a 完成 → 汇总', onMissing: 'fail' },
+        { from: 'dev_b', to: 'qa_verify', description: 'dev_b 完成 → 汇总', onMissing: 'fail' },
+      ],
+    };
+  }
+
+  const roleOf = (req: RunRequest): string => /你是\s*(\S+)/.exec(req.systemPrompt)?.[1] ?? 'unknown';
+
+  type Behavior = { files?: Record<string, string>; exitCode?: number; onRun?: (req: RunRequest) => void };
+
+  /** 按角色脚本化的 runner：可在节点工作区里写文件、可指定退出码，供断言隔离/合并 */
+  function createScriptedRunner(
+    behaviorFor: (req: RunRequest) => Behavior,
+  ): AgentRunner & { requests: RunRequest[] } {
+    const requests: RunRequest[] = [];
+    return {
+      id: 'scripted',
+      capabilities: { structuredOutput: true, budgetCap: true, sessionResume: false, builtinReview: false },
+      requests,
+      async *run(req: RunRequest): AsyncIterable<RunnerEvent> {
+        requests.push(req);
+        const behavior = behaviorFor(req);
+        yield { kind: 'started', pid: 1, sessionId: `scripted-${req.runId}` };
+        behavior.onRun?.(req);
+        if (behavior.files) {
+          for (const [rel, content] of Object.entries(behavior.files)) {
+            const target = join(req.workdir, rel);
+            mkdirSync(dirname(target), { recursive: true });
+            writeFileSync(target, content);
+          }
+        }
+        yield { kind: 'artifact', raw: ARTIFACTS[req.artifactType] };
+        yield { kind: 'usage', tokensIn: 1, tokensOut: 1, costUsd: 0.001 };
+        yield { kind: 'exited', code: behavior.exitCode ?? 0 };
+      },
+      async cancel(): Promise<void> {},
+    };
+  }
+
+  function makeIsolatedKernel(opts: {
+    workflow: WorkflowDef;
+    roles: Map<string, RoleDef>;
+    runner: AgentRunner;
+    repoPath: string;
+    workspaceRoot: string;
+    logDir: string;
+    globalConcurrency?: number;
+  }) {
+    const store = createEventStore(':memory:');
+    const kernel = createKernel({
+      store,
+      runner: opts.runner,
+      workflow: opts.workflow,
+      roles: opts.roles,
+      maxPromptTokens: 30_000,
+      workspaceRoot: opts.workspaceRoot,
+      logDir: opts.logDir,
+      repoPath: opts.repoPath,
+      maxSteps: 40,
+      globalConcurrency: opts.globalConcurrency,
+    });
+    return { kernel, store };
+  }
+
+  it('并行节点在各自 worktree 中运行，批次结束后确定性合并回主工作区且 worktree 被回收', async () => {
+    const repo = makeIsolatedRepo();
+    const workspaceRoot = mkdtempSync(join(tmpdir(), 'agentflow-ws-'));
+    const logs = makeLogDir();
+    const runner = createScriptedRunner((req): Behavior => {
+      const role = roleOf(req);
+      if (role === 'dev_a') return { files: { 'src/dev_a/a.ts': '// a\n' } };
+      if (role === 'dev_b') return { files: { 'src/dev_b/b.ts': '// b\n' } };
+      if (role === 'qa_engineer') return { files: { 'tests/qa.test.ts': '// qa\n' } };
+      return {};
+    });
+    const { kernel, store } = makeIsolatedKernel({
+      workflow: isolatedWorkflow(true),
+      roles: isolatedRoles(),
+      runner,
+      repoPath: repo,
+      workspaceRoot,
+      logDir: logs,
+      globalConcurrency: 2,
+    });
+
+    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    const state = await kernel.runTask(taskId);
+
+    expect(state.status).toBe('completed');
+    // 合并：主工作区确实包含各节点改动
+    expect(readFileSync(join(repo, 'src/dev_a/a.ts'), 'utf8')).toBe('// a\n');
+    expect(readFileSync(join(repo, 'src/dev_b/b.ts'), 'utf8')).toBe('// b\n');
+
+    // 可追溯：节点事件记录「改动路径清单 + 工作区标识」
+    const succeeded = kernel.getEvents(taskId).filter((e) => e.type === 'node.succeeded');
+    const devA = succeeded.find((e) => e.payload['node_id'] === 'dev_a')!;
+    expect(devA.payload['changed_paths']).toEqual(['src/dev_a/a.ts']);
+    expect(devA.payload['isolated']).toBe(true);
+    expect(devA.payload['worktree_created']).toBe(true);
+    expect(String(devA.payload['worktree_path'])).toContain(workspaceRoot);
+    expect(String(devA.payload['worktree_path'])).not.toBe(repo);
+    const devB = succeeded.find((e) => e.payload['node_id'] === 'dev_b')!;
+    expect(devB.payload['changed_paths']).toEqual(['src/dev_b/b.ts']);
+    // 两个节点跑在**各自独立**的 worktree 里
+    expect(String(devB.payload['worktree_path'])).not.toBe(String(devA.payload['worktree_path']));
+
+    // 合并结论落库（wp.merged 之前全仓无生产者）
+    const merged = kernel.getEvents(taskId).filter((e) => e.type === 'wp.merged');
+    expect(merged.find((e) => e.payload['node_id'] === 'dev_a')?.payload['merged_paths']).toEqual([
+      'src/dev_a/a.ts',
+    ]);
+    expect(merged.find((e) => e.payload['node_id'] === 'dev_a')?.payload['skipped_paths']).toEqual([]);
+
+    // worktree 回收：仓库里只剩主工作树；workspaceRoot 下无残留目录；临时分支也已删除
+    const worktrees = execFileSync('git', ['worktree', 'list'], { cwd: repo, encoding: 'utf8' });
+    expect(worktrees.trim().split('\n')).toHaveLength(1);
+    expect(readdirSync(workspaceRoot)).toEqual([]);
+    const branches = execFileSync('git', ['branch', '--list', 'agentflow/*'], {
+      cwd: repo,
+      encoding: 'utf8',
+    });
+    expect(branches.trim()).toBe('');
+    store.close();
+  });
+
+  it('isolate:false 的并行节点仍被自动隔离；worktree 能看到主工作区最新的未提交改动', async () => {
+    const repo = makeIsolatedRepo();
+    const workspaceRoot = mkdtempSync(join(tmpdir(), 'agentflow-ws-'));
+    const logs = makeLogDir();
+    // 主工作区存在未提交改动，模拟"上一批次合并回来的上游产物"
+    writeFileSync(join(repo, 'src/shared/seed.txt'), 'dirty-from-upstream\n');
+    let seenInWorktree: string | null = null;
+    const runner = createScriptedRunner((req): Behavior => {
+      const role = roleOf(req);
+      if (role === 'dev_a') {
+        return {
+          onRun: (r) => {
+            seenInWorktree = readFileSync(join(r.workdir, 'src/shared/seed.txt'), 'utf8');
+          },
+          files: { 'src/dev_a/a.ts': '// a\n' },
+        };
+      }
+      if (role === 'dev_b') return { files: { 'src/dev_b/b.ts': '// b\n' } };
+      if (role === 'qa_engineer') return { files: { 'tests/qa.test.ts': '// qa\n' } };
+      return {};
+    });
+    const { kernel, store } = makeIsolatedKernel({
+      workflow: isolatedWorkflow(false),
+      roles: isolatedRoles(),
+      runner,
+      repoPath: repo,
+      workspaceRoot,
+      logDir: logs,
+      globalConcurrency: 2,
+    });
+
+    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    const state = await kernel.runTask(taskId);
+
+    expect(state.status).toBe('completed');
+    // worktree 基于主工作区当前状态创建：节点看到未提交的上游改动
+    expect(seenInWorktree).toBe('dirty-from-upstream\n');
+    // 触发条件生效：配置里 isolate=false，但批次可能真并发 → 自动隔离
+    const devA = kernel
+      .getEvents(taskId)
+      .find((e) => e.type === 'node.succeeded' && e.payload['node_id'] === 'dev_a')!;
+    expect(devA.payload['isolated']).toBe(true);
+    expect(devA.payload['worktree_created']).toBe(true);
+    // 合并只落地 owns 内路径：非 owns 的 seed.txt 保持主工作区版本
+    expect(readFileSync(join(repo, 'src/dev_a/a.ts'), 'utf8')).toBe('// a\n');
+    expect(readFileSync(join(repo, 'src/shared/seed.txt'), 'utf8')).toBe('dirty-from-upstream\n');
+    expect(readdirSync(workspaceRoot)).toEqual([]);
+    store.close();
+  });
+
+  it('失败节点的改动不被合并（成功节点的改动仍合并），worktree 仍被回收', async () => {
+    const repo = makeIsolatedRepo();
+    const workspaceRoot = mkdtempSync(join(tmpdir(), 'agentflow-ws-'));
+    const logs = makeLogDir();
+    const runner = createScriptedRunner((req): Behavior => {
+      const role = roleOf(req);
+      if (role === 'dev_a') return { files: { 'src/dev_a/a.ts': '// a\n' } };
+      if (role === 'dev_b') return { files: { 'src/dev_b/b.ts': '// b\n' }, exitCode: 1 };
+      return {};
+    });
+    const { kernel, store } = makeIsolatedKernel({
+      workflow: isolatedWorkflow(true),
+      roles: isolatedRoles(),
+      runner,
+      repoPath: repo,
+      workspaceRoot,
+      logDir: logs,
+      globalConcurrency: 2,
+    });
+
+    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    const state = await kernel.runTask(taskId);
+
+    expect(state.status).toBe('failed');
+    expect(state.nodes['dev_b']?.status).toBe('failed');
+    // 成功节点合并、失败节点不合并
+    expect(existsSync(join(repo, 'src/dev_a/a.ts'))).toBe(true);
+    expect(existsSync(join(repo, 'src/dev_b/b.ts'))).toBe(false);
+
+    const devBFailed = kernel
+      .getEvents(taskId)
+      .find((e) => e.type === 'node.failed' && e.payload['node_id'] === 'dev_b')!;
+    expect(devBFailed.payload['changed_paths']).toEqual(['src/dev_b/b.ts']);
+    expect(devBFailed.payload['isolated']).toBe(true);
+    const devBMerged = kernel
+      .getEvents(taskId)
+      .find((e) => e.type === 'wp.merged' && e.payload['node_id'] === 'dev_b')!;
+    expect(devBMerged.payload['merged_paths']).toEqual([]);
+    expect(String(devBMerged.payload['reason'])).toContain('失败');
+
+    expect(readdirSync(workspaceRoot)).toEqual([]);
+    store.close();
+  });
+
+  it('串行单节点批次不隔离（isolated=false，worktree_path 即主工作区），且无合并事件', async () => {
+    const repo = makeIsolatedRepo();
+    const workspaceRoot = mkdtempSync(join(tmpdir(), 'agentflow-ws-'));
+    const logs = makeLogDir();
+    const runner = createScriptedRunner((req): Behavior => {
+      const role = roleOf(req);
+      if (role === 'backend_dev') return { files: { 'src/a.ts': '// dev\n' } };
+      if (role === 'qa_engineer') return { files: { 'tests/a.test.ts': '// qa\n' } };
+      return {};
+    });
+    const { kernel, store } = makeIsolatedKernel({
+      workflow,
+      roles: roles(),
+      runner,
+      repoPath: repo,
+      workspaceRoot,
+      logDir: logs,
+      // 即便全局并发上限为 4，单节点批次也不会并发 → 不应隔离（串行等价性）
+      globalConcurrency: 4,
+    });
+
+    const taskId = kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    const state = await kernel.runTask(taskId);
+
+    expect(state.status).toBe('completed');
+    expect(state.completedNodeIds).toEqual(['pm_analyze', 'dev_implement', 'qa_verify']);
+    const succeeded = kernel.getEvents(taskId).filter((e) => e.type === 'node.succeeded');
+    expect(succeeded).toHaveLength(3);
+    for (const event of succeeded) {
+      expect(event.payload['isolated']).toBe(false);
+      expect(event.payload['worktree_path']).toBe(repo);
+    }
+    // 非隔离节点直接写主工作区，无需合并
+    expect(readFileSync(join(repo, 'src/a.ts'), 'utf8')).toBe('// dev\n');
+    expect(kernel.getEvents(taskId).some((e) => e.type === 'wp.merged')).toBe(false);
+    const worktrees = execFileSync('git', ['worktree', 'list'], { cwd: repo, encoding: 'utf8' });
+    expect(worktrees.trim().split('\n')).toHaveLength(1);
     store.close();
   });
 });

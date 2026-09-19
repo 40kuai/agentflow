@@ -13,8 +13,9 @@ import {
   findOwnViolations,
   type BatchConflictPolicy,
 } from './path-guard.js';
+import { mergeBatchChanges } from './merge.js';
 import { project, type TaskState } from './projector.js';
-import { prepareWorkspace, releaseWorkspace } from './scheduler.js';
+import { prepareWorkspace, releaseWorkspace, type Workspace } from './scheduler.js';
 import { decideNext, type EdgeEvaluation } from './state-machine.js';
 
 export type KernelDeps = {
@@ -44,6 +45,19 @@ export type StartTaskInput = {
   title: string;
   requirementRaw: string;
   baseBranch: string;
+};
+
+/**
+ * 一次节点执行的收尾信息（Task 11）：批次结束后据此**合并改动**并**回收工作区**。
+ * `succeeded` 为 false 时其改动不参与合并（失败产物不可信）。
+ */
+type NodeRunResult = {
+  nodeId: string;
+  runId: string;
+  workspace: Workspace;
+  owns: string[];
+  changedPaths: string[];
+  succeeded: boolean;
 };
 
 export type Kernel = {
@@ -91,13 +105,24 @@ export function createKernel(deps: KernelDeps): Kernel {
     // 批次之间会重新赋值：`serialize` 策略把该批次上限降为 1（改为串行）。
     let queue: { nodeId: string; edge: EdgeEvaluation | null }[] = [];
     let batchLimit = concurrencyLimit;
+    // 本批次是否**强制隔离**（Task 11.1 的触发条件）：批次数 ≥2 且本批次生效上限 ≥2 才可能真并发，
+    // 并发节点必须各跑在自己的 worktree 里，否则会互相覆盖工作树。
+    let batchAutoIsolate = false;
     // 在途节点：nodeId → 其 runNode 的「结束即自我移除」包装 promise
     const running = new Map<string, Promise<void>>();
+    // 本批次已结束、待合并/回收的结果；批次全部干净后一次性处理（见 finishBatch）
+    let batchResults: NodeRunResult[] = [];
+    // 本任务全部在途工作区，供异常提前返回时兜底回收（避免残留 worktree）
+    const liveWorkspaces = new Set<Workspace>();
 
     /** 启动一个就绪节点；其 runNode 结束后自动从在途集合移除（成功/失败都移除） */
     function launch(item: { nodeId: string; edge: EdgeEvaluation | null }): void {
-      const tracked = runNode(taskId, item.nodeId, item.edge).then(
-        () => {
+      const autoIsolate = batchAutoIsolate;
+      const tracked = runNode(taskId, item.nodeId, item.edge, autoIsolate, (ws) =>
+        liveWorkspaces.add(ws),
+      ).then(
+        (result) => {
+          if (result) batchResults.push(result);
           running.delete(item.nodeId);
         },
         () => {
@@ -107,95 +132,154 @@ export function createKernel(deps: KernelDeps): Kernel {
       running.set(item.nodeId, tracked);
     }
 
-    for (;;) {
-      if (steps >= deps.maxSteps) {
-        store.append({
-          task_id: taskId,
-          type: 'task.failed',
-          payload: {
-            reason: `超过最大步数 ${deps.maxSteps}，判定为死循环`,
-            reason_category: 'other',
-            reason_label: FAILURE_REASON_LABELS.other,
-          },
-          actor: 'kernel',
+    /**
+     * 批次全部结束：按 `owns` 归属把各节点改动**确定性合并**回主工作区，随后回收全部工作区（Task 11.2）。
+     *
+     * 必须在求解下一批次**之前**完成：下一批的 worktree 是基于「合并后的主工作区」创建的，
+     * 这样下游节点才看得到上游产物。
+     */
+    function finishBatch(): void {
+      const results = batchResults;
+      batchResults = [];
+
+      const isolated = results.filter((r) => r.workspace.isolated);
+      if (isolated.length > 0) {
+        const outcomes = mergeBatchChanges({
+          repoPath: deps.repoPath,
+          nodes: isolated.map((r) => ({
+            nodeId: r.nodeId,
+            workspacePath: r.workspace.path,
+            changedPaths: r.changedPaths,
+            owns: r.owns,
+            succeeded: r.succeeded,
+          })),
         });
-        return getState(taskId);
-      }
-      steps += 1;
-
-      // 1) 就绪节点入队后按上限尽量多启动；超限的留在队列里排队，等有空位再启动。
-      while (queue.length > 0 && running.size < batchLimit) {
-        launch(queue.shift()!);
-      }
-
-      // 2) 有在途节点：等至少一个结束再重新评估。
-      //    这正是 **join 语义**的实现——上游未全部进入终态前，主循环不会去求解下一批次，
-      //    因此 join 节点不会在任一上游仍在运行时被启动。
-      if (running.size > 0) {
-        await Promise.race(running.values());
-        continue;
-      }
-
-      // 3) 无在途、无待启动：求解下一批次（`decideNext` 在无运行节点时才会给出 start/end）
-      const state = getState(taskId);
-      if (state.status !== 'active') {
-        return state;
-      }
-
-      const facts = buildFacts({ state, workflow, roles });
-      const decision = decideNext({ workflow, state, facts });
-
-      if (decision.kind === 'wait') {
-        return state;
-      }
-      if (decision.kind === 'end') {
-        const payload: Record<string, unknown> = { reason: decision.reason };
-        // 失败时把**分类化原因**（稳定枚举 + 中文说明）与结构化解释一并落库，
-        // 界面无需解析 CLI 原始文本即可展示根因；`reason` 仍保留原有中文说明文本。
-        if (decision.failure) {
-          payload['reason_category'] = decision.failure.category;
-          payload['reason_label'] = FAILURE_REASON_LABELS[decision.failure.category];
-          payload['unmet_conditions'] = decision.failure.unmetConditions;
-          payload['artifact_statuses'] = decision.failure.artifactStatuses;
+        // 合并结论落库：`wp.merged` 此前全仓无生产者，此处复用既有事件类型记录"改动来自哪个节点、是否已合并"。
+        for (const outcome of outcomes) {
+          store.append({
+            task_id: taskId,
+            type: 'wp.merged',
+            payload: {
+              node_id: outcome.nodeId,
+              merged_paths: outcome.mergedPaths,
+              skipped_paths: outcome.skippedPaths,
+              reason: outcome.reason,
+            },
+            actor: 'kernel',
+          });
         }
-        store.append({
-          task_id: taskId,
-          type: decision.status === 'completed' ? 'task.completed' : 'task.failed',
-          payload,
-          actor: 'kernel',
-        });
-        return getState(taskId);
       }
 
-      // Task 8：占用检查必须在**批次启动之前**执行（fan-out 后批次可含多个节点）。
-      // 这道闸不可绕过：重叠时按配置改为串行（本批次上限降为 1）或拒绝该批次。
-      const batchNodes = decision.nodeIds.map((id) => {
-        const node = workflow.nodes.find((n) => n.id === id);
-        const batchRole = node ? roles.get(node.role) : undefined;
-        return { nodeId: id, owns: batchRole?.owns ?? [] };
-      });
-      const guard = checkBatchOwns(batchNodes, deps.batchConflictPolicy ?? 'serialize');
-      if (guard.mode === 'reject') {
-        // 拒绝该批次：在启动这些节点之前就把原因写清楚（哪两个节点、哪段路径重叠）
-        store.append({
-          task_id: taskId,
-          type: 'task.failed',
-          payload: {
-            reason: guard.reason,
-            reason_category: 'other' satisfies FailureReason,
-            reason_label: FAILURE_REASON_LABELS.other,
-            owns_overlaps: guard.overlaps,
-          },
-          actor: 'kernel',
-        });
-        return getState(taskId);
+      for (const result of results) {
+        releaseWorkspace(result.workspace, deps.repoPath);
+        liveWorkspaces.delete(result.workspace);
       }
+    }
 
-      batchLimit = guard.mode === 'serialize' ? 1 : concurrencyLimit;
-      queue = decision.nodeIds.map((id, i) => ({
-        nodeId: id,
-        edge: decision.selectedEdges[i] ?? null,
-      }));
+    try {
+      for (;;) {
+        if (steps >= deps.maxSteps) {
+          store.append({
+            task_id: taskId,
+            type: 'task.failed',
+            payload: {
+              reason: `超过最大步数 ${deps.maxSteps}，判定为死循环`,
+              reason_category: 'other',
+              reason_label: FAILURE_REASON_LABELS.other,
+            },
+            actor: 'kernel',
+          });
+          return getState(taskId);
+        }
+        steps += 1;
+
+        // 1) 就绪节点入队后按上限尽量多启动；超限的留在队列里排队，等有空位再启动。
+        while (queue.length > 0 && running.size < batchLimit) {
+          launch(queue.shift()!);
+        }
+
+        // 2) 有在途节点：等至少一个结束再重新评估。
+        //    这正是 **join 语义**的实现——上游未全部进入终态前，主循环不会去求解下一批次，
+        //    因此 join 节点不会在任一上游仍在运行时被启动。
+        if (running.size > 0) {
+          await Promise.race(running.values());
+          continue;
+        }
+
+        // 本批次已全部结束：**先把改动合并回主工作区并回收工作区**，再求解下一批次。
+        // 顺序很重要——下一批的 worktree 基于合并后的主工作区创建，下游才看得到上游产物（Task 11.2）。
+        if (batchResults.length > 0) {
+          finishBatch();
+        }
+
+        // 3) 无在途、无待启动：求解下一批次（`decideNext` 在无运行节点时才会给出 start/end）
+        const state = getState(taskId);
+        if (state.status !== 'active') {
+          return state;
+        }
+
+        const facts = buildFacts({ state, workflow, roles });
+        const decision = decideNext({ workflow, state, facts });
+
+        if (decision.kind === 'wait') {
+          return state;
+        }
+        if (decision.kind === 'end') {
+          const payload: Record<string, unknown> = { reason: decision.reason };
+          // 失败时把**分类化原因**（稳定枚举 + 中文说明）与结构化解释一并落库，
+          // 界面无需解析 CLI 原始文本即可展示根因；`reason` 仍保留原有中文说明文本。
+          if (decision.failure) {
+            payload['reason_category'] = decision.failure.category;
+            payload['reason_label'] = FAILURE_REASON_LABELS[decision.failure.category];
+            payload['unmet_conditions'] = decision.failure.unmetConditions;
+            payload['artifact_statuses'] = decision.failure.artifactStatuses;
+          }
+          store.append({
+            task_id: taskId,
+            type: decision.status === 'completed' ? 'task.completed' : 'task.failed',
+            payload,
+            actor: 'kernel',
+          });
+          return getState(taskId);
+        }
+
+        // Task 8：占用检查必须在**批次启动之前**执行（fan-out 后批次可含多个节点）。
+        // 这道闸不可绕过：重叠时按配置改为串行（本批次上限降为 1）或拒绝该批次。
+        const batchNodes = decision.nodeIds.map((id) => {
+          const node = workflow.nodes.find((n) => n.id === id);
+          const batchRole = node ? roles.get(node.role) : undefined;
+          return { nodeId: id, owns: batchRole?.owns ?? [] };
+        });
+        const guard = checkBatchOwns(batchNodes, deps.batchConflictPolicy ?? 'serialize');
+        if (guard.mode === 'reject') {
+          // 拒绝该批次：在启动这些节点之前就把原因写清楚（哪两个节点、哪段路径重叠）
+          store.append({
+            task_id: taskId,
+            type: 'task.failed',
+            payload: {
+              reason: guard.reason,
+              reason_category: 'other' satisfies FailureReason,
+              reason_label: FAILURE_REASON_LABELS.other,
+              owns_overlaps: guard.overlaps,
+            },
+            actor: 'kernel',
+          });
+          return getState(taskId);
+        }
+
+        batchLimit = guard.mode === 'serialize' ? 1 : concurrencyLimit;
+        // Task 11.1 隔离触发：节点显式 isolate=true，或本批次可能真并发（批次数 ≥2 且生效上限 ≥2）。
+        batchAutoIsolate = batchLimit > 1 && decision.nodeIds.length > 1;
+        queue = decision.nodeIds.map((id, i) => ({
+          nodeId: id,
+          edge: decision.selectedEdges[i] ?? null,
+        }));
+      }
+    } finally {
+      // 异常/提前返回时兜底回收仍在途的工作区，避免残留 worktree
+      for (const ws of liveWorkspaces) {
+        releaseWorkspace(ws, deps.repoPath);
+      }
     }
   }
 
@@ -203,7 +287,9 @@ export function createKernel(deps: KernelDeps): Kernel {
     taskId: string,
     nodeId: string,
     selectedEdge: EdgeEvaluation | null,
-  ): Promise<void> {
+    autoIsolate: boolean,
+    trackWorkspace: (ws: Workspace) => void,
+  ): Promise<NodeRunResult | null> {
     const node = workflow.nodes.find((n) => n.id === nodeId);
     if (!node) {
       store.append({
@@ -216,7 +302,7 @@ export function createKernel(deps: KernelDeps): Kernel {
         },
         actor: 'kernel',
       });
-      return;
+      return null;
     }
 
     const role = roles.get(node.role);
@@ -231,17 +317,43 @@ export function createKernel(deps: KernelDeps): Kernel {
         },
         actor: 'kernel',
       });
-      return;
+      return null;
     }
 
     const stateBefore = getState(taskId);
-    const ws = prepareWorkspace({
-      workspaceRoot: deps.workspaceRoot,
-      repoPath: deps.repoPath,
-      isolate: node.isolate,
-      taskId,
-      nodeId,
-    });
+
+    // 收窄后的角色可写范围（供嵌套函数 result 使用，避免闭包内再判空）
+    const roleOwns = role.owns;
+
+    // Task 11.1 隔离触发条件：节点显式 `isolate: true`，或本批次可能真并发（批次数 ≥2 且生效上限 ≥2）。
+    // 只有"可能并发"时才必须隔离（并发节点共用一棵工作树会互相覆盖）；串行批次不隔离，
+    // 从而保持既有串行行为（simple_dev 三节点直线、全 isolate:false）完全不变。
+    const isolate = node.isolate || autoIsolate;
+    let ws: Workspace;
+    try {
+      ws = prepareWorkspace({
+        workspaceRoot: deps.workspaceRoot,
+        repoPath: deps.repoPath,
+        isolate,
+        taskId,
+        nodeId,
+      });
+    } catch (error) {
+      // 工作区创建失败必须有明确失败路径（不静默继续）
+      store.append({
+        task_id: taskId,
+        type: 'task.failed',
+        payload: {
+          reason: `节点 ${nodeId} 的工作区创建失败：${(error as Error).message}`,
+          reason_category: 'other' satisfies FailureReason,
+          reason_label: FAILURE_REASON_LABELS.other,
+        },
+        actor: 'kernel',
+      });
+      return null;
+    }
+    // 登记在途工作区：runTask 的 finally 会在异常提前返回时兜底回收，避免残留 worktree
+    trackWorkspace(ws);
 
     const previousVisit = stateBefore.visitCounts[nodeId] ?? 0;
 
@@ -269,7 +381,16 @@ export function createKernel(deps: KernelDeps): Kernel {
     store.append({
       task_id: taskId,
       type: 'node.queued',
-      payload: { node_id: nodeId, role_id: role.id, run_id: ws.runId, attempt: previousVisit + 1 },
+      payload: {
+        node_id: nodeId,
+        role_id: role.id,
+        run_id: ws.runId,
+        attempt: previousVisit + 1,
+        // Task 11.3 可追溯：工作区标识（隔离时为 worktree 路径，否则即主工作区）
+        worktree_path: ws.path,
+        isolated: ws.isolated,
+        worktree_created: ws.createdWorktree,
+      },
       actor: 'kernel',
     });
 
@@ -295,6 +416,9 @@ export function createKernel(deps: KernelDeps): Kernel {
         run_id: ws.runId,
         attempt: previousVisit + 1,
         log_ref: logRef,
+        worktree_path: ws.path,
+        isolated: ws.isolated,
+        worktree_created: ws.createdWorktree,
       },
       actor: `role:${role.id}`,
     });
@@ -391,7 +515,22 @@ export function createKernel(deps: KernelDeps): Kernel {
         ? { out_of_bounds_paths: outOfBoundsPaths, changed_paths: changedPaths }
         : {};
 
-    releaseWorkspace(ws, deps.repoPath);
+    // Task 11：工作区**不在此处回收**——批次结束后由 runTask 的 finishBatch 统一「先合并、再回收」。
+    // 若仍在此回收，隔离节点写进 worktree 的改动会在合并之前被删掉（这正是 Task 11 要让其可达的核心前提）。
+
+    // Task 11.3 可追溯：把「改动路径清单 + 工作区标识」写进每个节点的终态事件，
+    // 使"这次改动来自哪个节点、落在哪个工作区"可追溯。
+    const workspaceExtra: Record<string, unknown> = {
+      changed_paths: changedPaths,
+      worktree_path: ws.path,
+      isolated: ws.isolated,
+      worktree_created: ws.createdWorktree,
+    };
+
+    /** 收尾结果：succeeded=false 的节点改动不会被合并 */
+    function result(succeeded: boolean): NodeRunResult {
+      return { nodeId, runId: ws.runId, workspace: ws, owns: roleOwns, changedPaths, succeeded };
+    }
 
     /**
      * 统一的失败落库：node.failed 与 task.failed 各写一条，均带**稳定分类枚举 + 中文说明**，
@@ -403,7 +542,7 @@ export function createKernel(deps: KernelDeps): Kernel {
       rawError: string,
       taskReason: string,
       extra: Record<string, unknown> = {},
-    ): void {
+    ): NodeRunResult {
       store.append({
         task_id: taskId,
         type: 'node.failed',
@@ -414,6 +553,7 @@ export function createKernel(deps: KernelDeps): Kernel {
           reason_category: category,
           reason_label: FAILURE_REASON_LABELS[category],
           log_ref: logRef,
+          ...workspaceExtra,
           ...extra,
         },
         actor: 'kernel',
@@ -430,6 +570,7 @@ export function createKernel(deps: KernelDeps): Kernel {
         },
         actor: 'kernel',
       });
+      return result(false);
     }
 
     if (exitCode !== 0) {
@@ -440,22 +581,29 @@ export function createKernel(deps: KernelDeps): Kernel {
       }
       const rawError = `CLI 退出码 ${exitCode}${detailParts.length > 0 ? `：${detailParts.join(' / ')}` : ''}`;
       // 分类来自 runner 层对 CLI subtype 的映射；runner 未给出分类时归入 other
-      failNode(failureReason ?? 'other', rawError, `节点 ${nodeId} 执行失败`, violationExtra);
-      return;
+      return failNode(failureReason ?? 'other', rawError, `节点 ${nodeId} 执行失败`, violationExtra);
     }
 
     if (!hasArtifact) {
       const rawError = `未产出任何结构化结果（期望类型 ${node.produces}）`;
-      failNode(failureReason ?? 'other', rawError, `节点 ${nodeId} 未产出结构化结果`, violationExtra);
-      return;
+      return failNode(
+        failureReason ?? 'other',
+        rawError,
+        `节点 ${nodeId} 未产出结构化结果`,
+        violationExtra,
+      );
     }
 
     let parsed: ParsedArtifactPayload;
     try {
       parsed = parseArtifactPayload(node.produces as ArtifactType, artifactRaw);
     } catch (error) {
-      failNode('invalid_payload', (error as Error).message, `节点 ${nodeId} 产出载荷不合规`, violationExtra);
-      return;
+      return failNode(
+        'invalid_payload',
+        (error as Error).message,
+        `节点 ${nodeId} 产出载荷不合规`,
+        violationExtra,
+      );
     }
 
     const artifactId = newId('art');
@@ -498,21 +646,21 @@ export function createKernel(deps: KernelDeps): Kernel {
         },
         actor: 'kernel',
       });
-      failNode(
+      return failNode(
         'permission_denied',
         `越界写入 ${outOfBoundsPaths.length} 个路径：${outOfBoundsPaths.join(', ')}`,
         `节点 ${nodeId} 越界写入（超出 owns 允许范围）`,
         violationExtra,
       );
-      return;
     }
 
     store.append({
       task_id: taskId,
       type: 'node.succeeded',
-      payload: { node_id: nodeId, run_id: ws.runId, log_ref: logRef },
+      payload: { node_id: nodeId, run_id: ws.runId, log_ref: logRef, ...workspaceExtra },
       actor: 'kernel',
     });
+    return result(true);
   }
 
   return { startTask, getState, getEvents, runTask };

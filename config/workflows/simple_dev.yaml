@@ -1,9 +1,9 @@
 id: simple_dev
 start: pm_analyze
-# 注意：Phase 1 所有节点 isolate 一律为 false。
-# 原因：本阶段还没有"合并"能力，若 dev 在 worktree 里写代码，跑完 worktree 会被回收，
-# 代码即丢失，随后 qa_verify（在主工作区运行）看不到任何改动，闭环就断了。
-# worktree 隔离必须与合并能力一起引入，属于 Phase 2。
+# simple_dev 是**串行等价性基线**：三节点直线、全部 isolate=false，行为不得改变。
+# worktree 隔离与确定性合并能力已由 Task 11 提供（isolate: true 的节点会在独立 worktree 中运行，
+# 批次结束后按 owns 归属确定性合并回主工作区，见 src/kernel/scheduler.ts 与 src/kernel/merge.ts）；
+# 本文件刻意保持非隔离，并行示例工作流属 Task 12。
 #
 # 契约唯一来源：本文件节点的 consumes/produces 是**派生**字段，权威来源是 config/roles/*.yaml
 # 的 inputs/outputs。二者不一致时加载期报错（详见 src/config/loader.ts）。

@@ -59,11 +59,11 @@
   - [x] SubTask 10.3: 保证无并发时行为与既有串行**等价**（现有单测全绿）
   - [x] SubTask 10.4: 补测试：并发上限被遵守、超限节点排队
 
-- [ ] Task 11: worktree 隔离与确定性合并
-  - [ ] SubTask 11.1: 并行节点在各自独立 git worktree 中运行（复用 `src/kernel/scheduler.ts` 既有骨架）
-  - [ ] SubTask 11.2: 批次结束后按 `owns` 不相交的前提将各节点改动**确定性合并**回主工作区
-  - [ ] SubTask 11.3: 每个节点的事件中记录其改动的路径与工作区标识（可追溯"改动来自哪个节点"）
-  - [ ] SubTask 11.4: 补测试：合并后主工作区包含各节点改动、可追溯字段存在、worktree 被回收
+- [x] Task 11: worktree 隔离与确定性合并
+  - [x] SubTask 11.1: 并行节点在各自独立 git worktree 中运行（复用 `src/kernel/scheduler.ts` 既有骨架）
+  - [x] SubTask 11.2: 批次结束后按 `owns` 不相交的前提将各节点改动**确定性合并**回主工作区
+  - [x] SubTask 11.3: 每个节点的事件中记录其改动的路径与工作区标识（可追溯"改动来自哪个节点"）
+  - [x] SubTask 11.4: 补测试：合并后主工作区包含各节点改动、可追溯字段存在、worktree 被回收
 
 - [ ] Task 12: 提供并行示例工作流（不破坏既有串行流程）
   - [ ] SubTask 12.1: 新增一个演示并行的工作流配置（含 PM 产出 `work_package_plan` 后扇出多个开发节点、再 join 到测试节点）
