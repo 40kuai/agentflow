@@ -119,7 +119,7 @@ export function App() {
             <h2>{detail.title}</h2>
             <div className="sub">
               状态 {detail.status} · 已消耗 ${detail.budgetUsedUsd.toFixed(4)} · 并行度{' '}
-              {detail.currentNodeIds.length}
+              {detail.currentNodeIds.length}（Phase 1 串行执行，并发调度属 Phase 2）
             </div>
 
             <div className="timeline">

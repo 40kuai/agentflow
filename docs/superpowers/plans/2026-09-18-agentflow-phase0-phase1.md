@@ -22,7 +22,7 @@
 - 提交信息用中文，格式 `类型: 说明`（如 `feat: 新增事件存储`）
 - 本阶段实现的 Artifact 类型**只有 4 种**：`requirement` / `work_package_plan` / `code_diff` / `test_report`。其余类型在后续阶段补充
 - 本阶段是**单引擎（claude-code）、串行**流程。并行、codex、卡点 G1–G3 均不属于本计划范围
-- **Artifact status 规则（本阶段）**：CLI 退出码为 0 且载荷通过 zod 校验 → 内核写入 `status: 'ok'`；否则节点失败。也就是说 **Phase 1 中 status 恒为 `ok`**，工作流边条件里的 `artifacts.*.status == 'ok'` 实际起的是"确认产物存在且合法"的作用。从载荷内容派生出 `needs_changes` / `blocked` 需要 LLM 判断，留到引入 LLM 决策器的阶段再做
+- **Artifact status 规则（2026-09-19 契约修复后）**：`status` 由**模型在结构化输出里给出**——每个 payload schema 内嵌 `status: ok | needs_changes | blocked`（带 `default('ok')`，兼容不含该字段的历史归档样本）；内核用 `parseArtifactPayload` 把它**提升为 Artifact 行的独立列**并写入 `artifact.created`，**不再写死 `'ok'`**。CLI 退出码为 0、载荷通过 zod 校验、产物写入成功，节点才算成功。工作流边条件 `artifacts.*.status == 'ok'` 因此真正生效：模型判 `blocked` / `needs_changes` → 该边不通过 → 任务落 `failed`，并在错误原因里带出未满足的条件与当前产物状态。**（修复前：内核写死 `ok`，模型的判断被静默吃掉，边条件形同恒真。）**
 - **本阶段所有工作流节点的 `isolate` 一律为 `false`**：Phase 1 没有合并能力，若在 worktree 里写代码，worktree 回收后代码即丢失，后续节点看不到改动，闭环就断了。worktree 隔离必须与合并能力一起引入，属于 Phase 2
 
 ## 目录与文件结构
@@ -3423,6 +3423,27 @@ Task 2 用真实 CLI 实测（含 16,403 次重试的可复核证据）推翻了
 > （原两条子串断言都不含 `dangerously-skip-permissions` 这个子串，等于从洞里漏过去）。
 
 **可测性设计**：解析逻辑与进程管理分离。`parseStreamLine(line)` 是纯函数，可脱离真实 CLI 单测；`createClaudeCodeRunner` 只负责 spawn 与把 stdout 行喂给解析函数。
+
+> **实测修正（2026-09-19，`--json-schema` 与 `result` 两条通道互为兜底）**
+>
+> 一次真实任务（`logs/runs/run_46e7a5442100440da2ac.jsonl`）里 `pm_analyze` 以
+> `subtype: error_max_structured_output_retries` 收场、`result: undefined`（22 轮 / 103 秒 / $0.417，零产出），
+> 但该次调用里 **5 次 `StructuredOutput` 工具调用每次返回都是 "provided successfully"、提交的键集合也完全合规**。
+> 说明 CLI 的结构化输出 harness 要求那次提交是**终结动作**：模型在调用之间继续 Grep/Read 并重复提交，
+> harness 反复重新注入约束，最终耗尽预算判失败。该 `result` 行已逐字归档为
+> `tests/fixtures/claude-stream-maxretries-sample.jsonl`，并有契约测试断言「必须被识别为需降级重试」。
+>
+> 于是**两条通道互为兜底**：
+> - 开 `--json-schema`：可能以 `error_max_structured_output_retries` 零产出（即上一条）；
+> - 关 `--json-schema`：模型可能把 JSON 包进 ` ```json ` 代码块 → `JSON.parse` 失败（`claude-stream-plain-sample.jsonl`）。
+>
+> 落地为两处：① 装配后的 prompt 在「硬约束」里写明终止语义（「调用一次 StructuredOutput 提交后立即结束本轮，
+> 不要再读写文件、不要重复提交」，见 `src/kernel/context-assembler.ts`）；
+> ② runner 层在识别到该 subtype 后**自动关闭 `--json-schema` 重跑一次**（走 `result` 通道），
+> 只降级一次、失败即按失败处理、只读角色不做例外，并留一条 `{kind:'log'}` 说明
+> 「结构化输出重试耗尽，已降级为 result 通道重试一次」。代价是新增一次真实调用与额外花费——这是互为兜底本身的价值，属预期。
+> 识别函数 `isStructuredOutputRetriesExhausted(line)` 与降级重试由 `src/runner/claude-code-runner.retry.test.ts`
+> （假 bin，不调真实 claude）把守。
 
 - [ ] **Step 1: 写失败的测试 `src/runner/claude-code-runner.test.ts`**
 
