@@ -14,28 +14,28 @@
   - [x] SubTask 2.2: 在 `src/config/schema.ts` 与 `config/workflows/simple_dev.yaml` 中落地上述字段
   - [x] SubTask 2.3: 补测试覆盖字段的解析与校验
 
-- [ ] Task 3: 失败原因分类化（引擎可解释的基础）
-  - [ ] SubTask 3.1: 在 `src/shared/events.ts` 定义稳定的原因分类枚举（权限被拒 / 超时 / 载荷不合规 / 结构化输出重试耗尽 / 条件不满足 / 其他）
-  - [ ] SubTask 3.2: 在 `src/kernel/kernel.ts` 的失败路径写入分类（含中文说明），保留原始文本作为附加信息
-  - [ ] SubTask 3.3: 在 runner 层把已知 subtype 映射到分类枚举（复用既有的降级触发判据，不改变其行为）
-  - [ ] SubTask 3.4: 补测试并做变异验证（分类写错或写死时应有测试变红）
+- [x] Task 3: 失败原因分类化（引擎可解释的基础）
+  - [x] SubTask 3.1: 在 `src/shared/events.ts` 定义稳定的原因分类枚举（权限被拒 / 超时 / 载荷不合规 / 结构化输出重试耗尽 / 条件不满足 / 其他）
+  - [x] SubTask 3.2: 在 `src/kernel/kernel.ts` 的失败路径写入分类（含中文说明），保留原始文本作为附加信息
+  - [x] SubTask 3.3: 在 runner 层把已知 subtype 映射到分类枚举（复用既有的降级触发判据，不改变其行为）
+  - [x] SubTask 3.4: 补测试并做变异验证（分类写错或写死时应有测试变红）
 
-- [ ] Task 4: 决策结构化（`decideNext` 返回可解释结果）
-  - [ ] SubTask 4.1: 扩展 `src/kernel/state-machine.ts` 的返回类型：被激活节点集合 + 被选中边 + 未选中边及各自原因 + 失败/等待的区分
-  - [ ] SubTask 4.2: 在 `src/kernel/kernel.ts` 消费新结构，保持既有串行行为**等价**（现有三节点直线流程行为不变）
-  - [ ] SubTask 4.3: 转换事件中记录：所用边、条件表达式原文、该表达式的**人类可读说明**、判定依据（相关产物状态）
-  - [ ] SubTask 4.4: 补测试（含"为何无法流转"的失败原因同时含条件、实际状态、分类）
+- [x] Task 4: 决策结构化（`decideNext` 返回可解释结果）
+  - [x] SubTask 4.1: 扩展 `src/kernel/state-machine.ts` 的返回类型：被激活节点集合 + 被选中边 + 未选中边及各自原因 + 失败/等待的区分
+  - [x] SubTask 4.2: 在 `src/kernel/kernel.ts` 消费新结构，保持既有串行行为**等价**（现有三节点直线流程行为不变）
+  - [x] SubTask 4.3: 转换事件中记录：所用边、条件表达式原文、该表达式的**人类可读说明**、判定依据（相关产物状态）
+  - [x] SubTask 4.4: 补测试（含"为何无法流转"的失败原因同时含条件、实际状态、分类）
 
-- [ ] Task 5: 角色与流转的查询 API（供用户自己的前端消费，**不碰 `web/`**）
-  - [ ] SubTask 5.1: `GET` 角色列表与详情（职责/禁止事项/完成判据/可写路径/可读路径/模型/预算）
-  - [ ] SubTask 5.2: `GET` 某任务的角色使用情况（角色↔节点↔状态↔产出类型↔耗时↔花费）
-  - [ ] SubTask 5.3: `GET` 某任务的流转视图（拓扑 + 每个节点的进入理由、状态、阻塞原因）
-  - [ ] SubTask 5.4: 补测试覆盖三类返回的结构化字段（含无角色/无流转的边界）
+- [x] Task 5: 角色与流转的查询 API（供用户自己的前端消费，**不碰 `web/`**）
+  - [x] SubTask 5.1: `GET` 角色列表与详情（职责/禁止事项/完成判据/可写路径/可读路径/模型/预算）
+  - [x] SubTask 5.2: `GET` 某任务的角色使用情况（角色↔节点↔状态↔产出类型↔耗时↔花费）
+  - [x] SubTask 5.3: `GET` 某任务的流转视图（拓扑 + 每个节点的进入理由、状态、阻塞原因）
+  - [x] SubTask 5.4: 补测试覆盖三类返回的结构化字段（含无角色/无流转的边界）
 
-- [ ] Task 6: 角色编辑 API（写入前校验，非法编辑不落盘）
-  - [ ] SubTask 6.1: 实现编辑端点：校验通过才写回 YAML
-  - [ ] SubTask 6.2: 保证"编辑前内容不变"的原子性（校验失败时不产生任何写入）
-  - [ ] SubTask 6.3: 补测试：合法编辑后加载得到一致结果；非法编辑返回明确错误且文件内容不变（**变异验证**：跳过校验后应有测试变红）
+- [x] Task 6: 角色编辑 API（写入前校验，非法编辑不落盘）
+  - [x] SubTask 6.1: 实现编辑端点：校验通过才写回 YAML
+  - [x] SubTask 6.2: 保证"编辑前内容不变"的原子性（校验失败时不产生任何写入）
+  - [x] SubTask 6.3: 补测试：合法编辑后加载得到一致结果；非法编辑返回明确错误且文件内容不变（**变异验证**：跳过校验后应有测试变红）
 
 - [x] Task 7: `owns` 路径级强制（越界检出）
   - [x] SubTask 7.1: 节点结束后采集其工作区实际变更路径（`git status`/`git diff --name-only` 等价手段）
@@ -65,23 +65,26 @@
   - [x] SubTask 11.3: 每个节点的事件中记录其改动的路径与工作区标识（可追溯"改动来自哪个节点"）
   - [x] SubTask 11.4: 补测试：合并后主工作区包含各节点改动、可追溯字段存在、worktree 被回收
 
-- [ ] Task 12: 提供并行示例工作流（不破坏既有串行流程）
-  - [ ] SubTask 12.1: 新增一个演示并行的工作流配置（含 PM 产出 `work_package_plan` 后扇出多个开发节点、再 join 到测试节点）
-  - [ ] SubTask 12.2: 各并行开发节点的 `owns` **互不相交**，以通过占用检查
-  - [ ] SubTask 12.3: 保留 `config/workflows/simple_dev.yaml` 作为串行基线（其行为不得改变）
+- [x] Task 12: 提供并行示例工作流（不破坏既有串行流程）
+  - [x] SubTask 12.1: 新增一个演示并行的工作流配置（含 PM 产出 `work_package_plan` 后扇出多个开发节点、再 join 到测试节点）
+  - [x] SubTask 12.2: 各并行开发节点的 `owns` **互不相交**，以通过占用检查
+  - [x] SubTask 12.3: 保留 `config/workflows/simple_dev.yaml` 作为串行基线（其行为不得改变）
 
-- [ ] Task 13: 文档与台账同步
-  - [ ] SubTask 13.1: 同步 spec（`docs/superpowers/specs/...design.md`）中角色定义、工作流定义、决策语义、并发与隔离的表述
-  - [ ] SubTask 13.2: 同步计划文档中受影响章节
-  - [ ] SubTask 13.3: 在 `记录.md` 更新：`globalConcurrency` 已被消费、`owns` 已强制、并发已实现、以及仍属后续阶段的范围
-  - [ ] SubTask 13.4: 如实记录本次仍未覆盖的范围（PM 拆解质量的自动保证、G1–G3 卡点、前端渲染）
+- [x] Task 13: 文档与台账同步
+  - [x] SubTask 13.1: 同步 spec（`docs/superpowers/specs/...design.md`）中角色定义、工作流定义、决策语义、并发与隔离的表述
+  - [x] SubTask 13.2: 同步计划文档中受影响章节
+  - [x] SubTask 13.3: 在 `记录.md` 更新：`globalConcurrency` 已被消费、`owns` 已强制、并发已实现、以及仍属后续阶段的范围
+  - [x] SubTask 13.4: 如实记录本次仍未覆盖的范围（PM 拆解质量的自动保证、G1–G3 卡点、前端渲染）
 
-- [ ] Task 14: 集成验证
-  - [ ] SubTask 14.1: 全量 `npx vitest run` 与 `npx tsc --noEmit` 通过
-  - [ ] SubTask 14.2: 验证串行等价性：既有 `simple_dev` 的单元行为不变
-  - [ ] SubTask 14.3: 验证并行批次：扇出→并发（不超上限）→合并→join 的完整链路（用 Fake Runner，**不真实调用 claude**）
-  - [ ] SubTask 14.4: 验证并发上限小于就绪节点数时确实排队
-  - [ ] SubTask 14.5: 端到端冒烟（`tests/e2e/smoke.sh`，会真实消耗额度，需用户确认后执行）
+- [x] Task 14: 集成验证
+  - [x] SubTask 14.1: 全量 `npx vitest run` 与 `npx tsc --noEmit` 通过
+  - [x] SubTask 14.2: 验证串行等价性：既有 `simple_dev` 的单元行为不变
+  - [x] SubTask 14.3: 验证并行批次：扇出→并发（不超上限）→合并→join 的完整链路（用 Fake Runner，**不真实调用 claude**）
+  - [x] SubTask 14.4: 验证并发上限小于就绪节点数时确实排队
+  - [x] SubTask 14.5: 端到端冒烟（`tests/e2e/smoke.sh`）—— **PASS（2026-09-19，一次跑通）**：`status=completed`、3/3 `node.succeeded`、
+    `completedNodeIds=["pm_analyze","dev_implement","qa_verify"]`、3/3 artifact（`requirement`/`code_diff`/`test_report` 均 `status=ok`）、
+    `dev self_test_result=passed`、3/3 `log_ref` 存在、AgentFlow 仓库未被 agent 触碰；实测总花费 **$0.4115058**（190.3s）。
+    需求文本已对齐各角色 `owns`（dev 只产 `src/hello.sh`，测试由 qa 在 `tests/**` 内自建）
 
 # Task Dependencies
 
@@ -98,3 +101,14 @@
 - Task 1/2/3 之间：契约字段、拓扑字段、失败分类三者互不阻塞，可并行推进
 - Task 5/6 之间：查询 API 与编辑 API 共享角色模型，建议同一实现者顺序完成，避免冲突
 - Task 12/13 可在 Task 11 完成后并行（示例配置与文档互不阻塞）
+
+# 验收时的遗留项（如实登记，均**不属**本 spec 的未完成项）
+
+以下为 Task 14 验收时发现的、**跨任务或属他人工作**的项，不阻塞本 spec 验收，如实登记：
+
+- [ ] **跨任务冲突（中）**：本 spec 的 Task 12 新增了 3 个角色（为让并行节点 `owns` 互不相交），使用户的 `tests/website/website.test.ts` 的 **AC5「角色数=3」断言失败**（角色现为 6）。需官网负责人把该断言改为不写死数量（或按角色清单动态断言）。**本 spec 未修改该测试。**
+- [ ] **未跟踪的 `README.md`（低）**：其内容仍写「`globalConcurrency` 无消费者 / 并发未实现 / `owns` 未强制 / 仅 3 角色」，与当前实现矛盾。该文件**未跟踪**（疑似用户运行留下的产物），按"不回退用户改动"的原则未处理。
+- [ ] **`web/` 内的过期文案（低）**：`web/src/App.tsx`、`web/src/components/NodeCostView.tsx` 仍有「无消费者」等表述。`web/` 归用户，本 spec 未触碰。
+- [ ] **`on_missing` 仅为声明式（信息）**：边的失败语义字段已可读，但内核尚未消费它（join 等待语义由主循环保证）。如需内核依它区分"失败 vs 等待"，应另开任务。
+- [ ] **`parallel_dev` 未接线（信息）**：`src/main.ts` 仍固定加载 `simple_dev`，`parallel_dev` 为可加载、可校验、可被测试驱动的示例。若要默认跑并行流程，需改接线。
+- [x] **端到端冒烟待执行**：见 SubTask 14.5 —— **已执行且 PASS（2026-09-19 一次跑通，实测 $0.4115058）**，本条遗留项关闭。
