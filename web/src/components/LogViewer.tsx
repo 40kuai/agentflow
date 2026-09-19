@@ -67,6 +67,7 @@ export function LogViewer({ taskId, nodes, focusNodeId }: Props) {
   const [hitIndex, setHitIndex] = useState(0);
   const [highlightLine, setHighlightLine] = useState<number | null>(null);
   const [reloadToken, setReloadToken] = useState(0);
+  const [wrapLines, setWrapLines] = useState(true);
   const containerRef = useRef<HTMLDivElement | null>(null);
 
   // nodes 每次轮询都会是新数组：用 ref 读，避免把它放进 fetch 依赖里造成每 2 秒重拉日志
@@ -213,6 +214,16 @@ export function LogViewer({ taskId, nodes, focusNodeId }: Props) {
             >
               诊断视图
             </button>
+            {view === 'raw' && (
+              <button
+                type="button"
+                className={`tab-btn${wrapLines ? ' active' : ''}`}
+                onClick={() => setWrapLines((v) => !v)}
+                title="折行可避免超长横向滚动"
+              >
+                折行 {wrapLines ? '开' : '关'}
+              </button>
+            )}
           </div>
         </div>
 
@@ -314,7 +325,7 @@ export function LogViewer({ taskId, nodes, focusNodeId }: Props) {
       )}
 
       {data && !error && view === 'raw' && (
-        <RawView lines={parsed.rawLines} highlightLine={highlightLine} query={query} />
+        <RawView lines={parsed.rawLines} highlightLine={highlightLine} query={query} wrap={wrapLines} />
       )}
 
       {data && !error && view === 'diagnostic' && (
@@ -325,6 +336,7 @@ export function LogViewer({ taskId, nodes, focusNodeId }: Props) {
           skippedStreamEvents={diagnostics.skippedStreamEvents}
           parseFailures={diagnostics.parseFailures}
           totalEntries={diagnostics.totalEntries}
+          windowLines={data.returnedLines}
           onJump={jumpToLine}
         />
       )}
@@ -592,9 +604,19 @@ function ResultBlock({ info, lineChip }: { info: ResultInfo; lineChip: ReactNode
   );
 }
 
-function Metric({ label, value, tone }: { label: string; value: string; tone?: string }) {
+function Metric({
+  label,
+  value,
+  tone,
+  wide,
+}: {
+  label: string;
+  value: string;
+  tone?: string;
+  wide?: boolean;
+}) {
   return (
-    <div className="metric">
+    <div className={`metric${wide ? ' wide' : ''}`}>
       <div className="metric-label">{label}</div>
       <div className={`metric-value${tone ? ` tone-${tone}` : ''}`}>{value}</div>
     </div>
@@ -609,16 +631,18 @@ function RawView({
   lines,
   highlightLine,
   query,
+  wrap,
 }: {
   lines: ParsedLog['rawLines'];
   highlightLine: number | null;
   query: string;
+  wrap: boolean;
 }) {
   if (lines.length === 0) return <EmptyState>没有返回任何日志行。</EmptyState>;
   const needle = query.trim().toLowerCase();
 
   return (
-    <div className="raw-view">
+    <div className={`raw-view${wrap ? ' wrap' : ''}`}>
       {lines.map((line) => (
         <div
           key={line.lineNo}
@@ -669,6 +693,7 @@ function DiagnosticView({
   skippedStreamEvents,
   parseFailures,
   totalEntries,
+  windowLines,
   onJump,
 }: {
   signals: DiagnosticSignal[];
@@ -677,6 +702,8 @@ function DiagnosticView({
   skippedStreamEvents: number;
   parseFailures: number;
   totalEntries: number;
+  /** 本窗口实际返回的日志行数（用于标注统计口径边界） */
+  windowLines: number;
   onJump: (lineNo: number) => void;
 }) {
   const toolTotal = toolCounts.reduce((sum, tool) => sum + tool.count, 0);
@@ -686,7 +713,7 @@ function DiagnosticView({
       <Section title="终局指标">
         {result ? (
           <div className="result-metrics">
-            <Metric label="subtype" value={result.subtype} tone={result.isError ? 'fail' : 'ok'} />
+            <Metric label="subtype" value={result.subtype} tone={result.isError ? 'fail' : 'ok'} wide />
             <Metric
               label="is_error"
               value={String(result.isError)}
@@ -764,7 +791,7 @@ function DiagnosticView({
         </table>
       </Section>
 
-      <Section title={`工具调用统计（共 ${toolTotal} 次）`}>
+      <Section title={`工具调用统计（本窗口最后 ${windowLines} 行内，共 ${toolTotal} 次）`}>
         {toolCounts.length === 0 ? (
           <div className="muted">本窗口内未观察到 tool_use 调用。</div>
         ) : (

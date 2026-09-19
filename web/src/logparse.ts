@@ -534,11 +534,15 @@ export function scanDiagnostics(parsed: ParsedLog): LogDiagnostics {
     id: 'subtype',
     label: 'result.subtype',
     severity: retriesExhausted.length > 0 ? 'error' : subtypes.length > 0 ? 'info' : 'ok',
-    count: retriesExhausted.length,
+    // count 与 detail 口径对齐：都按"出现过的 subtype 次数"统计（此前只计 max-retries 子型，导致 count=0 但 detail 写"出现过 success"）
+    count: subtypes.length,
     lineNos: subtypeEntries
-      .filter((e) => asString(e.json?.['subtype']) === 'error_max_structured_output_retries')
+      .filter((e) => asString(e.json?.['subtype'], 'unknown') !== 'unknown')
       .map((e) => e.lineNo),
-    detail: subtypes.length > 0 ? `出现过的 subtype：${[...new Set(subtypes)].join(', ')}` : '未出现 result 行',
+    detail:
+      subtypes.length > 0
+        ? `出现过的 subtype（${subtypes.length} 条 result 行）：${[...new Set(subtypes)].join(', ')}`
+        : '未出现 result 行',
   });
 
   signals.push({

@@ -63,17 +63,26 @@ export function TaskList({ tasks, selectedId, error, onSelect, onCreate }: Props
 
       <form className="create-form" onSubmit={handleSubmit}>
         <input
+          id="create-title"
+          name="title"
+          aria-label="任务标题"
           placeholder="任务标题"
           value={title}
           onChange={(e) => setTitle(e.target.value)}
         />
         <textarea
+          id="create-requirement"
+          name="requirementRaw"
+          aria-label="需求原文"
           placeholder="需求原文（requirementRaw）"
           rows={3}
           value={requirement}
           onChange={(e) => setRequirement(e.target.value)}
         />
         <input
+          id="create-base-branch"
+          name="baseBranch"
+          aria-label="baseBranch"
           placeholder="baseBranch（可选，默认 main）"
           value={baseBranch}
           onChange={(e) => setBaseBranch(e.target.value)}
@@ -86,6 +95,9 @@ export function TaskList({ tasks, selectedId, error, onSelect, onCreate }: Props
 
       <div className="list-controls">
         <input
+          id="task-search"
+          name="taskSearch"
+          aria-label="按标题或 ID 搜索任务"
           placeholder="按标题 / ID 搜索"
           value={query}
           onChange={(e) => setQuery(e.target.value)}

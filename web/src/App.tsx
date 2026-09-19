@@ -148,6 +148,8 @@ export function App() {
     setEventsError(null);
     setTaskErrorMessage(null);
     setLogFocusNodeId(null);
+    // 切任务回到「节点与成本」：新任务未必有日志，留在「日志」标签会看到空态造成误解
+    setTab('nodes');
   }, []);
 
   const handleCreate = useCallback(

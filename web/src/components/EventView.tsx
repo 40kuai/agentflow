@@ -2,7 +2,17 @@
 
 import { Fragment, useMemo, useState } from 'react';
 import type { KernelEvent } from '../api';
-import { asRecord, asString, eventTime, formatClock, formatRelativeTime, formatAbsoluteTime } from '../format';
+import {
+  asNumber,
+  asRecord,
+  asString,
+  eventTime,
+  formatClock,
+  formatCount,
+  formatRelativeTime,
+  formatAbsoluteTime,
+  formatUsd,
+} from '../format';
 import { Badge, EmptyState, JsonBlock, Section } from './common';
 
 type Props = {
@@ -51,10 +61,16 @@ function summarize(event: KernelEvent): string {
       return `${nodeId} · run=${asString(payload['run_id'])}`;
     case 'node.failed':
       return `${nodeId} · ${asString(payload['error'], '（无 error）')}`;
-    case 'node.usage_recorded':
-      return `${nodeId} · cost=${asString(payload['cost_usd'])} · in=${payload['tokens_in'] ?? '?'} out=${payload['tokens_out'] ?? '?'}`;
+    case 'node.usage_recorded': {
+      // cost_usd / tokens_* 是数字型字段，必须走 asNumber，不能用 asString（对数字返回空串）
+      const tokensIn = payload['tokens_in'];
+      const tokensOut = payload['tokens_out'];
+      return `${nodeId} · cost=${formatUsd(asNumber(payload['cost_usd']))} · in=${
+        typeof tokensIn === 'number' ? formatCount(tokensIn) : '?'
+      } out=${typeof tokensOut === 'number' ? formatCount(tokensOut) : '?'}`;
+    }
     case 'budget.consumed':
-      return `run=${asString(payload['run_id'])} · cost=${asString(payload['cost_usd'])}`;
+      return `run=${asString(payload['run_id'])} · cost=${formatUsd(asNumber(payload['cost_usd']))}`;
     case 'budget.exceeded':
       return asString(payload['reason'], '（无 reason）');
     case 'artifact.created':

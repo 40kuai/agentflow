@@ -141,6 +141,12 @@ pre {
   gap: 10px;
 }
 
+/* 关键：滚动容器里的 flex 子项不应被压缩。
+   否则带 overflow:hidden 的子项（如 .summary-bar）自动最小尺寸归 0，会被 flex-shrink 压成一条 2px 边框。 */
+.main > * {
+  flex-shrink: 0;
+}
+
 .topbar {
   position: sticky;
   top: -12px;
@@ -659,6 +665,7 @@ pre {
   border: 1px solid var(--line);
   border-radius: 6px;
   overflow: hidden;
+  flex-shrink: 0;
 }
 
 .tabs {
@@ -954,6 +961,11 @@ pre {
   color: var(--muted);
 }
 
+/* label 不得被挤成竖排（"搜索" 曾断成上下两行） */
+.field > span {
+  white-space: nowrap;
+}
+
 .field.grow {
   flex: 1 1 240px;
 }
@@ -1094,7 +1106,13 @@ pre {
 .metric-value {
   font-family: var(--mono);
   font-size: 12.5px;
+  overflow-wrap: anywhere;
   word-break: break-word;
+}
+
+/* subtype 等长枚举值：跨列显示，避免从单词中间断行 */
+.metric.wide {
+  grid-column: span 2;
 }
 
 .error-list {
@@ -1120,6 +1138,12 @@ pre {
   font-family: var(--mono);
   font-size: 11px;
   white-space: pre;
+}
+
+/* 折行模式：长行不再撑出超长横向滚动条 */
+.raw-view.wrap .raw-line {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .raw-line.kind-stderr {
