@@ -82,7 +82,8 @@ export function parseStreamLine(line: string): RunnerEvent[] {
  * `error_max_structured_output_retries` 收场 → `result: undefined`，零产出（22 轮 / 103 秒 / $0.417）。
  *
  * 为什么必须单独识别：这类失败既不是「普通成功」（无 artifact），也不该被当成「普通失败」直接放弃——
- * 它与「模型把 JSON 包进代码块」互为兜底的两条通道。识别出来后由 run() 自动降级重试一次。
+ * 它与「模型把 JSON 包进代码块」是两条**各自都可能零产出**的通道（并非互为兜底）；识别出来后由 run()
+ * 自动降级重试一次，作为一次有代价的补救尝试。
  */
 export function isStructuredOutputRetriesExhausted(line: string): boolean {
   const trimmed = line.trim();
@@ -397,14 +398,20 @@ function createRunnerCore(options: ClaudeCodeRunnerOptions): RunnerCore {
 /**
  * 对外入口：在核心实现之上加**一次**降级重试。
  *
- * 为什么要这一层（2026-09-19 契约修复）：`--json-schema` 与 `result` 通道互为兜底，但各自会以不同方式零产出——
+ * 为什么要这一层（2026-09-19 契约修复）：`--json-schema` 与 `result` 两条通道各自会以不同方式零产出——
  *  · 开 schema：模型把那次提交当普通工具调用，在调用之间继续读写文件、反复重提，harness 反复注入约束 →
  *    `error_max_structured_output_retries`（归档证据 `tests/fixtures/claude-stream-maxretries-sample.jsonl`，5 次合规提交仍零产出）；
  *  · 关 schema：模型把 JSON 包进 ```json 代码块 → `JSON.parse` 失败（归档证据 `claude-stream-plain-sample.jsonl`）。
  *
+ * ⚠️ 两条通道**并非互为兜底**：归档证据恰好说明两者都可能零产出，降级只是「换一种零产出模式」的**概率性补救**
+ * （例如从「schema 重试耗尽」换到「result 被代码块包裹、`JSON.parse` 失败」——后者会显式失败并留下日志，不是静默）。
+ * 所以这里做的是一次**有代价的补救尝试**，不保证产出。
+ *
  * 故：本次若以「结构化输出重试耗尽」收场，则**自动关闭 `--json-schema` 重跑一次**（走 result 通道）。
  * 只降级一次、失败即按失败处理（不递归）；只读角色不做例外，行为统一。
- * 代价是新一次真实调用与额外花费——这是「两条通道互为兜底」这一设计本身的价值所在。
+ * 代价：新一次真实调用与额外花费；且单节点的 wall-clock 超时与 `--max-budget-usd` 上限在降级场景下
+ * **实际是标称值的 2×**（两次尝试各起一个 timeoutTimer、各带一次预算上限）。这有界、已知，可接受。
+ * 另：降级时第一次尝试的 `started` 不对外发出，只发重试那次的（见 run() 内注释）。
  */
 export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentRunner {
   const core = createRunnerCore(options);
@@ -419,9 +426,27 @@ export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentR
       const canFallback = useJsonSchema && req.outputSchema !== undefined;
       const state = { schemaRetriesExhausted: false };
 
+      // 缓冲第一次尝试的 started。降级时第一次尝试整体作废，它的 started 不应泄漏给消费者——
+      // 否则一次 run 会发出两条 started，破坏「一次 run 一个 started」的契约（并发计数 / 尝试追踪的
+      // 消费方很容易踩）。关闭 schema 时不可能降级，started 仍即时发出以保留原有事件顺序。
+      // 代价：开启 schema 时只有等本次尝试落幕（exited）才能判定它是否作废，故 started 会略晚于
+      // 本次尝试的中间事件（usage / log）发出——内核忽略 started，无功能影响。
+      let pendingStarted: Extract<RunnerEvent, { kind: 'started' }> | null = null;
+
       for await (const event of core.run(req, useJsonSchema, state)) {
-        // 拦下第一次尝试的 exited：若它属于重试耗尽，就不让它进入事件流（否则内核会把它的退出码当最终结果）
+        if (event.kind === 'started') {
+          if (canFallback) {
+            pendingStarted = event;
+            continue;
+          }
+          yield event;
+          continue;
+        }
+
+        // 拦下第一次尝试的 exited：若它属于重试耗尽，就不让它进入事件流（否则内核会把它的退出码当最终结果），
+        // 并连同它的 started 一起丢弃——只把降级重试那次的 started 对外发出。
         if (event.kind === 'exited' && canFallback && state.schemaRetriesExhausted) {
+          pendingStarted = null;
           yield {
             kind: 'log',
             chunk: '结构化输出重试耗尽，已降级为 result 通道重试一次',
@@ -429,8 +454,17 @@ export function createClaudeCodeRunner(options: ClaudeCodeRunnerOptions): AgentR
           yield* core.run(req, false, { schemaRetriesExhausted: false });
           return;
         }
+
+        // 本次尝试未被作废：在收尾事件前补发缓冲的 started（保持它仍在事件流最前）
+        if (pendingStarted && event.kind === 'exited') {
+          yield pendingStarted;
+          pendingStarted = null;
+        }
         yield event;
       }
+
+      // 迭代器正常结束但缺 exited 时（正常实现不会走到），补发仍在缓冲的 started，避免静默丢失
+      if (pendingStarted) yield pendingStarted;
     },
 
     cancel: (runId: string) => core.cancel(runId),

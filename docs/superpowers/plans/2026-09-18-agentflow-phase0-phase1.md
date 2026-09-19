@@ -3424,7 +3424,7 @@ Task 2 用真实 CLI 实测（含 16,403 次重试的可复核证据）推翻了
 
 **可测性设计**：解析逻辑与进程管理分离。`parseStreamLine(line)` 是纯函数，可脱离真实 CLI 单测；`createClaudeCodeRunner` 只负责 spawn 与把 stdout 行喂给解析函数。
 
-> **实测修正（2026-09-19，`--json-schema` 与 `result` 两条通道互为兜底）**
+> **实测修正（2026-09-19，`--json-schema` 重试耗尽时的降级重试）**
 >
 > 一次真实任务（`logs/runs/run_46e7a5442100440da2ac.jsonl`）里 `pm_analyze` 以
 > `subtype: error_max_structured_output_retries` 收场、`result: undefined`（22 轮 / 103 秒 / $0.417，零产出），
@@ -3433,15 +3433,20 @@ Task 2 用真实 CLI 实测（含 16,403 次重试的可复核证据）推翻了
 > harness 反复重新注入约束，最终耗尽预算判失败。该 `result` 行已逐字归档为
 > `tests/fixtures/claude-stream-maxretries-sample.jsonl`，并有契约测试断言「必须被识别为需降级重试」。
 >
-> 于是**两条通道互为兜底**：
+> 两条通道**各自都可能零产出，并非互为兜底**：
 > - 开 `--json-schema`：可能以 `error_max_structured_output_retries` 零产出（即上一条）；
 > - 关 `--json-schema`：模型可能把 JSON 包进 ` ```json ` 代码块 → `JSON.parse` 失败（`claude-stream-plain-sample.jsonl`）。
 >
-> 落地为两处：① 装配后的 prompt 在「硬约束」里写明终止语义（「调用一次 StructuredOutput 提交后立即结束本轮，
+> 故降级只是**一次有代价的补救尝试**（可能从一种零产出模式换到另一种，不保证产出），落地为两处：
+> ① 装配后的 prompt 在「硬约束」里写明终止语义（「调用一次 StructuredOutput 提交后立即结束本轮，
 > 不要再读写文件、不要重复提交」，见 `src/kernel/context-assembler.ts`）；
 > ② runner 层在识别到该 subtype 后**自动关闭 `--json-schema` 重跑一次**（走 `result` 通道），
 > 只降级一次、失败即按失败处理、只读角色不做例外，并留一条 `{kind:'log'}` 说明
-> 「结构化输出重试耗尽，已降级为 result 通道重试一次」。代价是新增一次真实调用与额外花费——这是互为兜底本身的价值，属预期。
+> 「结构化输出重试耗尽，已降级为 result 通道重试一次」。
+>
+> **代价与已知边界**：新增一次真实调用与额外花费；单节点的 wall-clock 超时与 `--max-budget-usd` 预算上限在降级场景下
+> **实际为标称值的 2×**（两次尝试各起一个 timeoutTimer、各带一次预算上限，有界且已知，属可接受）。
+> 降级时第一次尝试整体作废，其 `started` 不对外发出，只发重试那次的，以维持「一次 run 一个 started」契约。
 > 识别函数 `isStructuredOutputRetriesExhausted(line)` 与降级重试由 `src/runner/claude-code-runner.retry.test.ts`
 > （假 bin，不调真实 claude）把守。
 

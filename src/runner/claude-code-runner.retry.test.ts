@@ -115,6 +115,17 @@ describe('claude runner 结构化输出重试耗尽后的降级重试', () => {
 
     // 第一次失败的 exited(code 1) 不得进入事件流，否则内核会把它当最终退出码
     expect(events.filter((e) => e.kind === 'exited')).toEqual([{ kind: 'exited', code: 0 }]);
+
+    // 「一次 run 一个 started」：降级时第一次尝试整体作废，它的 started 不得泄漏，只留重试那条。
+    // 且该 started 必须出现在降级说明之后 —— 证明留下的是重试那次的，而不是第一次尝试的。
+    const startedIndexes = events
+      .map((e, i) => (e.kind === 'started' ? i : -1))
+      .filter((i) => i >= 0);
+    expect(startedIndexes).toHaveLength(1);
+    const fallbackLogIndex = events.findIndex(
+      (e) => e.kind === 'log' && e.chunk.includes('结构化输出重试耗尽，已降级为 result 通道重试一次'),
+    );
+    expect(startedIndexes[0]!).toBeGreaterThan(fallbackLogIndex);
   }, 30_000);
 
   it('降级重试自身再失败时正常按失败处理，且只降级一次（不再无限重试）', async () => {
@@ -129,6 +140,8 @@ describe('claude runner 结构化输出重试耗尽后的降级重试', () => {
     expect(invocations(dir)).toHaveLength(2);
     expect(events.some((e) => e.kind === 'artifact')).toBe(false);
     expect(events.at(-1)).toEqual({ kind: 'exited', code: 1 });
+    // 降级场景（重试亦失败）同样只发一条 started：第一次尝试的 started 不泄漏
+    expect(events.filter((e) => e.kind === 'started')).toHaveLength(1);
     // 只留一条降级说明，避免出现「降级再降级」的递归
     expect(
       events.filter(

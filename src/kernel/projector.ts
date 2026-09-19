@@ -159,6 +159,9 @@ export function project(events: KernelEvent[]): TaskState {
           task_id: event.task_id,
           run_id: str(p, 'run_id'),
           type: str(p, 'type') as Artifact['type'],
+          // ⚠️ 历史兼容缺省，不是活路径：内核写 artifact.created 时必带 status
+          // （`src/kernel/kernel.ts` 写入的是 parseArtifactPayload 提升出的 parsed.status，永远合法），
+          // 故这里的 'ok' 只对更早的历史事件（修复前内核写死 status 之前的载荷）生效，正常回放不会走到它。
           status: str(p, 'status', 'ok') as Artifact['status'],
           schema_version: num(p, 'schema_version', 1),
           payload: p['payload'],

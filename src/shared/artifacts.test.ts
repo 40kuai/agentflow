@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { ARTIFACT_PAYLOAD_SCHEMAS, jsonSchemaForArtifact, parseArtifactPayload } from './artifacts.js';
+import {
+  ARTIFACT_PAYLOAD_SCHEMAS,
+  ARTIFACT_TYPES,
+  jsonSchemaForArtifact,
+  parseArtifactPayload,
+} from './artifacts.js';
 
 describe('Artifact payload schema', () => {
   it('requirement 接受合法载荷', () => {
@@ -157,5 +162,22 @@ describe('Artifact status 契约（由模型在结构化输出里给出，内核
       properties?: Record<string, unknown>;
     };
     expect(schema.properties?.['status']).toBeDefined();
+  });
+
+  it('jsonSchemaForArtifact 把 status 注入 required（4 个类型都强制模型给出），且保留 additionalProperties: false', () => {
+    // zod 侧的 status 带 .default('ok')（为兼容归档 fixture），故 zod-to-json-schema 不会把它列为 required。
+    // 若不在 JSON Schema 上注入，模型漏给 status 就会被当成 'ok' 静默放行（边条件形同恒真）——
+    // 这份 schema 同时用于签发 --json-schema 与内联进 prompt，故必须对所有 4 个类型一致地标为必填。
+    for (const type of ARTIFACT_TYPES) {
+      const schema = jsonSchemaForArtifact(type) as {
+        required?: string[];
+        additionalProperties?: unknown;
+        properties?: Record<string, unknown>;
+      };
+      expect(schema.required, `${type} 的 required 应包含 status`).toContain('status');
+      expect(schema.properties?.['status'], `${type} 的 properties 应含 status`).toBeDefined();
+      // 既有形状不得被破坏
+      expect(schema.additionalProperties, `${type} 应保留 additionalProperties: false`).toBe(false);
+    }
   });
 });

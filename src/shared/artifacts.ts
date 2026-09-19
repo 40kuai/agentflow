@@ -120,10 +120,24 @@ export function parseArtifactPayload(type: ArtifactType, raw: unknown): ParsedAr
   return { status, payload };
 }
 
-/** 导出 JSON Schema，供 claude --json-schema 使用 */
+/**
+ * 导出 JSON Schema，供 claude --json-schema 使用，同时也会被内联进装配后的 prompt
+ * （`src/kernel/context-assembler.ts`），两处必须是同一份、措辞一致。
+ *
+ * `status` 在 zod 侧带 `.default('ok')`（为兼容 `tests/fixtures/` 下无该字段的归档样本），
+ * 因此 `zod-to-json-schema` **不会**把它列进 `required` —— 这会让模型漏给 status 时被 CLI/harness
+ * 静默当成 `ok` 放行，边条件 `all(artifacts.*.status == 'ok')` 形同恒真，与本次契约修复的病根同类。
+ * 故在此对**所有 4 个 payload 类型**统一把 `status` 注入 `required`：
+ *  - 模型侧：CLI 强制必须给出该字段（漏给会被 harness 要求重试，而不是静默通过）；
+ *  - 解析侧：仍容忍历史载荷缺省为 `'ok'`（归档 fixture 继续可用）。
+ */
 export function jsonSchemaForArtifact(type: ArtifactType): object {
-  return zodToJsonSchema(ARTIFACT_PAYLOAD_SCHEMAS[type], {
+  const schema = zodToJsonSchema(ARTIFACT_PAYLOAD_SCHEMAS[type], {
     target: 'jsonSchema7',
     $refStrategy: 'none',
-  }) as object;
+  }) as { required?: string[] } & Record<string, unknown>;
+  const required = Array.isArray(schema.required) ? [...schema.required] : [];
+  if (!required.includes('status')) required.push('status');
+  // 展开原 schema 以保留 additionalProperties: false 等既有形状
+  return { ...schema, required };
 }
