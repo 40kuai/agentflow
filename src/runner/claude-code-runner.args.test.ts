@@ -48,10 +48,40 @@ describe('buildArgs', () => {
 
   // 安全边界：预授权只属于「真正需要执行」的角色。只读角色若被放开 Bash 预授权，
   // 就等于把 Read/Grep/Glob 的沙箱彻底打破，故这条必须有断言把守。
+  //
+  // 2026-09-18 评审补洞：原两条断言都是**子串**判断（不含 `--allowed-tools`、不含 `Bash`），
+  // 而 `--dangerously-skip-permissions` **两个子串都不含**——用户明确否决的那一项正好从这个洞里漏过去。
+  // 故补一条显式否定断言（下面第二条用例再用整串精确断言兜住「任何新增参数」）。
   it('只读角色不含任何 Bash 预授权（安全边界）', () => {
     const args = buildArgs({ ...base, readOnly: true });
     expect(args).not.toContain('--allowed-tools');
     expect(args.join(' ')).not.toContain('Bash');
+    expect(args.join(' ')).not.toContain('dangerously-skip-permissions');
+  });
+
+  // 更强的一条：整串精确断言。子串断言只能挡住「已知的那几个词」，
+  // 精确断言能挡住**任何**新增参数（含未来有人把 --dangerously-skip-permissions 加进只读分支）。
+  it('只读角色的 args 完整精确断言（任何新增参数都会被抓住）', () => {
+    const args = buildArgs({
+      ...base,
+      readOnly: true,
+      outputSchema: { type: 'object' },
+      budgetCapUsd: 0.5,
+      sessionId: 'sess-1',
+    });
+    expect(args).toEqual([
+      '-p', '做点事',
+      '--output-format', 'stream-json',
+      '--include-partial-messages',
+      '--verbose',
+      '--model', 'sonnet',
+      '--system-prompt', '你是后端开发',
+      '--json-schema', JSON.stringify({ type: 'object' }),
+      '--tools=Read,Grep,Glob',
+      '--permission-mode', 'default',
+      '--max-budget-usd', '0.5',
+      '--session-id', 'sess-1',
+    ]);
   });
 
   it('非只读角色使用 acceptEdits 并开放写工具', () => {

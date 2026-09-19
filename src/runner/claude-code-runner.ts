@@ -170,12 +170,23 @@ export function buildArgs(req: RunRequest, useJsonSchema = true): string[] {
     // `This command requires approval`（Task 15 真实日志里这类拒绝出现 461 次）。
     // 但 dev_implement 的产物 schema 要求 self_test_result、dev/qa 的 prompt 明确要求
     // 「真实运行自测/测试」——契约不可满足 → agent 陷入重试，单节点成本涨到 $1.13~$2.20。
-    // 故在不放弃 CLI 权限强制的前提下，用 --allowed-tools 显式预授权角色真正需要的命令前缀：
+    // 故用 --allowed-tools 预授权角色真正需要的命令前缀（六类，本轮保持不变）：
     //   sh / bash → 运行 .sh 脚本（prompt 要求「运行一次自测」；真实日志里 `bash x.sh` 也被拒过）
     //   chmod     → 让脚本可执行（真实日志里被拒过，属「运行 shell 脚本」的必要一步）
-    //   git       → 基本操作（开分支 / 提交）
-    //   node / npm→ 跑测试
-    // 明确不用 --dangerously-skip-permissions：那会放弃 CLI 的全部权限强制。
+    //   git       → **全部** git 子命令（该前缀不按子命令过滤），含 push / reset --hard / clean -fdx 等破坏性操作
+    //   node      → 全部 node 调用（该前缀同样不按子命令过滤）
+    //   npm       → **全部** npm 子命令，含 publish 与任意 install 生命周期脚本
+    //
+    // ⚠️ 已知局限（2026-09-18 评审确认，方案固有，非疏漏）：
+    // shell 前缀（sh / bash）等价于**任意命令执行**——`bash -c "<任意命令>"` 完全落在 `Bash(bash:*)` 内，
+    // 于是 `git push --force`、`rm -rf`、`curl … | sh` 都能绕过前缀限制。
+    // 也就是说这里的「精准预授权」在**能力层面已退化为「全量放行」**；前缀白名单实际只约束
+    // **不包 shell 的调用**（agent 直接写 `npm test` 会被前缀约束，写成 `bash -c 'npm test'` 就不会）。
+    // 这是满足 dev/qa prompt「真实运行 .sh 脚本」的必要代价，收窄属 Phase 2 决策，本轮不改。
+    // 另：`Bash(git:*)` / `Bash(npm:*)` 的授权面同样过宽（含 push / publish 等），
+    // Phase 1 目标仓库是临时目录尚可控，真实项目使用前需按需收窄（如 `Bash(npm test:*)` / `Bash(npm run:*)`）。
+    //
+    // 明确不用 --dangerously-skip-permissions：那会放弃 CLI 的全部权限强制（用户已否决）。
     // `--tools` 与 `--allowed-tools` 语义不同且实测可并用（2026-09-18 探针 D/E）：
     // 前者限定「可用工具集」必须包含 Bash，后者在该集合内「预授权具体命令」，
     // 两者同时给出时 sh/bash/chmod/git/node/npm 均实际执行成功、permission_denials 为空。

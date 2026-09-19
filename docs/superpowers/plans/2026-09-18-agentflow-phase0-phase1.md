@@ -3392,6 +3392,36 @@ Task 2 用真实 CLI 实测（含 16,403 次重试的可复核证据）推翻了
 - `-p` 搭配 `--output-format stream-json` **必须同时给 `--verbose`**，否则没有输出
 - 解析必须对 `result` 是「JSON 字符串」和「对象」两种形态都容错
 
+> **实测修正（2026-09-18，headless 权限预授权，由 Task 15 端到端驱动）**
+>
+> Task 15 真实端到端发现：headless（`-p`）下没有人工审批通道，`--permission-mode acceptEdits` **只自动放行文件编辑**，
+> Bash 里的非白名单命令（`sh x.sh` / `chmod` / `git checkout -b`）一律返回 `This command requires approval`
+> （真实日志里这类拒绝 **461 次**）；而 dev/qa 的 prompt 明确要求「真实运行自测/测试」、`dev_implement` 的产物 schema 要求
+> `self_test_result` —— 契约不可满足 → agent 陷入重试，单节点成本涨到 $1.13~$2.20。
+> 故**可写角色**（`readOnly === false`）在原有参数后追加：
+> `--allowed-tools 'Bash(sh:*),Bash(bash:*),Bash(chmod:*),Bash(git:*),Bash(node:*),Bash(npm:*)'`
+> （探针实测：叠加后上述命令均真实执行、`permission_denials` 为空；`--tools` 与 `--allowed-tools` 并用不冲突）。
+> **只读角色一字未改**，仍为 `--tools=Read,Grep,Glob --permission-mode default`，且**未使用** `--dangerously-skip-permissions`。
+> 本节 Step 4 的 `buildArgs` 代码块是修订前形态，实际实现以 `src/runner/claude-code-runner.ts` 为准。
+>
+> **已知局限 / 已知风险（方案固有，本轮有意不修，收窄属 Phase 2 决策）**
+>
+> 1. **shell 前缀（`sh` / `bash`）等价于任意命令执行 ⇒「精准预授权」在能力层面已退化为「全量放行」。**
+>    `Bash(bash:*)` 允许 `bash -c "<任意命令>"`，因此 `git push --force`、`rm -rf`、`curl … | sh` 都能绕过前缀限制。
+>    前缀白名单实际只约束**不包 shell 的调用**（agent 直接写 `npm test` 受约束，写成 `bash -c 'npm test'` 就不受约束）。
+>    这是满足 dev/qa prompt「真实运行 .sh 脚本」的必要代价。若后续端到端仍见零星的 `requires approval`，
+>    下一步应是**收集被拒命令清单再决定补哪条前缀**，而不是换成 `--dangerously-skip-permissions`（用户已明确否决）。
+> 2. **`Bash(git:*)` / `Bash(npm:*)` 授权面过宽，注释须如实描述。**
+>    `Bash(git:*)` 涵盖**全部** git 子命令（含 `git push` / `git reset --hard` / `git clean -fdx`）；
+>    `Bash(npm:*)` 涵盖 `npm publish` 与任意 install 生命周期脚本。
+>    **Phase 1 的目标仓库是临时目录，尚可控；但同一参数在真实项目里立即生效** —— 真实项目使用前必须按需收窄
+>    （例如收窄到 `Bash(npm test:*)` / `Bash(npm run:*)`）。
+> 3. `--allowed-tools` 不约束 MCP 工具（spec §11.2 的既有实测局限），故「角色权限即沙箱参数」的强度弱于 spec 原意，本次修复未改变这一点。
+>
+> 安全侧的对应断言在 `src/runner/claude-code-runner.args.test.ts`：只读角色不仅断言不含 `--allowed-tools` / `Bash`，
+> 还断言**不含 `--dangerously-skip-permissions`**，并对只读 args 做**整串精确断言**以兜住任何新增参数
+> （原两条子串断言都不含 `dangerously-skip-permissions` 这个子串，等于从洞里漏过去）。
+
 **可测性设计**：解析逻辑与进程管理分离。`parseStreamLine(line)` 是纯函数，可脱离真实 CLI 单测；`createClaudeCodeRunner` 只负责 spawn 与把 stdout 行喂给解析函数。
 
 - [ ] **Step 1: 写失败的测试 `src/runner/claude-code-runner.test.ts`**
