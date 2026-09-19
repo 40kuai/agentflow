@@ -124,20 +124,40 @@ export function parseArtifactPayload(type: ArtifactType, raw: unknown): ParsedAr
  * 导出 JSON Schema，供 claude --json-schema 使用，同时也会被内联进装配后的 prompt
  * （`src/kernel/context-assembler.ts`），两处必须是同一份、措辞一致。
  *
- * `status` 在 zod 侧带 `.default('ok')`（为兼容 `tests/fixtures/` 下无该字段的归档样本），
- * 因此 `zod-to-json-schema` **不会**把它列进 `required` —— 这会让模型漏给 status 时被 CLI/harness
- * 静默当成 `ok` 放行，边条件 `all(artifacts.*.status == 'ok')` 形同恒真，与本次契约修复的病根同类。
- * 故在此对**所有 4 个 payload 类型**统一把 `status` 注入 `required`：
- *  - 模型侧：CLI 强制必须给出该字段（漏给会被 harness 要求重试，而不是静默通过）；
- *  - 解析侧：仍容忍历史载荷缺省为 `'ok'`（归档 fixture 继续可用）。
+ * 解析侧与签发侧诉求相反，必须分开：
+ *  - 解析侧（`ARTIFACT_PAYLOAD_SCHEMAS` 里 `status: ….default('ok')`）**保留**默认值，
+ *    以便解析 `tests/fixtures/` 下那些采集于 status 字段存在之前的归档载荷；
+ *  - 签发侧（本函数，发往 CLI 的 `--json-schema` 与 prompt）**必须剥离** `status` 属性上的
+ *    `default`：把「必填（required）」与「默认值（default）」同时声明自相矛盾，语义含混；
+ *    一旦 harness/CLI 对缺失字段应用 default，模型漏给 status 就会被兜成 `ok`，
+ *    边条件 `all(artifacts.*.status == 'ok')` 形同恒真——与本次契约修复的病根同类。
+ *
+ * 实现要点：`status` 在 zod 侧带 default，`zod-to-json-schema` 因此**不会**把它列进 `required`，
+ * 故在此对**所有 4 个 payload 类型**统一补进 `required`、并剥掉属性上的 `default`。
+ * （实测 claude 2.1.38 的 `--json-schema` harness 用 `new Ajv({allErrors:true})` 校验，未开
+ * `useDefaults`，故当前版本不会兜底；剥离仍是为消除含混、并对未来 CLI 版本的行为变化设防。）
  */
 export function jsonSchemaForArtifact(type: ArtifactType): object {
   const schema = zodToJsonSchema(ARTIFACT_PAYLOAD_SCHEMAS[type], {
     target: 'jsonSchema7',
     $refStrategy: 'none',
-  }) as { required?: string[] } & Record<string, unknown>;
+  }) as {
+    required?: string[];
+    properties?: Record<string, Record<string, unknown>>;
+  } & Record<string, unknown>;
+
   const required = Array.isArray(schema.required) ? [...schema.required] : [];
   if (!required.includes('status')) required.push('status');
+
+  // 剥离签发侧 status 属性上的 default；解析侧 zod schema 的 .default('ok') 保持不变
+  const properties = { ...(schema.properties ?? {}) };
+  const statusProp = properties['status'];
+  if (statusProp && typeof statusProp === 'object' && 'default' in statusProp) {
+    const stripped = { ...statusProp };
+    delete stripped['default'];
+    properties['status'] = stripped;
+  }
+
   // 展开原 schema 以保留 additionalProperties: false 等既有形状
-  return { ...schema, required };
+  return { ...schema, required, properties };
 }

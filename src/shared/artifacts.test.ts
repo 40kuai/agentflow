@@ -180,4 +180,26 @@ describe('Artifact status 契约（由模型在结构化输出里给出，内核
       expect(schema.additionalProperties, `${type} 应保留 additionalProperties: false`).toBe(false);
     }
   });
+
+  it('jsonSchemaForArtifact 剥离签发侧 status 的 default（4 个类型都不许兜底）', () => {
+    // 解析侧（ARTIFACT_PAYLOAD_SCHEMAS 的 .default('ok')）必须保留（归档 fixture 依赖它），
+    // 但签发侧不能带 default：required 与 default 并存会让「必填」形同虚设——
+    // 一旦 harness 对缺失字段应用 default，模型漏给 status 就会被兜成 ok、边条件恒真。
+    for (const type of ARTIFACT_TYPES) {
+      const schema = jsonSchemaForArtifact(type) as {
+        required?: string[];
+        properties?: Record<string, Record<string, unknown>>;
+      };
+      expect(schema.required, `${type} 的 required 应包含 status`).toContain('status');
+      const status = schema.properties?.['status'];
+      expect(status, `${type} 的 properties 应含 status`).toBeDefined();
+      expect(status?.['default'], `${type} 的签发 schema 不应带 default`).toBeUndefined();
+      // 剥离 default 不得破坏其余形状
+      expect(status?.['enum'], `${type} 的 status 枚举应保留`).toEqual([
+        'ok',
+        'needs_changes',
+        'blocked',
+      ]);
+    }
+  });
 });
