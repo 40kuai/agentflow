@@ -14,6 +14,20 @@ export function formatCount(value: number | null | undefined): string {
   return n.toLocaleString('en-US');
 }
 
+/** 字节数：人类可读（B / KB / MB / GB / TB，1024 进制，保留 1 位小数） */
+export function formatBytes(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return EMPTY;
+  if (value < 1024) return `${Math.round(value)} B`;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let size = value / 1024;
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit += 1;
+  }
+  return `${size.toFixed(1)} ${units[unit]}`;
+}
+
 /** 耗时：ms < 1000 → `450ms`；< 60s → `103.4s`；< 60min → `8.6min`；否则 `1.3h` */
 export function formatDuration(ms: number | null | undefined): string {
   if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return EMPTY;
@@ -60,6 +74,13 @@ export function formatRelativeTime(ts: number | null | undefined, now: number = 
   const days = Math.floor(hours / 24);
   if (days < 30) return `${days} 天前`;
   return formatAbsoluteTime(ts).slice(0, 10);
+}
+
+/** 活性年龄：<60s 用秒（"6 秒前"），其余复用相对时间口径。入参是「距今毫秒数」而非时间戳。 */
+export function formatActiveAge(ageMs: number | null | undefined): string {
+  if (typeof ageMs !== 'number' || !Number.isFinite(ageMs) || ageMs < 0) return EMPTY;
+  if (ageMs < 60_000) return `${Math.floor(ageMs / 1000)} 秒前`;
+  return formatRelativeTime(Date.now() - ageMs);
 }
 
 /** 短 id：`task_1a2b3c…` */

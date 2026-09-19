@@ -1,7 +1,13 @@
 /** 通用展示件：状态徽章、时间、折叠块、JSON 块、复制按钮、空状态与错误框 */
 
-import { useState, type ReactNode } from 'react';
-import { formatAbsoluteTime, formatRelativeTime } from '../format';
+import { useEffect, useState, type ReactNode } from 'react';
+import {
+  formatAbsoluteTime,
+  formatActiveAge,
+  formatDuration,
+  formatRelativeTime,
+} from '../format';
+import type { TaskHealth } from '../liveness';
 
 export type Tone = 'ok' | 'run' | 'fail' | 'warn' | 'blocked' | 'muted';
 
@@ -73,6 +79,57 @@ export function TimeAgo({ ts, prefix }: { ts: number | null | undefined; prefix?
       {prefix}
       {formatRelativeTime(ts)}
     </span>
+  );
+}
+
+/** 每秒自更新的 hook：仅让用到它的组件重渲染，避免整页每秒刷新 */
+function useSecondTick(): void {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const timer = window.setInterval(() => setTick((value) => value + 1), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+}
+
+/**
+ * 实时增长的相对时间（如「最后活动 6 秒前」）。
+ * staleAfterMs 给定后，超过阈值会加显著标记——用于「疑似停滞」的视觉提示。
+ */
+export function LiveAgo({
+  ts,
+  prefix,
+  staleAfterMs,
+}: {
+  ts: number | null | undefined;
+  prefix?: string;
+  staleAfterMs?: number;
+}) {
+  useSecondTick();
+  const valid = typeof ts === 'number' && Number.isFinite(ts) && ts > 0;
+  const age = valid ? Math.max(0, Date.now() - ts) : null;
+  const stale = age !== null && staleAfterMs !== undefined && age >= staleAfterMs;
+  return (
+    <span className={`timeago${stale ? ' stale' : ''}`} title={formatAbsoluteTime(ts)}>
+      {prefix}
+      {formatActiveAge(age)}
+    </span>
+  );
+}
+
+/** 实时增长的「已运行时长」：从给定起始时刻起算，每秒更新 */
+export function LiveSince({ ts }: { ts: number | null | undefined }) {
+  useSecondTick();
+  const valid = typeof ts === 'number' && Number.isFinite(ts) && ts > 0;
+  return <span title={formatAbsoluteTime(ts)}>{formatDuration(valid ? Date.now() - ts : null)}</span>;
+}
+
+/** 任务级流程健康徽章：一眼看正常还是异常，hover 展示判据 */
+export function HealthBadge({ health }: { health: TaskHealth | null }) {
+  if (!health) return null;
+  return (
+    <Badge tone={health.tone} title={`流程健康判据：${health.reason}`}>
+      流程 {health.label}
+    </Badge>
   );
 }
 

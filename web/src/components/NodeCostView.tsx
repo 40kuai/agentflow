@@ -2,17 +2,45 @@
 
 import type { TaskAggregate, NodeAggregate } from '../aggregate';
 import type { TaskState } from '../api';
-import { formatAbsoluteTime, formatCount, formatDuration, formatUsd, shortId } from '../format';
-import { ArtifactStatusBadge, Badge, EmptyState, KeyValue, Section, StatusBadge, TimeAgo } from './common';
+import {
+  formatAbsoluteTime,
+  formatBytes,
+  formatCount,
+  formatDuration,
+  formatUsd,
+  shortId,
+} from '../format';
+import {
+  STAGNANT_THRESHOLD_MS,
+  classifyLogError,
+  livenessAgeMs,
+  type BackendCompatibility,
+  type NodeLiveness,
+} from '../liveness';
+import {
+  ArtifactStatusBadge,
+  Badge,
+  EmptyState,
+  KeyValue,
+  LiveAgo,
+  LiveSince,
+  Section,
+  StatusBadge,
+  TimeAgo,
+} from './common';
 
 type Props = {
   state: TaskState;
   aggregate: TaskAggregate;
+  /** 运行中节点的活性快照（按 nodeId 索引），由 App 每 2 秒刷新 */
+  liveness: Record<string, NodeLiveness>;
+  /** 后端能力兼容性：用于把活性缺失的原因说清楚 */
+  compat: BackendCompatibility;
   onOpenLog: (nodeId: string) => void;
   onOpenArtifacts: () => void;
 };
 
-export function NodeCostView({ state, aggregate, onOpenLog, onOpenArtifacts }: Props) {
+export function NodeCostView({ state, aggregate, liveness, compat, onOpenLog, onOpenArtifacts }: Props) {
   const artifactById = new Map(state.artifacts.map((a) => [a.artifact_id, a]));
   const now = Date.now();
 
@@ -75,6 +103,8 @@ export function NodeCostView({ state, aggregate, onOpenLog, onOpenArtifacts }: P
               node={node}
               transfers={state.transfers.filter((t) => t.to === node.nodeId)}
               artifacts={node.artifactIds.map((id) => artifactById.get(id) ?? null)}
+              liveness={liveness[node.nodeId]}
+              compat={compat}
               onOpenLog={onOpenLog}
               onOpenArtifacts={onOpenArtifacts}
             />
@@ -89,20 +119,25 @@ function NodeCard({
   node,
   transfers,
   artifacts,
+  liveness,
+  compat,
   onOpenLog,
   onOpenArtifacts,
 }: {
   node: NodeAggregate;
   transfers: TaskState['transfers'];
   artifacts: (TaskState['artifacts'][number] | null)[];
+  liveness: NodeLiveness | undefined;
+  compat: BackendCompatibility;
   onOpenLog: (nodeId: string) => void;
   onOpenArtifacts: () => void;
 }) {
   const lastTransfer = transfers.at(-1);
   const failed = node.status === 'failed';
+  const running = node.status === 'running';
 
   return (
-    <div className={`node-card${failed ? ' is-failed' : ''}`}>
+    <div className={`node-card${failed ? ' is-failed' : ''}${running ? ' is-running' : ''}`}>
       <div className="node-card-head">
         <div className="node-card-title">
           <span className="node-name">{node.nodeId}</span>
@@ -139,6 +174,8 @@ function NodeCard({
           <span className="value">{node.visitCount}</span>
         </div>
       </div>
+
+      {running && <LivenessBlock node={node} liveness={liveness} compat={compat} />}
 
       <div className="node-meta-row">
         <span className="muted">runId</span>
@@ -233,6 +270,105 @@ function NodeCard({
           查看日志
         </button>
       </div>
+    </div>
+  );
+}
+
+/**
+ * 运行中节点的活性块（C 项）：回答「agent 还在干活还是已卡死」与「现在正在做什么」。
+ * 数据全部来自真实来源：日志文件 mtime（最后活动）、node.started 事件（已运行）、
+ * 文件 size（日志增长）、日志尾部解析（当前动作）、事件流 usage 聚合（已结算花费）。
+ */
+function LivenessBlock({
+  node,
+  liveness,
+  compat,
+}: {
+  node: NodeAggregate;
+  liveness: NodeLiveness | undefined;
+  compat: BackendCompatibility;
+}) {
+  const currentRun = node.runs.find((run) => run.runId === node.runId) ?? node.runs.at(-1) ?? null;
+  const startedAt = currentRun?.startedAt ?? null;
+  const ageMs = livenessAgeMs(liveness, Date.now());
+  const stalled = ageMs !== null && ageMs >= STAGNANT_THRESHOLD_MS;
+  const errorDisplay = liveness?.error ? classifyLogError(liveness.error, compat) : null;
+  const delta = liveness?.sizeDeltaBytes;
+
+  return (
+    <div className={`liveness${stalled ? ' is-stalled' : ''}`}>
+      <div className="liveness-head">
+        <span className="liveness-title">活性（运行中）</span>
+        {ageMs === null ? (
+          <Badge tone="muted">活性未知</Badge>
+        ) : stalled ? (
+          <Badge tone="warn">疑似停滞</Badge>
+        ) : (
+          <Badge tone="ok">正常推进</Badge>
+        )}
+      </div>
+
+      <div className="node-metrics">
+        <div className="node-metric">
+          <span className="label">最后活动</span>
+          <span className="value">
+            {typeof liveness?.lastModifiedAt === 'number' ? (
+              <LiveAgo ts={liveness.lastModifiedAt} staleAfterMs={STAGNANT_THRESHOLD_MS} />
+            ) : (
+              <span className="muted">未知</span>
+            )}
+          </span>
+        </div>
+        <div className="node-metric">
+          <span className="label">已运行</span>
+          <span className="value">
+            <LiveSince ts={startedAt} />
+          </span>
+        </div>
+        <div className="node-metric">
+          <span className="label">日志增长</span>
+          <span className="value">
+            {formatBytes(liveness?.sizeBytes ?? null)}
+            {typeof delta === 'number' && delta > 0 && (
+              <span className="delta-up"> +{formatBytes(delta)}</span>
+            )}
+            {typeof delta === 'number' && delta < 0 && (
+              <span className="delta-down"> {formatBytes(delta)}</span>
+            )}
+          </span>
+        </div>
+        <div className="node-metric">
+          <span className="label">已结算花费</span>
+          <span className="value money" title="事件流 usage 聚合；运行中为已落库部分">
+            {formatUsd(node.costUsd)}
+          </span>
+        </div>
+      </div>
+
+      <div className="liveness-action">
+        <span className="label">当前动作</span>
+        <span className="value">{liveness?.action ?? '等待模型输出'}</span>
+      </div>
+
+      <div className="liveness-window muted">
+        本窗口内：工具调用 {liveness?.toolCallsInWindow ?? 0} 次 · assistant 消息{' '}
+        {liveness?.assistantMessagesInWindow ?? 0} 条（窗口 = 日志末 {liveness?.windowLines ?? 0}{' '}
+        行，非全程累计）
+      </div>
+
+      {stalled && (
+        <div className="liveness-hint">
+          日志已超过 {STAGNANT_THRESHOLD_MS / 1000} 秒未更新（{formatDuration(ageMs)}）：可能正在长时间思考、
+          或已卡住；可切到「日志」查看活日志确认。
+        </div>
+      )}
+
+      {errorDisplay && (
+        <div className="liveness-error">
+          <b>{errorDisplay.title}</b>
+          <span className="muted">{errorDisplay.hint}</span>
+        </div>
+      )}
     </div>
   );
 }

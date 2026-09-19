@@ -1,6 +1,6 @@
 /** AgentFlow 内部管理台：诊断优先的运维控制台（三栏：任务列表 / 主区标签页） */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   createTask,
   getHealth,
@@ -13,14 +13,29 @@ import {
   type TaskState,
   type TaskSummary,
 } from './api';
-import { aggregateTask } from './aggregate';
+import { aggregateTask, type NodeAggregate } from './aggregate';
 import { ArtifactView } from './components/ArtifactView';
 import { EventView } from './components/EventView';
 import { LogViewer } from './components/LogViewer';
 import { NodeCostView } from './components/NodeCostView';
 import { TaskList } from './components/TaskList';
-import { Badge, Collapsible, EmptyState, PreBlock, StatusBadge, TimeAgo } from './components/common';
-import { formatDuration, formatUsd, shortId } from './format';
+import {
+  Badge,
+  Collapsible,
+  EmptyState,
+  HealthBadge,
+  PreBlock,
+  StatusBadge,
+  TimeAgo,
+} from './components/common';
+import { formatAbsoluteTime, formatDuration, formatUsd, shortId } from './format';
+import {
+  backendCompatibility,
+  computeTaskHealth,
+  fetchNodeLiveness,
+  type BackendHealth,
+  type NodeLiveness,
+} from './liveness';
 
 type TabId = 'nodes' | 'logs' | 'artifacts' | 'events';
 
@@ -39,12 +54,28 @@ export function App() {
   const [detailError, setDetailError] = useState<string | null>(null);
   const [events, setEvents] = useState<KernelEvent[]>([]);
   const [eventsError, setEventsError] = useState<string | null>(null);
-  const [health, setHealth] = useState<'unknown' | 'ok' | 'down'>('unknown');
+  // 后端健康探测结果：包含能力集，用于区分「后端版本落后」与「日志确实不存在」
+  const [backend, setBackend] = useState<BackendHealth>({ status: 'unknown' });
+  // 运行中节点的活性快照（日志文件 mtime/size），由轮询刷新
+  const [liveness, setLiveness] = useState<Record<string, NodeLiveness>>({});
   const [wsStatus, setWsStatus] = useState<'connecting' | 'open' | 'closed'>('connecting');
   const [taskErrorMessage, setTaskErrorMessage] = useState<string | null>(null);
   const [tab, setTab] = useState<TabId>('nodes');
   const [logFocusNodeId, setLogFocusNodeId] = useState<string | null>(null);
   const [listTick, setListTick] = useState(0);
+
+  // nodes / liveness 用 ref 读，避免把每轮新对象放进轮询 effect 的依赖里造成重复拉取
+  const nodesRef = useRef<NodeAggregate[]>([]);
+  const livenessRef = useRef<Record<string, NodeLiveness>>({});
+  livenessRef.current = liveness;
+
+  const probeHealth = useCallback(async () => {
+    try {
+      setBackend({ status: 'ok', info: await getHealth() });
+    } catch (err) {
+      setBackend({ status: 'down', error: (err as Error).message });
+    }
+  }, []);
 
   const refreshList = useCallback(async () => {
     try {
@@ -74,12 +105,34 @@ export function App() {
     }
   }, []);
 
+  /**
+   * 刷新运行中节点的活性：拉活日志、算 mtime/size 增量、解析当前动作。
+   * 只对 running 节点发请求；无 running 节点时清空，避免展示过期活性。
+   */
+  const refreshLiveness = useCallback(async (taskId: string) => {
+    const targets = nodesRef.current.filter((node) => node.status === 'running');
+    if (targets.length === 0) {
+      setLiveness({});
+      return;
+    }
+    const results = await Promise.all(
+      targets.map((node) =>
+        fetchNodeLiveness(
+          taskId,
+          { nodeId: node.nodeId, runId: node.runId, lastLogRef: node.lastLogRef },
+          livenessRef.current[node.nodeId],
+        ),
+      ),
+    );
+    const next: Record<string, NodeLiveness> = {};
+    for (const item of results) next[item.nodeId] = item;
+    setLiveness(next);
+  }, []);
+
   // 列表轮询 + 健康检查 + WebSocket（WS 只是补充，不替代轮询）
   useEffect(() => {
     void refreshList();
-    getHealth()
-      .then((res) => setHealth(res.ok ? 'ok' : 'down'))
-      .catch(() => setHealth('down'));
+    void probeHealth();
 
     const unsubscribe = openEventSocket(
       (message) => {
@@ -96,7 +149,7 @@ export function App() {
     );
 
     return unsubscribe;
-  }, [refreshList]);
+  }, [refreshList, probeHealth]);
 
   // WS 收到 task_state 时补一次列表刷新
   useEffect(() => {
@@ -104,10 +157,14 @@ export function App() {
     void refreshList();
   }, [listTick, refreshList]);
 
+  // 每次列表轮询都重新探测后端能力（A 项：启动与每次轮询都探测）
   useEffect(() => {
-    const timer = setInterval(() => void refreshList(), POLL_LIST_MS);
+    const timer = setInterval(() => {
+      void refreshList();
+      void probeHealth();
+    }, POLL_LIST_MS);
     return () => clearInterval(timer);
-  }, [refreshList]);
+  }, [refreshList, probeHealth]);
 
   // 选中任务：先清空旧数据，避免把上一个任务的内容张冠李戴
   useEffect(() => {
@@ -135,9 +192,46 @@ export function App() {
 
   const aggregate = useMemo(() => aggregateTask(detail, events, Date.now()), [detail, events]);
 
+  // 每次渲染都把最新节点列表交给 ref：轮询回调据此决定对哪些节点抓活性
+  nodesRef.current = aggregate.nodes;
+
   const failedNodes = useMemo(
     () => aggregate.nodes.filter((node) => node.status === 'failed'),
     [aggregate.nodes],
+  );
+
+  // 运行中节点集合的稳定指纹：只有它变化时才重启活性轮询，避免每 2 秒重建定时器
+  const runningKey = useMemo(
+    () =>
+      aggregate.nodes
+        .filter((node) => node.status === 'running')
+        .map((node) => `${node.nodeId}:${node.runId ?? ''}`)
+        .join('|'),
+    [aggregate.nodes],
+  );
+
+  // 活性轮询：与详情轮询同频（2 秒）；进入终态后停止
+  useEffect(() => {
+    if (!selectedId || terminal) return;
+    void refreshLiveness(selectedId);
+    const timer = setInterval(() => void refreshLiveness(selectedId), POLL_DETAIL_MS);
+    return () => clearInterval(timer);
+  }, [selectedId, terminal, runningKey, refreshLiveness]);
+
+  // 后端能力兼容性（缺能力 → 版本落后）+ 任务级健康判定（D 项）
+  const compat = useMemo(() => backendCompatibility(backend), [backend]);
+  const taskHealth = useMemo(
+    () =>
+      detail
+        ? computeTaskHealth({
+            status: detail.status,
+            nodes: aggregate.nodes,
+            liveness,
+            compat,
+            now: Date.now(),
+          })
+        : null,
+    [detail, aggregate.nodes, liveness, compat],
   );
 
   const handleSelect = useCallback((taskId: string) => {
@@ -148,6 +242,7 @@ export function App() {
     setEventsError(null);
     setTaskErrorMessage(null);
     setLogFocusNodeId(null);
+    setLiveness({});
     // 切任务回到「节点与成本」：新任务未必有日志，留在「日志」标签会看到空态造成误解
     setTab('nodes');
   }, []);
@@ -166,6 +261,26 @@ export function App() {
     setLogFocusNodeId(nodeId);
     setTab('logs');
   }, []);
+
+  // 状态区派生值：后端可达性 + 能力兼容 + claude 进程（E 项）
+  const claudeProcCount =
+    backend.status === 'ok' ? (backend.info.claudeProcesses?.length ?? 0) : 0;
+  const backendClass =
+    backend.status === 'ok' ? 'ok' : backend.status === 'down' ? 'down' : 'unknown';
+  const backendLabel =
+    backend.status === 'ok'
+      ? `正常${typeof backend.info.pid === 'number' ? ` · pid ${backend.info.pid}` : ''}`
+      : backend.status === 'down'
+        ? '不可达'
+        : '检测中';
+  const backendTitle =
+    backend.status === 'ok'
+      ? `后端 pid ${backend.info.pid ?? '?'}，启动于 ${formatAbsoluteTime(
+          backend.info.startedAt,
+        )}，能力：${(backend.info.features ?? []).join(', ') || '（未声明）'}`
+      : backend.status === 'down'
+        ? `后端不可达：${backend.error}`
+        : '正在探测后端能力…';
 
   return (
     <div className="layout">
@@ -187,6 +302,7 @@ export function App() {
                   {shortId(detail.taskId, 28)}
                 </span>
                 <StatusBadge status={detail.status} />
+                <HealthBadge health={taskHealth} />
                 <Badge tone="muted">baseBranch {detail.baseBranch || 'main'}</Badge>
               </>
             ) : (
@@ -194,7 +310,27 @@ export function App() {
             )}
           </div>
           <div className="topbar-right">
-            <span className={`health health-${health}`}>API {health === 'ok' ? '正常' : health === 'down' ? '不可达' : '检测中'}</span>
+            <span className={`health health-${backendClass}`} title={backendTitle}>
+              API {backendLabel}
+            </span>
+            {compat.kind === 'stale' && (
+              <span
+                className="health health-down"
+                title={`后端缺少能力：${compat.missing.join(
+                  ', ',
+                )}。后端版本落后于前端，请重启服务后再试。`}
+              >
+                后端版本落后
+              </span>
+            )}
+            {claudeProcCount > 0 && (
+              <span
+                className="health health-warn"
+                title="平台监听 127.0.0.1、面向 macOS 单机；内核不记录 spawn 的 PID，无法精确关联 PID↔runId。若当前没有运行中节点，这些进程基本可判定为孤儿残留（不会自动清理）。"
+              >
+                claude 进程 {claudeProcCount} · 可能有孤儿残留
+              </span>
+            )}
             <span className={`health health-${wsStatus === 'open' ? 'ok' : wsStatus === 'closed' ? 'down' : 'unknown'}`}>
               WS {wsStatus === 'open' ? '已连接' : wsStatus === 'closed' ? '已断开（自动重连）' : '连接中'}
             </span>
@@ -205,6 +341,13 @@ export function App() {
           <div className="banner banner-fail">
             <b>内核上报任务异常：</b>
             <span>{taskErrorMessage}</span>
+          </div>
+        )}
+
+        {taskHealth && (taskHealth.label === '疑似停滞' || taskHealth.label === '无法判断') && (
+          <div className="banner banner-warn">
+            <b>流程健康：{taskHealth.label}</b>
+            <span>{taskHealth.reason}</span>
           </div>
         )}
 
@@ -352,13 +495,20 @@ export function App() {
                   <NodeCostView
                     state={detail}
                     aggregate={aggregate}
+                    liveness={liveness}
+                    compat={compat}
                     onOpenLog={openLog}
                     onOpenArtifacts={() => setTab('artifacts')}
                   />
                 )}
 
                 {tab === 'logs' && (
-                  <LogViewer taskId={detail.taskId} nodes={aggregate.nodes} focusNodeId={logFocusNodeId} />
+                  <LogViewer
+                    taskId={detail.taskId}
+                    nodes={aggregate.nodes}
+                    compat={compat}
+                    focusNodeId={logFocusNodeId}
+                  />
                 )}
 
                 {tab === 'artifacts' && <ArtifactView state={detail} aggregate={aggregate} />}

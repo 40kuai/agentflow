@@ -101,6 +101,29 @@ export type LogTail = {
   returnedLines: number;
   truncated: boolean;
   lines: string[];
+  /** 以下为文件活性字段（后端 capabilities 见 health.features）。旧后端可能缺省，缺省时按「未知」处理 */
+  sizeBytes?: number;
+  /** 文件最后修改时间（ms） */
+  lastModifiedAt?: number;
+  /** 服务端上报的「现在 − 最后修改时间」（ms） */
+  ageMs?: number;
+};
+
+/** 本机 claude 进程（E 项）：内核不记录 spawn 的 PID，无法精确关联 runId，故只如实报告进程本身 */
+export type ClaudeProcess = { pid: number; etimeMs: number; command: string };
+
+/**
+ * /api/health 响应。除 ok 外全部可选：
+ * 旧后端只返回 { ok: true }，此时 `features` 缺失即代表「后端版本落后于前端」。
+ */
+export type HealthInfo = {
+  ok: boolean;
+  pid?: number;
+  startedAt?: number;
+  uptimeMs?: number;
+  /** 后端声明的能力集；缺失或缺少前端所需能力 → 后端版本落后 */
+  features?: string[];
+  claudeProcesses?: ClaudeProcess[];
 };
 
 export type CreateTaskInput = {
@@ -112,11 +135,14 @@ export type CreateTaskInput = {
 /** 带 HTTP 状态码的接口错误：日志端点的 400 / 404 需要如实上报给界面 */
 export class ApiError extends Error {
   readonly status: number;
+  /** 后端给出的原因码（如 NO_LOG_REF / FILE_NOT_FOUND / OUT_OF_LOG_ROOT）；未知或缺失为 null */
+  readonly code: string | null;
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, code: string | null = null) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -124,19 +150,21 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init);
   if (!res.ok) {
     let detail = '';
+    let code: string | null = null;
     try {
-      const body = (await res.json()) as { error?: string; detail?: string };
+      const body = (await res.json()) as { error?: string; detail?: string; code?: string };
       detail = [body?.error, body?.detail].filter(Boolean).join(' — ');
+      if (typeof body?.code === 'string' && body.code !== '') code = body.code;
     } catch {
       // 响应体非 JSON：忽略，退回状态码
     }
-    throw new ApiError(res.status, detail || `HTTP ${res.status}`);
+    throw new ApiError(res.status, detail || `HTTP ${res.status}`, code);
   }
   return (await res.json()) as T;
 }
 
-export async function getHealth(): Promise<{ ok: boolean }> {
-  return requestJson<{ ok: boolean }>('/api/health');
+export async function getHealth(): Promise<HealthInfo> {
+  return requestJson<HealthInfo>('/api/health');
 }
 
 export async function createTask(input: CreateTaskInput): Promise<{ taskId: string }> {

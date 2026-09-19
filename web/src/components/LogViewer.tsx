@@ -9,7 +9,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { ApiError, getNodeLog, getRunLog, type LogTail } from '../api';
 import type { NodeAggregate } from '../aggregate';
-import { formatClock, formatDuration, formatUsd, shortId, truncate } from '../format';
+import { formatBytes, formatClock, formatDuration, formatUsd, shortId, truncate } from '../format';
+import { classifyLogError, STAGNANT_THRESHOLD_MS, type BackendCompatibility } from '../liveness';
 import {
   buildConversation,
   parseLogLines,
@@ -27,6 +28,7 @@ import {
   CopyButton,
   EmptyState,
   ErrorBox,
+  LiveAgo,
   PreBlock,
   Section,
   statusTone,
@@ -41,6 +43,8 @@ type ViewMode = 'conversation' | 'raw' | 'diagnostic';
 type Props = {
   taskId: string;
   nodes: NodeAggregate[];
+  /** 后端能力兼容性：把 404 正确分类为「后端版本落后」而不是「日志不存在」 */
+  compat: BackendCompatibility;
   /** 外部（节点卡片「查看日志」）指定的聚焦节点 */
   focusNodeId: string | null;
 };
@@ -56,13 +60,15 @@ function pickDefaultNode(nodes: NodeAggregate[]): string | null {
   );
 }
 
-export function LogViewer({ taskId, nodes, focusNodeId }: Props) {
+export function LogViewer({ taskId, nodes, compat, focusNodeId }: Props) {
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(focusNodeId);
   const [tail, setTail] = useState(200);
   const [view, setView] = useState<ViewMode>('conversation');
   const [data, setData] = useState<LogTail | null>(null);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<{ status: number | null; message: string } | null>(null);
+  const [error, setError] = useState<{ status: number | null; code: string | null; message: string } | null>(
+    null,
+  );
   const [query, setQuery] = useState('');
   const [hitIndex, setHitIndex] = useState(0);
   const [highlightLine, setHighlightLine] = useState<number | null>(null);
@@ -125,8 +131,8 @@ export function LogViewer({ taskId, nodes, focusNodeId }: Props) {
       .catch((err: unknown) => {
         if (cancelled) return;
         setData(null);
-        if (err instanceof ApiError) setError({ status: err.status, message: err.message });
-        else setError({ status: null, message: (err as Error).message });
+        if (err instanceof ApiError) setError({ status: err.status, code: err.code, message: err.message });
+        else setError({ status: null, code: null, message: (err as Error).message });
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -152,6 +158,12 @@ export function LogViewer({ taskId, nodes, focusNodeId }: Props) {
     if (!q) return [];
     return parsed.rawLines.filter((line) => line.text.toLowerCase().includes(q)).map((l) => l.lineNo);
   }, [parsed, query]);
+
+  // 错误文案按后端能力 + 原因码分类：不再用「节点无日志引用，或日志文件已不存在」抹平真相
+  const errorDisplay = useMemo(
+    () => (error ? classifyLogError(error, compat) : null),
+    [error, compat],
+  );
 
   const jumpToLine = useCallback((lineNo: number) => {
     setView('raw');
@@ -295,6 +307,14 @@ export function LogViewer({ taskId, nodes, focusNodeId }: Props) {
               {data.truncated ? '（已截断）' : '（已含全部）'}
             </span>
             <span className="muted">本次窗口起始行号 {startLineNo}</span>
+            {typeof data.sizeBytes === 'number' ? (
+              <span className="muted">文件 {formatBytes(data.sizeBytes)}</span>
+            ) : (
+              <span className="tone-warn">后端未提供文件活性（可能版本落后于前端）</span>
+            )}
+            {typeof data.lastModifiedAt === 'number' && (
+              <LiveAgo ts={data.lastModifiedAt} prefix="最后写入 " staleAfterMs={STAGNANT_THRESHOLD_MS} />
+            )}
             {loading && <span className="muted">刷新中…</span>}
           </div>
         )}
@@ -319,25 +339,7 @@ export function LogViewer({ taskId, nodes, focusNodeId }: Props) {
         </div>
       )}
 
-      {error && (
-        <ErrorBox
-          title={
-            error.status === 400
-              ? '日志端点返回 400（服务端拒绝读取）'
-              : error.status === 404
-                ? '日志端点返回 404'
-                : '拉取日志失败'
-          }
-          message={error.message}
-          hint={
-            error.status === 400
-              ? '服务端做了目录穿越校验：lastLogRef 指向了日志根目录之外。这是数据问题，需检查内核写入的 log_ref。'
-              : error.status === 404
-                ? '节点无日志引用，或日志文件已不存在。'
-                : '网络或服务异常，可点「重新拉取」重试。'
-          }
-        />
-      )}
+      {errorDisplay && <ErrorBox title={errorDisplay.title} message={errorDisplay.message} hint={errorDisplay.hint} />}
 
       {loading && !data && !error && <EmptyState>正在拉取日志…</EmptyState>}
 

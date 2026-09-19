@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -156,11 +156,27 @@ function seedRunningNode(b: Boot, runId: string): { taskId: string; nodeId: stri
 }
 
 describe('HTTP API', () => {
-  it('health 返回 ok', async () => {
+  it('health 返回能力探测元信息（pid/startedAt/uptimeMs/features/claudeProcesses）', async () => {
     const { server } = boot();
     const res = await server.app.inject({ method: 'GET', url: '/api/health' });
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ ok: true });
+    const body = res.json() as {
+      ok: boolean;
+      pid: number;
+      startedAt: number;
+      uptimeMs: number;
+      features: string[];
+      claudeProcesses: unknown;
+    };
+    expect(body.ok).toBe(true);
+    expect(body.pid).toBe(process.pid);
+    expect(typeof body.startedAt).toBe('number');
+    expect(body.uptimeMs).toBeGreaterThanOrEqual(0);
+    // 前端必需能力齐全，才能避免把日志 404 误读成「日志不存在」
+    expect(body.features).toEqual(
+      expect.arrayContaining(['log-by-node', 'log-by-run', 'live-stats']),
+    );
+    expect(Array.isArray(body.claudeProcesses)).toBe(true);
   });
 
   it('POST /api/tasks 创建任务并返回 taskId', async () => {
@@ -498,5 +514,117 @@ describe('GET /api/tasks/:taskId/runs/:runId/log（运行中节点的回退日�
       url: '/api/tasks/task_ghost/runs/run_x/log',
     });
     expect(res.statusCode).toBe(404);
+  });
+});
+
+describe('日志端点：文件活性字段（B 项）', () => {
+  const LINES = ['{"n":1}', '{"n":2}', '{"n":3}'];
+
+  it('节点日志响应新增 sizeBytes/lastModifiedAt/ageMs，既有 6 个字段不变且与磁盘一致', async () => {
+    const b = boot();
+    const taskId = await startAndRun(b);
+    const logRef = b.kernel.getState(taskId).nodes['pm_analyze']?.lastLogRef;
+    writeLogFile(logRef!, LINES);
+
+    const res = await b.server.app.inject({
+      method: 'GET',
+      url: `/api/tasks/${taskId}/nodes/pm_analyze/log?tail=2`,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      totalLines: number;
+      returnedLines: number;
+      truncated: boolean;
+      lines: string[];
+      sizeBytes: number;
+      lastModifiedAt: number;
+      ageMs: number;
+    };
+    // 既有字段保持不变
+    expect(body.totalLines).toBe(3);
+    expect(body.returnedLines).toBe(2);
+    expect(body.truncated).toBe(true);
+    expect(body.lines).toEqual(LINES.slice(1));
+    // 新增活性字段与磁盘真实文件一致
+    const st = statSync(resolve(logRef!));
+    expect(body.sizeBytes).toBe(st.size);
+    expect(Math.abs(body.lastModifiedAt - Math.round(st.mtimeMs))).toBeLessThanOrEqual(1);
+    expect(body.ageMs).toBeGreaterThanOrEqual(0);
+    expect(body.ageMs).toBeLessThan(60_000);
+  });
+
+  it('runId 回退日志端点同样带活性字段', async () => {
+    const b = boot();
+    const { taskId } = seedRunningNode(b, 'run_live_stats');
+    const logRef = join(b.logDir, 'runs', 'run_live_stats.jsonl');
+    writeLogFile(logRef, LINES);
+
+    const res = await b.server.app.inject({
+      method: 'GET',
+      url: `/api/tasks/${taskId}/runs/run_live_stats/log`,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { sizeBytes: number; lastModifiedAt: number; ageMs: number };
+    const st = statSync(resolve(logRef));
+    expect(body.sizeBytes).toBe(st.size);
+    expect(body.ageMs).toBeGreaterThanOrEqual(0);
+  });
+});
+
+describe('日志端点：错误原因码（F 项）', () => {
+  it('NO_LOG_REF：节点无日志引用', async () => {
+    const b = boot();
+    const taskId = b.kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    b.store.append({
+      task_id: taskId,
+      type: 'node.queued',
+      payload: { node_id: 'pm_analyze', role_id: 'pm', run_id: 'run_seed', attempt: 1 },
+      actor: 'kernel',
+    });
+
+    const res = await b.server.app.inject({
+      method: 'GET',
+      url: `/api/tasks/${taskId}/nodes/pm_analyze/log`,
+    });
+    expect(res.statusCode).toBe(404);
+    expect(res.json()).toMatchObject({ code: 'NO_LOG_REF' });
+  });
+
+  it('FILE_NOT_FOUND：log_ref 指向的文件不存在', async () => {
+    const b = boot();
+    const taskId = await startAndRun(b);
+    // 不写出日志文件，直接请求 → 文件不存在
+    const res = await b.server.app.inject({
+      method: 'GET',
+      url: `/api/tasks/${taskId}/nodes/pm_analyze/log`,
+    });
+    expect(res.statusCode).toBe(404);
+    expect(res.json()).toMatchObject({ code: 'FILE_NOT_FOUND' });
+  });
+
+  it('OUT_OF_LOG_ROOT：log_ref 越界返回 400 + code，且不泄露内容', async () => {
+    const b = boot();
+    const secretPath = join(b.repo, 'secret.txt');
+    writeFileSync(secretPath, 'TOP_SECRET_MARKER\n', 'utf8');
+    const { taskId, nodeId } = seedNodeWithLogRef(b, secretPath);
+
+    const res = await b.server.app.inject({
+      method: 'GET',
+      url: `/api/tasks/${taskId}/nodes/${nodeId}/log`,
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toMatchObject({ code: 'OUT_OF_LOG_ROOT' });
+    expect(res.body).not.toContain('TOP_SECRET_MARKER');
+  });
+
+  it('runId 端点：文件不存在返回 FILE_NOT_FOUND + code', async () => {
+    const b = boot();
+    const { taskId } = seedRunningNode(b, 'run_never_written');
+    const res = await b.server.app.inject({
+      method: 'GET',
+      url: `/api/tasks/${taskId}/runs/run_never_written/log`,
+    });
+    expect(res.statusCode).toBe(404);
+    expect(res.json()).toMatchObject({ code: 'FILE_NOT_FOUND' });
   });
 });
