@@ -50,6 +50,9 @@ const SERVER_FEATURES: readonly string[] = [
   'log-by-run',
   'live-stats',
   'task-cancel',
+  // 节点「停滞自动停止」：health 会额外返回 nodeStallTimeoutMs（0 = 未启用），
+  // 前端据此在状态条说明「连续多久无输出会被自动终止」，避免用户只能看到「疑似停滞」。
+  'node-stall-timeout',
 ];
 
 /** claude 进程探测结果的缓存时长：health 会被前端高频轮询，避免每次都 spawn ps */
@@ -81,6 +84,11 @@ export type ServerDeps = {
    * 未提供时回退到从 configDir 加载。
    */
   roles?: Map<string, RoleDef>;
+  /**
+   * 内核实际生效的节点停滞自动停止阈值（ms）：仅用于向 `/api/health` 如实汇报，
+   * 让前端能展示「连续多久无输出会被自动终止」。`0` / 未提供 = 未启用该保护。
+   */
+  nodeStallTimeoutMs?: number;
 };
 
 export type AgentFlowServer = {
@@ -338,6 +346,9 @@ function collectNodeFacts(events: KernelEvent[]): Map<string, NodeEventFacts> {
       case 'node.started': {
         const facts = get(asStr(p, 'node_id'));
         facts.startedAt = event.created_at;
+        // 重试会再次落 node.started：清掉上一轮的结束时刻，否则运行中节点的 durationMs
+        // 会拿「本次开始 − 上次结束」算出 0，把「还没结束」误报成「耗时 0」。
+        facts.endedAt = null;
         facts.worktreePath = asStrOrNull(p, 'worktree_path') ?? facts.worktreePath;
         break;
       }
@@ -506,6 +517,11 @@ type FlowNodeView = {
   } | null;
   blockedReason: { category: string | null; label: string | null; error: string } | null;
   durationMs: number | null;
+  /**
+   * 本节点**最后一次尝试**的启动时刻（ms）；从未启动为 null。
+   * `durationMs` 只在节点结束后才有值，运行中的节点要靠 `startedAt` 才能显示「已运行多久」。
+   */
+  startedAt: number | null;
   costUsd: number;
   artifactTypes: string[];
   invalidatedArtifactTypes: string[];
@@ -594,6 +610,7 @@ function buildFlowView(
         : null,
       blockedReason: nodeFacts?.blocked ?? null,
       durationMs: durationMsOf(nodeFacts),
+      startedAt: nodeFacts?.startedAt ?? null,
       costUsd: nodeFacts?.costUsd ?? 0,
       artifactTypes: nodeFacts?.artifactTypes ?? [],
       invalidatedArtifactTypes: nodeFacts?.invalidatedArtifactTypes ?? [],
@@ -842,6 +859,8 @@ export function createServer(deps: ServerDeps): AgentFlowServer {
       startedAt: PROCESS_STARTED_AT,
       uptimeMs: Math.max(0, now - PROCESS_STARTED_AT),
       features: [...SERVER_FEATURES],
+      // 节点停滞自动停止阈值（ms）：0 表示未启用。前端据此说明自动终止规则。
+      nodeStallTimeoutMs: deps.nodeStallTimeoutMs ?? 0,
       claudeProcesses: listClaudeProcesses(),
     };
   });

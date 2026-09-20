@@ -354,6 +354,44 @@ function createRunnerCore(options: ClaudeCodeRunnerOptions): RunnerCore {
         notify = null;
       };
 
+      /**
+       * 「停滞自动停止」（stall timeout）：与上面的 wall-clock 硬超时互补。
+       * wall-clock 只封顶总时长，对「进程还活着、但再也不产生任何输出」的挂起无能为力
+       * （已实测的 --json-schema 空转路径可以一直不退出）。这里按**最后输出时刻**计时：
+       * stdout/stderr 每来一块数据就重置，连续 stallTimeoutMs 无任何输出即判定卡死并强制终止。
+       *
+       * 与 wall-clock 的两点差别（有意为之）：
+       *  - 判据是「无输出」而非「总耗时」：正常长任务只要持续输出就不会被误杀；
+       *  - 上报分类复用既有的 `timeout`（语义就是超时），detail 里写明是停滞而非总时长超限，
+       *    使内核落库的 error 文案能直接回答「为什么被停」。
+       * 定时器必须在 'close'/'error' 清理，否则进程已退出还会补一次误杀。
+       */
+      let stalled = false;
+      const stallMs = req.stallTimeoutMs ?? 0;
+      let stallTimer: ReturnType<typeof setTimeout> | null = null;
+      const clearStall = (): void => {
+        if (stallTimer !== null) {
+          clearTimeout(stallTimer);
+          stallTimer = null;
+        }
+      };
+      const armStall = (): void => {
+        if (stallMs <= 0) return;
+        clearStall();
+        stallTimer = setTimeout(() => {
+          stallTimer = null;
+          stalled = true;
+          const detail = `节点连续 ${stallMs}ms 无任何输出，判定为停滞并已自动终止（stall timeout）`;
+          logStream.write(
+            JSON.stringify({ ts: Date.now(), kind: 'stall_timeout', stallTimeoutMs: stallMs }) + '\n',
+          );
+          push({ kind: 'log', chunk: detail });
+          push({ kind: 'failure', reason: 'timeout', detail });
+          killTree(child.pid, 'SIGKILL');
+        }, stallMs);
+      };
+      armStall();
+
       // ⚠️ 'error' 监听**必须**在第一个 yield 之前挂上。
       // spawn 失败（binPath 不存在 → ENOENT）时 Node 经 process.nextTick 投递 'error'，
       // 而 nextTick 队列先于 await 的微任务续跑执行：若此刻还没有监听器，Node 会抛
@@ -366,6 +404,7 @@ function createRunnerCore(options: ClaudeCodeRunnerOptions): RunnerCore {
       // 回归测试：`src/runner/claude-code-runner.spawn-error.test.ts`（把本段挪回 yield 之后即变红）。
       child.on('error', (error) => {
         clearTimeout(timeoutTimer);
+        clearStall();
         const detail = `进程启动失败：${error.message}`;
         push({ kind: 'log', chunk: detail });
         // spawn 失败（ENOENT 等）不属于上面列出的任一分类，归入 other，但原文一并保留供排查
@@ -382,6 +421,7 @@ function createRunnerCore(options: ClaudeCodeRunnerOptions): RunnerCore {
 
       child.stdout.setEncoding('utf8');
       child.stdout.on('data', (chunk: string) => {
+        armStall();
         logStream.write(JSON.stringify({ ts: Date.now(), kind: 'stdout', chunk }) + '\n');
         buffered += chunk;
         const lines = buffered.split('\n');
@@ -394,12 +434,14 @@ function createRunnerCore(options: ClaudeCodeRunnerOptions): RunnerCore {
 
       child.stderr.setEncoding('utf8');
       child.stderr.on('data', (chunk: string) => {
+        armStall();
         logStream.write(JSON.stringify({ ts: Date.now(), kind: 'stderr', chunk }) + '\n');
         push({ kind: 'log', chunk });
       });
 
       child.on('close', (code) => {
         clearTimeout(timeoutTimer);
+        clearStall();
         if (buffered.trim() !== '') {
           if (isStructuredOutputRetriesExhausted(buffered)) state.schemaRetriesExhausted = true;
           for (const e of parseStreamLine(buffered)) push(e);
@@ -412,7 +454,8 @@ function createRunnerCore(options: ClaudeCodeRunnerOptions): RunnerCore {
         }
         closed = true;
         // 被 SIGKILL 终止时 code 为 null，统一归一为 -1，避免上层把 null 当成功
-        push({ kind: 'exited', code: timedOut ? -1 : code });
+        // （停滞自动停止同样走 SIGKILL，故与 wall-clock 超时合并判断）
+        push({ kind: 'exited', code: timedOut || stalled ? -1 : code });
         logStream.end();
         running.delete(req.runId);
         unregisterGroup(child.pid);

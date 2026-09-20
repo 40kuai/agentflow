@@ -271,6 +271,10 @@ export function App() {
   }, [selectedId, terminal, runningKey, refreshLiveness]);
 
   const compat = useMemo(() => backendCompatibility(backend), [backend]);
+  // 后端生效的停滞自动停止阈值（ms）：null = 后端未声明该能力（版本落后）；0 = 已关闭。
+  // 前端据此**如实**说明"会不会自动停"，绝不把未启用说成会自动停。
+  const stallTimeoutMs =
+    backend.status === 'ok' ? (backend.info.nodeStallTimeoutMs ?? null) : null;
   const taskHealth = useMemo(
     () =>
       detail
@@ -451,6 +455,8 @@ export function App() {
               aggregate={aggregate}
               compat={compat}
               taskHealth={taskHealth}
+              liveness={liveness}
+              stallTimeoutMs={stallTimeoutMs}
               cancelling={cancelling}
               cancelNotice={cancelNotice}
               cancelError={cancelError}
@@ -462,7 +468,10 @@ export function App() {
               flow={flow}
               error={flowError}
               liveness={liveness}
+              stallTimeoutMs={stallTimeoutMs}
+              cancelling={cancelling}
               onOpenLog={openLog}
+              onCancelTask={() => void handleCancel()}
             />
 
             {!detail && !detailError && !flow && <EmptyState>正在加载任务详情…</EmptyState>}

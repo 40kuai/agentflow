@@ -13,7 +13,8 @@ export type FlowGraphEdge = { from: string; to: string };
 
 /** 节点方框与间距（px）。数值只影响展示，不参与语义 */
 export const NODE_WIDTH = 208;
-export const NODE_HEIGHT = 112;
+/** 高度按「标题 / 角色 / 已运行·花费 / 状态行 / 当前动作行」五行 + 内边距留足 */
+export const NODE_HEIGHT = 136;
 export const COLUMN_GAP = 72;
 export const ROW_GAP = 16;
 

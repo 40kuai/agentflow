@@ -44,6 +44,27 @@ const req: RunRequest = {
   wallTimeMs: 300,
 };
 
+/** 持续输出（每 200ms 一行）但总时长 1.6s 的脚本：用来证明「有输出就不会被 stall 判死」 */
+function makeTickingBin(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'agentflow-tick-'));
+  const bin = join(dir, 'fake-claude.js');
+  writeFileSync(
+    bin,
+    `#!/usr/bin/env node
+if (process.argv[2] === '--warmup') process.exit(0);
+let n = 0;
+const t = setInterval(() => {
+  process.stdout.write('tick\\n');
+  n += 1;
+  if (n >= 8) { clearInterval(t); process.exit(0); }
+}, 200);
+`,
+  );
+  chmodSync(bin, 0o755);
+  execFileSync(bin, ['--warmup']);
+  return bin;
+}
+
 describe('claude runner wall-clock 超时保护', () => {
   it('超过 wallTimeMs 时强制终止，退出码归一为 -1 并留下日志', async () => {
     const binPath = makeHangingBin();
@@ -71,5 +92,68 @@ describe('claude runner wall-clock 超时保护', () => {
     expect(pid).toBeGreaterThan(0);
     // process.kill(-pid, 0) 是探测进程组是否存在的标准做法；组已消失时会抛 ESRCH
     expect(() => process.kill(-pid, 0)).toThrow();
+  }, 10_000);
+});
+
+describe('claude runner 停滞自动停止（stall timeout）', () => {
+  it('连续无输出超过 stallTimeoutMs 即强制终止，退出码 -1 且失败原因归为 timeout', async () => {
+    const binPath = makeHangingBin();
+    const logDir = mkdtempSync(join(tmpdir(), 'agentflow-stalllog-'));
+    const runner = createClaudeCodeRunner({ binPath, logDir });
+
+    const events: RunnerEvent[] = [];
+    const startedAt = Date.now();
+    // wallTimeMs 给到 30s：若最终仍在 5s 内结束，说明生效的是 stall 计时器而非总时长封顶
+    for await (const e of runner.run({ ...req, runId: 'run_stall', wallTimeMs: 30_000, stallTimeoutMs: 400 })) {
+      events.push(e);
+    }
+    const elapsed = Date.now() - startedAt;
+
+    expect(elapsed).toBeLessThan(5_000);
+    expect(events.at(-1)).toEqual({ kind: 'exited', code: -1 });
+    expect(events.some((e) => e.kind === 'log' && e.chunk.includes('stall timeout'))).toBe(true);
+    expect(events.some((e) => e.kind === 'failure' && e.reason === 'timeout')).toBe(true);
+
+    // SIGKILL 打的是进程组：孙进程（sleep 60）必须一起死，否则平台会留下孤儿进程
+    const started = events.find(
+      (e): e is Extract<RunnerEvent, { kind: 'started' }> => e.kind === 'started',
+    );
+    expect(started).toBeDefined();
+    expect(() => process.kill(-started!.pid, 0)).toThrow();
+  }, 10_000);
+
+  it('只要持续有输出就不会被误杀（stall 计的是「距最后一次输出」而非总耗时）', async () => {
+    const binPath = makeTickingBin();
+    const logDir = mkdtempSync(join(tmpdir(), 'agentflow-ticklog-'));
+    const runner = createClaudeCodeRunner({ binPath, logDir });
+
+    const events: RunnerEvent[] = [];
+    // stallTimeoutMs(400) < 脚本总时长(~1.6s)：若计时器不在每次输出后重置，这里必然被误杀
+    for await (const e of runner.run({ ...req, runId: 'run_tick', wallTimeMs: 30_000, stallTimeoutMs: 400 })) {
+      events.push(e);
+    }
+
+    expect(events.at(-1)).toEqual({ kind: 'exited', code: 0 });
+    expect(events.some((e) => e.kind === 'log' && e.chunk.includes('stall timeout'))).toBe(false);
+    expect(events.some((e) => e.kind === 'failure')).toBe(false);
+  }, 10_000);
+
+  it('stallTimeoutMs 为 0 / 未配置时不启用该保护（保持旧行为）', async () => {
+    const binPath = makeHangingBin();
+    const logDir = mkdtempSync(join(tmpdir(), 'agentflow-nostalllog-'));
+    const runner = createClaudeCodeRunner({ binPath, logDir });
+
+    const events: RunnerEvent[] = [];
+    const startedAt = Date.now();
+    // 只给 600ms 的 wall-clock 上限：若 stall 在未配置时也生效，它不可能成为本次结束的原因
+    for await (const e of runner.run({ ...req, runId: 'run_nostall', wallTimeMs: 600 })) {
+      events.push(e);
+    }
+    const elapsed = Date.now() - startedAt;
+
+    expect(elapsed).toBeLessThan(5_000);
+    expect(events.at(-1)).toEqual({ kind: 'exited', code: -1 });
+    expect(events.some((e) => e.kind === 'log' && e.chunk.includes('wall-clock'))).toBe(true);
+    expect(events.some((e) => e.kind === 'log' && e.chunk.includes('stall timeout'))).toBe(false);
   }, 10_000);
 });

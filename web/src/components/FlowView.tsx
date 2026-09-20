@@ -6,6 +6,8 @@
  * 都远好于 <text>；而边用 SVG 才能画平滑曲线与箭头。
  */
 
+import { useState } from 'react';
+
 import type { FlowNode, FlowView } from '../api';
 import {
   NODE_HEIGHT,
@@ -17,8 +19,8 @@ import {
   type LaidOutNode,
 } from '../flow';
 import { formatDuration, formatUsd } from '../format';
-import { STAGNANT_THRESHOLD_MS, type NodeLiveness } from '../liveness';
-import { Badge, EmptyState, LiveAgo } from './common';
+import { STAGNANT_THRESHOLD_MS, autoStopText, stalledAgeMs, type NodeLiveness } from '../liveness';
+import { Badge, EmptyState, LiveAgo, LiveSince } from './common';
 
 type Props = {
   flow: FlowView | null;
@@ -26,11 +28,31 @@ type Props = {
   error: string | null;
   /** 运行中节点的活性快照（按 nodeId），来自日志文件的 mtime/size */
   liveness: Record<string, NodeLiveness>;
+  /**
+   * 后端生效的「停滞自动停止」阈值（ms）：0 = 已关闭；null = 后端未声明该能力（版本落后）。
+   * 用于在停滞节点上如实说明"会不会自动停"，而不是只抛一句"疑似停滞"让用户去翻日志。
+   */
+  stallTimeoutMs: number | null;
+  /** 是否正在提交取消请求（停止按钮据此禁用，避免重复点） */
+  cancelling: boolean;
   /** 点击节点：跳到该节点的日志 */
   onOpenLog: (nodeId: string) => void;
+  /**
+   * 停止整个任务：内核只提供任务级取消（没有"只停单个节点"的语义），
+   * 故按钮文案必须写明是「停止任务」，不能让人误以为只停这一个节点。
+   */
+  onCancelTask: () => void;
 };
 
-export function FlowView({ flow, error, liveness, onOpenLog }: Props) {
+export function FlowView({
+  flow,
+  error,
+  liveness,
+  stallTimeoutMs,
+  cancelling,
+  onOpenLog,
+  onCancelTask,
+}: Props) {
   if (error) {
     return (
       <div className="banner banner-warn">
@@ -128,7 +150,10 @@ export function FlowView({ flow, error, liveness, onOpenLog }: Props) {
                 edges={flow.edges}
                 nodes={flow.nodes}
                 liveness={liveness[node.id]}
+                stallTimeoutMs={stallTimeoutMs}
+                cancelling={cancelling}
                 onOpenLog={onOpenLog}
+                onCancelTask={onCancelTask}
               />
             );
           })}
@@ -142,32 +167,51 @@ function label(node: FlowNode | undefined): string {
   return node ? node.title || node.id : '—';
 }
 
+/**
+ * 停滞节点的完整说明（hover 用）：把「无输出多久」与「系统会不会自动停」一次讲清，
+ * 直接回答用户"要不要我手动去停"这个决策问题，而不是只丢一句"疑似停滞"。
+ */
+function stallDetail(stalledForMs: number | null, stallTimeoutMs: number | null): string {
+  if (stalledForMs === null) return '';
+  return `日志已 ${formatDuration(stalledForMs)} 没有新输出（疑似停滞阈值 ${
+    STAGNANT_THRESHOLD_MS / 1000
+  } 秒）。${autoStopText(stallTimeoutMs)}。`;
+}
+
 function DagNodeBox({
   node,
   position,
   nodes,
   edges,
   liveness,
+  stallTimeoutMs,
+  cancelling,
   onOpenLog,
+  onCancelTask,
 }: {
   node: FlowNode;
   position: LaidOutNode;
   nodes: FlowNode[];
   edges: FlowView['edges'];
   liveness: NodeLiveness | undefined;
+  stallTimeoutMs: number | null;
+  cancelling: boolean;
   onOpenLog: (nodeId: string) => void;
+  onCancelTask: () => void;
 }) {
+  // 停止是**任务级**动作（内核没有"只停单个节点"的语义），必须先二次确认再提交，
+  // 避免在密集的节点方框里误点一下就把整条流程杀掉。
+  const [confirmStop, setConfirmStop] = useState(false);
+
   const active = node.current || isActive(node.status);
   const failed = node.status === 'failed';
   const cancelled = node.status === 'cancelled';
   const wait = joinWait(node.id, nodes, edges);
   // join 且自己尚未成功：显示"在等谁"。判定只看直接上游，与内核 join 语义一致。
   const waiting = wait.isJoin && node.status !== 'succeeded' && node.status !== 'running' && wait.waitingOn.length > 0;
-  const stalled =
-    active &&
-    liveness?.ok === true &&
-    typeof liveness.lastModifiedAt === 'number' &&
-    Date.now() - liveness.lastModifiedAt >= STAGNANT_THRESHOLD_MS;
+  // 停滞判据与状态条共用（liveness.ts 的 stalledAgeMs），避免两处口径漂移
+  const stalledFor = stalledAgeMs(active, liveness, Date.now());
+  const stalled = stalledFor !== null;
 
   const classes = [
     'dag-node',
@@ -204,12 +248,19 @@ function DagNodeBox({
       </div>
 
       <div className="dag-node-metrics">
-        <span>{formatDuration(node.durationMs)}</span>
+        {/* 运行中的节点没有 durationMs（要等结束才算得出），改显示**每秒自增**的已运行时长 */}
+        {active && typeof node.startedAt === 'number' ? (
+          <span title="本次尝试已运行时长（每秒刷新）">
+            已运行 <LiveSince ts={node.startedAt} />
+          </span>
+        ) : (
+          <span>{formatDuration(node.durationMs)}</span>
+        )}
         <span className="money">{formatUsd(node.costUsd)}</span>
         {node.artifactTypes.length > 0 && <span className="muted">{node.artifactTypes.join(', ')}</span>}
       </div>
 
-      {/* 三项"不用展开就能看到"的关键信息：失败原因 / 在等谁 / 正常运行中 */}
+      {/* 四项"不用展开就能看到"的关键信息：失败原因 / 在等谁 / 停滞（含停止入口）/ 正常运行中 */}
       {failed ? (
         <div className="dag-strip dag-strip-fail" title={node.blockedReason?.error ?? node.enterReason?.reason ?? ''}>
           <b>{node.blockedReason?.label ?? '失败'}</b>
@@ -219,6 +270,42 @@ function DagNodeBox({
         <div className="dag-strip dag-strip-wait" title={`未就绪的上游：${wait.waitingOn.join('、')}`}>
           <b>在等</b>
           <span className="ellipsis">{wait.waitingOn.map((id) => nodes.find((n) => n.id === id)?.title || id).join('、')}</span>
+        </div>
+      ) : active && confirmStop ? (
+        <div className="dag-strip dag-strip-stall">
+          <b>停止整个任务？</b>
+          <button
+            type="button"
+            className="btn btn-xs btn-danger"
+            disabled={cancelling}
+            onClick={() => {
+              setConfirmStop(false);
+              onCancelTask();
+            }}
+          >
+            {cancelling ? '停止中…' : '确认'}
+          </button>
+          <button type="button" className="btn btn-xs btn-ghost" onClick={() => setConfirmStop(false)}>
+            算了
+          </button>
+        </div>
+      ) : active && stalled ? (
+        <div className="dag-strip dag-strip-stall" title={stallDetail(stalledFor, stallTimeoutMs)}>
+          <b>疑似停滞</b>
+          {typeof liveness?.lastModifiedAt === 'number' ? (
+            <LiveAgo ts={liveness.lastModifiedAt} staleAfterMs={STAGNANT_THRESHOLD_MS} prefix="日志 " />
+          ) : (
+            <span className="muted">日志已无更新</span>
+          )}
+          <button
+            type="button"
+            className="btn btn-xs btn-danger"
+            disabled={cancelling}
+            onClick={() => setConfirmStop(true)}
+            title="内核只支持任务级取消：确认后将终止整条流程的全部在途节点（已花费用不退回）"
+          >
+            停止
+          </button>
         </div>
       ) : active ? (
         <div className="dag-strip dag-strip-run">
@@ -238,6 +325,25 @@ function DagNodeBox({
           <span className="ellipsis muted" title={node.enterReason?.reason ?? ''}>
             {node.enterReason?.reason ?? node.entryCondition ?? '（尚未进入）'}
           </span>
+        </div>
+      )}
+
+      {/* 当前动作行：直接回答"现在到底在做什么"，不必切到日志 tab 才知道。
+          停滞时改为陈述"多久没输出 + 会不会自动停"，比重复一个已经过期的动作更有用。 */}
+      {active && !waiting && (
+        <div
+          className={`dag-node-act${stalled ? ' is-stalled' : ''}`}
+          title={stalled ? stallDetail(stalledFor, stallTimeoutMs) : (liveness?.action ?? '')}
+        >
+          {stalled ? (
+            <span className="ellipsis">
+              已 {formatDuration(stalledFor)} 无输出 · {autoStopText(stallTimeoutMs)}
+            </span>
+          ) : node.status === 'running' ? (
+            <span className="ellipsis">{liveness?.action ?? '等待模型输出'}</span>
+          ) : (
+            <span className="ellipsis muted">等待调度启动</span>
+          )}
         </div>
       )}
 

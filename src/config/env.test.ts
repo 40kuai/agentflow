@@ -51,4 +51,24 @@ describe('loadEnv', () => {
       'parallel_dev',
     );
   });
+
+  it('节点停滞自动停止默认 10 分钟，可覆盖，且 0 是合法的「关闭」取值', () => {
+    expect(loadEnv({}, NO_ENV_FILE).nodeStallTimeoutMs).toBe(600_000);
+    expect(
+      loadEnv({ AGENTFLOW_NODE_STALL_TIMEOUT_MS: '5000' }, NO_ENV_FILE).nodeStallTimeoutMs,
+    ).toBe(5000);
+    // 0 必须能通过校验：readInt 的「必须正整数」约束在这里会把「显式关闭保护」变成启动失败
+    expect(
+      loadEnv({ AGENTFLOW_NODE_STALL_TIMEOUT_MS: '0' }, NO_ENV_FILE).nodeStallTimeoutMs,
+    ).toBe(0);
+  });
+
+  it('节点停滞自动停止阈值非法（负数/非整数）时显式报错，不静默回退', () => {
+    expect(() => loadEnv({ AGENTFLOW_NODE_STALL_TIMEOUT_MS: '-1' }, NO_ENV_FILE)).toThrow(
+      /AGENTFLOW_NODE_STALL_TIMEOUT_MS/,
+    );
+    expect(() => loadEnv({ AGENTFLOW_NODE_STALL_TIMEOUT_MS: '1.5' }, NO_ENV_FILE)).toThrow(
+      /AGENTFLOW_NODE_STALL_TIMEOUT_MS/,
+    );
+  });
 });

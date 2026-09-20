@@ -21,6 +21,8 @@ export const LIVENESS_TAIL = 200;
 export const FEATURE_LOG_BY_NODE = 'log-by-node';
 export const FEATURE_LOG_BY_RUN = 'log-by-run';
 export const FEATURE_LIVE_STATS = 'live-stats';
+/** 后端是否支持节点停滞自动停止（health 额外返回 nodeStallTimeoutMs）——非前端运行所必需 */
+export const FEATURE_NODE_STALL_TIMEOUT = 'node-stall-timeout';
 
 /** 前端运行所必需的后端能力 */
 const REQUIRED_FEATURES: readonly string[] = [
@@ -274,6 +276,34 @@ export function livenessAgeMs(liveness: NodeLiveness | undefined, now: number): 
   if (!liveness || !liveness.ok) return null;
   if (typeof liveness.lastModifiedAt === 'number') return Math.max(0, now - liveness.lastModifiedAt);
   return typeof liveness.ageMs === 'number' ? liveness.ageMs : null;
+}
+
+/**
+ * 疑似停滞的「无输出时长」（ms）；不满足停滞条件时返回 null。
+ * `active` 由调用方按 flow.ts 的 isActive 判定（只有活跃节点才谈得上停滞）。
+ *
+ * 统一收口到这里的理由：DAG 节点与状态条必须用**同一判据**——两处各写一遍
+ * 「active && ok && 超过阈值」迟早会出现「图上说停滞、状态条说健康」的自相矛盾。
+ */
+export function stalledAgeMs(
+  active: boolean,
+  liveness: NodeLiveness | undefined,
+  now: number,
+): number | null {
+  if (!active) return null;
+  const age = livenessAgeMs(liveness, now);
+  return age !== null && age >= STAGNANT_THRESHOLD_MS ? age : null;
+}
+
+/**
+ * 「停滞自动停止」规则的中文说明，区分三种真实情况：已配置 / 已关闭 / 后端未声明（版本落后）。
+ * 收口在这里是因为 DAG 节点与状态条都要展示它，且措辞必须与后端 runner 的实际行为一致——
+ * 前端绝不能把「未启用」说成「会自动停」。
+ */
+export function autoStopText(stallTimeoutMs: number | null): string {
+  if (stallTimeoutMs === null) return '后端未声明自动停止能力（版本可能落后），需手动停止';
+  if (stallTimeoutMs <= 0) return '未启用自动停止，需手动停止任务';
+  return `连续 ${formatDuration(stallTimeoutMs)} 无输出将自动终止并记为失败`;
 }
 
 // ---------------------------------------------------------------------------

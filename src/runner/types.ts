@@ -13,6 +13,12 @@ export type RunRequest = {
   readOnly: boolean;
   budgetCapUsd?: number;
   wallTimeMs: number;
+  /**
+   * 「停滞自动停止」阈值（ms）：子进程连续该时长没有任何 stdout/stderr 输出即判定卡死，
+   * 由 runner 强制终止（SIGKILL）并按失败上报。`0` / 未传 = 不启用。
+   * 与 wallTimeMs 互补：后者封顶总时长，对「进程活着但再也不输出」的挂起无效。
+   */
+  stallTimeoutMs?: number;
   sessionId?: string;
 };
 

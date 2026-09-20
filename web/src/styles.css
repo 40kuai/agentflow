@@ -1704,6 +1704,42 @@ mark.hit {
   flex-wrap: wrap;
 }
 
+/* 停滞处置区：把"哪个节点卡了 / 多久没输出 / 会不会自动停 / 想立刻停按哪儿"放在结论层，
+   避免用户为了判断"要不要管"而先去翻日志。 */
+.status-stall {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border-top: 1px dashed var(--warn);
+  padding-top: 8px;
+}
+
+.status-stall-head {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.status-stall-node {
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+}
+
+.status-stall-body {
+  font-size: 11.5px;
+  max-width: 90ch;
+}
+
+.status-stall-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
 /* —— 第二层·中：流程视图（DAG）—— */
 
 .flow-section {
@@ -1886,6 +1922,39 @@ mark.hit {
 
 .dag-strip-run b {
   color: var(--run);
+}
+
+/* 停滞条：底色沿用"警示"（疑似停滞 ≠ 失败，不抢占失败的红），
+   靠左侧实心竖条 + 内嵌的红色「停止」按钮来吸引注意力。 */
+.dag-strip-stall {
+  background: var(--warn-bg);
+  color: #f0d5a8;
+  border-left: 3px solid var(--warn);
+  white-space: nowrap;
+}
+
+.dag-strip-stall b {
+  color: var(--warn);
+}
+
+.dag-strip-stall .btn-xs {
+  padding: 0 5px;
+  line-height: 15px;
+  font-size: 10.5px;
+}
+
+/* 当前动作行：直接回答"现在到底在做什么"。只占一行，超出省略，
+   完整文案放 title（hover 可见），避免把节点方框撑破。 */
+.dag-node-act {
+  font-size: 10.5px;
+  color: var(--text);
+  overflow: hidden;
+  white-space: nowrap;
+  min-height: 14px;
+}
+
+.dag-node-act.is-stalled {
+  color: var(--warn);
 }
 
 .dag-strip-cancel {

@@ -131,6 +131,11 @@ export type HealthInfo = {
   uptimeMs?: number;
   /** 后端声明的能力集；缺失或缺少前端所需能力 → 后端版本落后 */
   features?: string[];
+  /**
+   * 节点「停滞自动停止」阈值（ms）：0 = 未启用；字段缺失 = 后端不支持该能力（版本落后）。
+   * 前端据此如实说明「连续多久无输出会被自动终止」，而不是只展示「疑似停滞」。
+   */
+  nodeStallTimeoutMs?: number;
   claudeProcesses?: ClaudeProcess[];
 };
 
@@ -262,6 +267,11 @@ export type FlowNode = {
   enterReason: FlowEnterReason | null;
   blockedReason: BlockedReason | null;
   durationMs: number | null;
+  /**
+   * 本节点**最后一次尝试**的启动时刻（ms）；从未启动为 null。
+   * `durationMs` 只在节点结束后才有值，运行中的节点要靠 `startedAt` 才能显示「已运行多久」。
+   */
+  startedAt: number | null;
   costUsd: number;
   artifactTypes: string[];
   invalidatedArtifactTypes: string[];

@@ -30,6 +30,8 @@ const kernel = createKernel({
   maxSteps: 50,
   batchConflictPolicy: env.batchConflictPolicy,
   globalConcurrency: env.globalConcurrency,
+  // 停滞自动停止阈值：0 表示关闭（保持「不配置就不自动停」的旧行为）
+  nodeStallTimeoutMs: env.nodeStallTimeoutMs,
 });
 
 const server = createServer({
@@ -42,6 +44,8 @@ const server = createServer({
   configDir: resolve(env.configDir),
   workflow,
   roles,
+  // health 如实汇报自动停止阈值（0 = 未启用），前端据此说明规则
+  nodeStallTimeoutMs: env.nodeStallTimeoutMs,
 });
 
 await server.app.listen({ host: env.host, port: env.port });

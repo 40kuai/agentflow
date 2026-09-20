@@ -47,6 +47,13 @@ export type KernelDeps = {
    * 即"不配置就不并发"——保守缺省不改变既有的单节点串行行为（Task 10 首次消费该配置）。
    */
   globalConcurrency?: number;
+  /**
+   * 节点「停滞自动停止」阈值（ms）：透传给 runner，节点子进程连续该时长无任何输出即被强制终止
+   * 并按失败落库（`reason_category='timeout'`，error 文案写明是停滞）。
+   * 取自 `AGENTFLOW_NODE_STALL_TIMEOUT_MS`（默认 600000）；`0` / 未传 = 不启用，
+   * 从而不改变既有「不配置就不自动停」的行为。
+   */
+  nodeStallTimeoutMs?: number;
 };
 
 export type StartTaskInput = {
@@ -525,6 +532,8 @@ export function createKernel(deps: KernelDeps): Kernel {
         artifactType: node.produces as ArtifactType,
         readOnly,
         wallTimeMs: role.maxWallTimeMs,
+        // 停滞自动停止：节点子进程连续无输出达阈值即被 runner 强制终止（未配置/0 = 不启用）
+        stallTimeoutMs: deps.nodeStallTimeoutMs,
       })) {
         handleEvent(event);
       }

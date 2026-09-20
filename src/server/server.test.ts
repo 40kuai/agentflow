@@ -79,6 +79,8 @@ type BootOptions = {
   configDir?: string;
   /** 刻意不向服务注入工作流，用于验证流转视图的 503 边界 */
   omitWorkflow?: boolean;
+  /** 停滞自动停止阈值：仅用于验证 health 如实回报该配置（0 = 未启用） */
+  nodeStallTimeoutMs?: number;
 };
 
 function boot(options?: BootOptions): Boot {
@@ -110,6 +112,9 @@ function boot(options?: BootOptions): Boot {
     ...(options?.omitWorkflow ? {} : { workflow }),
     roles,
     ...(options?.configDir ? { configDir: options.configDir } : {}),
+    ...(options?.nodeStallTimeoutMs !== undefined
+      ? { nodeStallTimeoutMs: options.nodeStallTimeoutMs }
+      : {}),
   });
   closers.push(async () => {
     await server.close();
@@ -187,6 +192,7 @@ describe('HTTP API', () => {
       uptimeMs: number;
       features: string[];
       claudeProcesses: unknown;
+      nodeStallTimeoutMs: number;
     };
     expect(body.ok).toBe(true);
     expect(body.pid).toBe(process.pid);
@@ -194,9 +200,21 @@ describe('HTTP API', () => {
     expect(body.uptimeMs).toBeGreaterThanOrEqual(0);
     // 前端必需能力齐全，才能避免把日志 404 误读成「日志不存在」
     expect(body.features).toEqual(
-      expect.arrayContaining(['log-by-node', 'log-by-run', 'live-stats']),
+      expect.arrayContaining(['log-by-node', 'log-by-run', 'live-stats', 'node-stall-timeout']),
     );
     expect(Array.isArray(body.claudeProcesses)).toBe(true);
+    // 未注入配置时为 0（= 未启用）：前端据此说明「需手动停止」，而不是谎称会自动停
+    expect(body.nodeStallTimeoutMs).toBe(0);
+  });
+
+  it('health 如实回报停滞自动停止阈值（0 = 未启用）', async () => {
+    const off = boot({ nodeStallTimeoutMs: 0 });
+    const offRes = await off.server.app.inject({ method: 'GET', url: '/api/health' });
+    expect((offRes.json() as { nodeStallTimeoutMs: number }).nodeStallTimeoutMs).toBe(0);
+
+    const on = boot({ nodeStallTimeoutMs: 1234 });
+    const onRes = await on.server.app.inject({ method: 'GET', url: '/api/health' });
+    expect((onRes.json() as { nodeStallTimeoutMs: number }).nodeStallTimeoutMs).toBe(1234);
   });
 
   it('POST /api/tasks 创建任务并返回 taskId', async () => {
@@ -838,6 +856,8 @@ describe('Task 5：某任务的流转视图', () => {
     expect(node['blockedReason']).toBeNull();
     expect(node['costUsd']).toBeCloseTo(0.02, 10);
     expect(typeof node['durationMs']).toBe('number');
+    // 已结束节点也能拿到启动时刻：前端据此在重跑/重试场景里定位「本次尝试何时开始」
+    expect(typeof node['startedAt']).toBe('number');
     expect(body.transfers).toHaveLength(1);
     expect(body.taskFailure).toBeNull();
   });
@@ -886,6 +906,45 @@ describe('Task 5：某任务的流转视图', () => {
     expect(body.nodes[0]!['enterReason']).toBeNull();
     expect(body.transfers).toEqual([]);
     expect(body.taskFailure).toBeNull();
+  });
+
+  it('运行中节点：startedAt 是最后一次尝试的启动时刻，durationMs 为 null（重试不得算成 0）', async () => {
+    const b = boot();
+    const taskId = b.kernel.startTask({ title: 't', requirementRaw: 'r', baseBranch: 'main' });
+    // 构造「第 1 次尝试失败 → 第 2 次尝试正在跑」：重试会再次落 node.started，
+    // 若不在 node.started 时清掉上一轮的结束时刻，durationMs 会算成「本次开始 − 上次结束」= 0，
+    // 把「还没结束」误报成「耗时 0」。
+    b.store.append({
+      task_id: taskId,
+      type: 'node.queued',
+      payload: { node_id: 'pm_analyze', role_id: 'pm', run_id: 'run_1', attempt: 1 },
+      actor: 'kernel',
+    });
+    b.store.append({
+      task_id: taskId,
+      type: 'node.started',
+      payload: { node_id: 'pm_analyze', role_id: 'pm', run_id: 'run_1', attempt: 1 },
+      actor: 'role:pm',
+    });
+    b.store.append({
+      task_id: taskId,
+      type: 'node.failed',
+      payload: { node_id: 'pm_analyze', run_id: 'run_1', attempt: 1, error: '第一次尝试失败' },
+      actor: 'kernel',
+    });
+    b.store.append({
+      task_id: taskId,
+      type: 'node.started',
+      payload: { node_id: 'pm_analyze', role_id: 'pm', run_id: 'run_2', attempt: 2 },
+      actor: 'role:pm',
+    });
+
+    const res = await b.server.app.inject({ method: 'GET', url: `/api/tasks/${taskId}/flow` });
+    const node = (res.json() as { nodes: Array<Record<string, unknown>> }).nodes[0]!;
+    expect(node['status']).toBe('running');
+    expect(node['attempt']).toBe(2);
+    expect(typeof node['startedAt']).toBe('number');
+    expect(node['durationMs']).toBeNull();
   });
 
   it('未知任务返回 404；未注入工作流时返回 503', async () => {

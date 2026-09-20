@@ -9,7 +9,15 @@ import { useState } from 'react';
 import type { FlowView } from '../api';
 import type { TaskAggregate } from '../aggregate';
 import { formatDuration, formatUsd } from '../format';
-import type { BackendCompatibility, TaskHealth } from '../liveness';
+import { isActive } from '../flow';
+import {
+  STAGNANT_THRESHOLD_MS,
+  autoStopText,
+  stalledAgeMs,
+  type BackendCompatibility,
+  type NodeLiveness,
+  type TaskHealth,
+} from '../liveness';
 import { Badge, HealthBadge } from './common';
 
 type Props = {
@@ -18,6 +26,10 @@ type Props = {
   aggregate: TaskAggregate;
   compat: BackendCompatibility;
   taskHealth: TaskHealth | null;
+  /** 运行中节点的活性快照：状态条据此把「疑似停滞」提到结论层，而不是留给用户去翻日志 */
+  liveness: Record<string, NodeLiveness>;
+  /** 后端生效的停滞自动停止阈值（ms）：0 = 已关闭；null = 后端未声明该能力 */
+  stallTimeoutMs: number | null;
   /** 是否正在提交取消请求 */
   cancelling: boolean;
   /** 取消结果/失败提示（后端中文文案） */
@@ -33,6 +45,8 @@ export function StatusBar({
   aggregate,
   compat,
   taskHealth,
+  liveness,
+  stallTimeoutMs,
   cancelling,
   cancelNotice,
   cancelError,
@@ -45,6 +59,15 @@ export function StatusBar({
   const activeNodes = (flow?.nodes ?? []).filter((node) => node.current || node.status === 'running');
   const queuedNodes = (flow?.nodes ?? []).filter((node) => node.status === 'queued');
   const failedNodes = (flow?.nodes ?? []).filter((node) => node.status === 'failed');
+
+  // 疑似停滞的活跃节点：与 DAG 节点共用 stalledAgeMs 判据，两处结论必然一致
+  const now = Date.now();
+  const stalledNodes: { node: FlowView['nodes'][number]; ageMs: number }[] = [];
+  for (const node of flow?.nodes ?? []) {
+    const active = node.current || isActive(node.status);
+    const ageMs = stalledAgeMs(active, liveness[node.id], now);
+    if (ageMs !== null) stalledNodes.push({ node, ageMs });
+  }
 
   const stage = currentStage(flow);
   const elapsed =
@@ -162,6 +185,46 @@ export function StatusBar({
 
       {cancelNotice && <div className="status-note tone-warn">{cancelNotice}</div>}
       {cancelError && <div className="status-note tone-fail">取消失败：{cancelError}</div>}
+
+      {/* 停滞处置：把"要不要我管"这个决策所需的全部事实放在结论层——
+          哪个节点、多久没输出、系统会不会自动停、想立刻停该按哪儿。 */}
+      {stalledNodes.length > 0 && (
+        <div className="status-stall">
+          <div className="status-stall-head">
+            <b className="tone-warn">疑似停滞</b>
+            {stalledNodes.map(({ node, ageMs }) => (
+              <span key={node.id} className="status-stall-node">
+                <button type="button" className="node-chip" onClick={() => onOpenLog(node.id)} title="查看该节点活日志">
+                  {node.title || node.id}
+                </button>
+                <span className="muted small">已 {formatDuration(ageMs)} 无输出</span>
+              </span>
+            ))}
+          </div>
+          <div className="status-stall-body muted">
+            {autoStopText(stallTimeoutMs)}（疑似停滞阈值 {STAGNANT_THRESHOLD_MS / 1000} 秒；判定依据是日志文件的
+            最后写入时刻，不是"总耗时"——持续输出的长任务不会被误判）
+          </div>
+          {canCancel && (
+            <div className="status-stall-actions">
+              <button
+                type="button"
+                className="btn btn-xs btn-danger"
+                disabled={cancelling || cancelBlocked}
+                title={
+                  cancelBlocked
+                    ? `后端缺少能力：${compat.missing.join(', ')}（版本落后），请重启服务后再试`
+                    : '内核只支持任务级取消：将终止整条流程的全部在途节点（已花费用不退回）'
+                }
+                onClick={() => setConfirming(true)}
+              >
+                {cancelling ? '停止中…' : '立即停止任务'}
+              </button>
+              <span className="muted small">想再等等就先不动：自动停止规则会按上面的阈值兜底。</span>
+            </div>
+          )}
+        </div>
+      )}
 
       {flowError && (
         <div className="status-note tone-warn">

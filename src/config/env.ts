@@ -20,6 +20,13 @@ export type AppEnv = {
    * 由环境变量 `AGENTFLOW_BATCH_CONFLICT_POLICY` 指定（默认 serialize）。
    */
   batchConflictPolicy: 'serialize' | 'reject';
+  /**
+   * 节点「停滞自动停止」阈值（ms）：某节点子进程连续该时长没有任何 stdout/stderr 输出，
+   * 即判定为卡死，由 runner 强制终止（SIGKILL）并按失败处理。`0` 表示关闭该保护。
+   * 由环境变量 `AGENTFLOW_NODE_STALL_TIMEOUT_MS` 指定（默认 600000 = 10 分钟）。
+   * 与角色的 wall-clock 硬超时互补：后者只封顶总时长，对「进程活着但再也不输出」无效。
+   */
+  nodeStallTimeoutMs: number;
   claudeBin: string;
   codexBin: string;
 };
@@ -35,6 +42,7 @@ const DEFAULTS: AppEnv = {
   maxPromptTokens: 30000,
   globalConcurrency: 4,
   batchConflictPolicy: 'serialize',
+  nodeStallTimeoutMs: 600_000,
   claudeBin: 'claude',
   codexBin: 'codex',
 };
@@ -64,6 +72,24 @@ function readInt(source: Record<string, string | undefined>, key: string, fallba
   const n = Number(raw);
   if (!Number.isInteger(n) || n <= 0) {
     throw new Error(`环境变量 ${key} 必须是正整数，实际为 "${raw}"`);
+  }
+  return n;
+}
+
+/**
+ * 读取**非负整数**：与 readInt 的区别是允许 0——0 在这里是「关闭保护」的合法取值，
+ * 不能沿用 readInt 的「必须是正整数」约束（那会让用户无法显式关闭自动停止）。
+ */
+function readNonNegInt(
+  source: Record<string, string | undefined>,
+  key: string,
+  fallback: number,
+): number {
+  const raw = source[key];
+  if (raw === undefined || raw === '') return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) {
+    throw new Error(`环境变量 ${key} 必须是非负整数（0 表示关闭），实际为 "${raw}"`);
   }
   return n;
 }
@@ -105,6 +131,11 @@ export function loadEnv(
       merged,
       'AGENTFLOW_BATCH_CONFLICT_POLICY',
       DEFAULTS.batchConflictPolicy,
+    ),
+    nodeStallTimeoutMs: readNonNegInt(
+      merged,
+      'AGENTFLOW_NODE_STALL_TIMEOUT_MS',
+      DEFAULTS.nodeStallTimeoutMs,
     ),
     claudeBin: readStr(merged, 'AGENTFLOW_CLAUDE_BIN', DEFAULTS.claudeBin),
     codexBin: readStr(merged, 'AGENTFLOW_CODEX_BIN', DEFAULTS.codexBin),
