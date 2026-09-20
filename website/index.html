@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgentFlow — 多 Agent 开发流程编排平台</title>
+<meta name="description" content="AgentFlow：用结构化契约、显式状态机与唯一状态真相，把多角色开发流程自动流转起来。单页中文官网。">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<a class="skip" href="#main">跳到正文</a>
+
+<header class="nav">
+  <div class="wrap nav-inner">
+    <a class="brand" href="#top">
+      <span class="brand-mark" aria-hidden="true">AF</span>
+      <span class="brand-name">AgentFlow</span>
+    </a>
+    <nav class="nav-links" aria-label="页面导航">
+      <a href="#problem">痛点</a>
+      <a href="#principles">原则</a>
+      <a href="#mechanisms">机制</a>
+      <a href="#architecture">架构</a>
+      <a href="#roles">角色</a>
+      <a href="#roadmap">路线图</a>
+      <a href="#start">快速开始</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+  <!-- ============ Hero ============ -->
+  <section class="hero" id="top">
+    <div class="wrap">
+      <p class="eyebrow">多 Agent 开发流程编排平台</p>
+      <h1>让多个 Agent 像一支公司一样<br><em>自动流转</em>，而不是互相聊天</h1>
+      <p class="lede">
+        一个需求输入，多个角色自动走完「立项 → 需求 → 设计 → 编码 → 测试 → 评审 → 集成 → 发布 → 验收」。
+        角色之间<strong>零自由对话</strong>，只交换结构化产物；所有状态变更都是<strong>追加事件</strong>，
+        任务的当前状态是事件重放的投影 —— 任何时刻都能回答「为什么走到了这一步」。
+      </p>
+
+      <div class="hero-actions">
+        <a class="btn btn-primary" href="#start">本地跑起来</a>
+        <a class="btn btn-ghost" href="#problem">先看它解决什么问题</a>
+      </div>
+
+      <dl class="hero-stats">
+        <div>
+          <dt>角色模板</dt>
+          <dd>12<span class="unit">个</span></dd>
+        </div>
+        <div>
+          <dt>卡点级别</dt>
+          <dd>G0–G3</dd>
+        </div>
+        <div>
+          <dt>Profile</dt>
+          <dd>3<span class="unit">档</span></dd>
+        </div>
+        <div>
+          <dt>当前进度</dt>
+          <dd class="stat-progress">Phase 0/1 已完成</dd>
+        </div>
+      </dl>
+
+      <p class="notice">
+        <strong>如实标注：</strong>Phase 0 与 Phase 1 已实现（单引擎 <code>claude-code</code>、串行闭环）；
+        Phase 2 及之后（并行、worktree 合并、完整公司、卡点 G1–G3、codex、完整观测前端）为<strong>规划中</strong>。
+        本页所有事实性陈述均可溯源到 <code>docs/</code> 下的设计文档与 <code>记录.md</code>。
+      </p>
+    </div>
+  </section>
+
+  <!-- ============ 痛点 ============ -->
+  <section class="section" id="problem">
+    <div class="wrap">
+      <h2>它解决什么问题</h2>
+      <p class="section-sub">
+        根因判断：<strong>把 agent 当「人」来协调</strong>。人类协作靠对话和默契，
+        agent 协作必须靠结构化契约 + 显式状态机 + 唯一状态真相。
+      </p>
+
+      <div class="grid grid-2">
+        <article class="card pain">
+          <span class="pain-no">01</span>
+          <h3>无唯一事实来源</h3>
+          <p>每个角色只知道自己手上的事，没人持有全局状态，判断「下一步该谁做」只能靠人。</p>
+        </article>
+        <article class="card pain">
+          <span class="pain-no">02</span>
+          <h3>无交接契约</h3>
+          <p>上游产出以自然语言散落，下游需要什么、产出什么格式全靠默契，导致反复返工。</p>
+        </article>
+        <article class="card pain">
+          <span class="pain-no">03</span>
+          <h3>无终止条件</h3>
+          <p>一旦允许角色自由对话，容易陷入互相追问的死循环，且成本不可控。</p>
+        </article>
+        <article class="card pain">
+          <span class="pain-no">04</span>
+          <h3>不可观测</h3>
+          <p>任务卡住时，无法回答「卡在谁身上、为什么卡、已消耗多少」。</p>
+        </article>
+        <article class="card pain">
+          <span class="pain-no">05</span>
+          <h3>并行是假象</h3>
+          <p>
+            想靠「多开几个 agent」提速，结果是多个实例改同一批文件，冲突与覆盖在跑完才发现。
+            并行必须由工作包拆解自然决定，而不是调度器硬凑。
+          </p>
+        </article>
+        <article class="card pain">
+          <span class="pain-no">06</span>
+          <h3>成本与风险失控</h3>
+          <p>
+            让最强模型全程参与，一个需求会烧掉几十倍 token；高风险动作（上线发布、预算超限）
+            缺少「必须真人批准」的硬卡点。
+          </p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 三条决定性设计原则 ============ -->
+  <section class="section section-alt" id="principles">
+    <div class="wrap">
+      <h2>三条决定性设计原则</h2>
+      <p class="section-sub">这三条贯穿全文，是后续所有设计取舍的判据。</p>
+
+      <div class="grid grid-3">
+        <article class="card principle">
+          <h3>唯一状态真相在内核，不在 agent</h3>
+          <p>
+            所有状态变更都是<strong>追加事件</strong>（append-only event）。任务的「当前状态」是事件重放的
+            <strong>投影</strong>，不是某个 agent 的记忆。
+          </p>
+          <p class="principle-gain">→ 可回溯、可重放、可精确复现「为什么走到这一步」。</p>
+        </article>
+        <article class="card principle">
+          <h3>角色间零自由对话，只交换结构化产物</h3>
+          <p>
+            每个角色声明 <code>inputs: Artifact[]</code> 与 <code>outputs: Artifact[]</code>。
+            产物落库后由状态机判定下一跳。
+          </p>
+          <p class="principle-gain">→ 责任链清晰，不靠 agent 自觉；成本可控；不会陷入互相追问的死循环。</p>
+        </article>
+        <article class="card principle">
+          <h3>大内容不进 prompt，只进引用</h3>
+          <p>
+            Artifact 的 <code>summary</code>（≤500 token）进下游 prompt，正文只以 <code>refs</code> 引用，
+            需要细节时 agent 自己去工作区读。
+          </p>
+          <p class="principle-gain">→ 解决上下文爆炸与信息丢失，这是多 agent 协作里最容易踩的坑。</p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 核心机制 ============ -->
+  <section class="section" id="mechanisms">
+    <div class="wrap">
+      <h2>核心机制</h2>
+      <p class="section-sub">六件事，构成「可自动流转」的最小完整集合。</p>
+
+      <div class="grid grid-3">
+        <article class="card mech">
+          <h3><span class="dot dot-1"></span>事件存储是唯一状态真相</h3>
+          <p>
+            事件表只追加、不修改。投影表（<code>task_state</code> / <code>node_state</code>）可从 events
+            <strong>完整重建</strong>，随时可丢弃。每条转移都记录 <code>reason</code> 与
+            <code>decided_by</code>（rule / llm / human）。
+          </p>
+        </article>
+        <article class="card mech">
+          <h3><span class="dot dot-2"></span>结构化产物，零自由对话</h3>
+          <p>
+            信息只走三条通道：① Artifact 事件总线（<strong>唯一决定流程走向</strong>）；② git 工作区；
+            ③ 受限问答（单轮、只读工具、token 上限极小，回答也必须以 Artifact 落库）。
+          </p>
+        </article>
+        <article class="card mech">
+          <h3><span class="dot dot-3"></span>工作包并行</h3>
+          <p>
+            并行度来自需求阶段的工作包拆解，而不是调度器硬凑。工作包声明
+            <code>owns</code>（拥有的路径）/ <code>reads</code> / <code>depends_on</code> /
+            <code>interface_contract</code>（冻结后不可变）。
+          </p>
+        </article>
+        <article class="card mech">
+          <h3><span class="dot dot-4"></span>G0–G3 卡点</h3>
+          <ul class="tight">
+            <li><code>G0</code> 规则自动通过，无角色介入</li>
+            <li><code>G1</code> 单角色审批（代码评审）</li>
+            <li><code>G2</code> 多角色会签（架构冻结、合并、验收）</li>
+            <li><code>G3</code> <strong>真人审批，流程挂起等待</strong></li>
+          </ul>
+          <p class="mech-note">CEO 全程只出现在 4 个 G3 节点，不参与任何中间环节。</p>
+        </article>
+        <article class="card mech">
+          <h3><span class="dot dot-5"></span>三档 profile</h3>
+          <ul class="tight">
+            <li><code>full</code> — 全部 12 角色，评审 2 人，CEO 全部 4 个 G3</li>
+            <li><code>lean</code> — 去掉 <code>ux_designer</code>，评审 1 人，G3 仅保留上线发布</li>
+            <li><code>solo</code> — 仅 dev + qa + 1 评审，无 G3</li>
+          </ul>
+          <p class="mech-note">profile 是角色集的过滤视图 + gate 级别覆写，不改流程拓扑。</p>
+        </article>
+        <article class="card mech">
+          <h3><span class="dot dot-6"></span>可观测</h3>
+          <p>
+            观测前端提供：任务总览、DAG 泳道图、实时日志、人工卡点队列、组织视图、成本面板、产物浏览器。
+            原始日志<strong>不进事件库</strong>，只存 <code>log_ref</code> 引用，事件库保持小而快。
+          </p>
+        </article>
+      </div>
+
+      <div class="callout">
+        <h4>刻意不做的事（非目标）</h4>
+        <p>
+          分布式多机调度 · 自研 LLM 工具调用循环（复用 <code>claude</code> / <code>codex</code> CLI）·
+          通用工作流引擎（转移条件用<strong>受限表达式</strong>，不做图灵完备脚本）· 图形化流程编辑器（流程用 YAML，
+          页面只做观测）· 多方案并行择优（成本翻倍，列为远期可选项）· 多人协同与账号体系（单用户本地平台，
+          仅绑定 <code>127.0.0.1</code>）。
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 架构分层 ============ -->
+  <section class="section section-alt" id="architecture">
+    <div class="wrap">
+      <h2>架构分层</h2>
+      <p class="section-sub">四层职责清晰，层间只通过事件和明确的数据结构通信。</p>
+
+      <div class="stack">
+        <article class="layer layer-front">
+          <header>
+            <h3>观测前端</h3>
+            <span class="tag tag-done">Phase 1 极简版已实现</span>
+          </header>
+          <p class="layer-duty">只读展示 + G3 审批动作</p>
+          <p class="layer-constraint"><strong>关键约束：</strong>不做业务决策，不含流程逻辑。</p>
+          <p class="layer-detail">
+            Phase 1 的 <code>web/</code> 为极简观测页；完整版（DAG 泳道图 / 实时日志流 / 组织视图 /
+            成本面板 / 产物浏览器）属 Phase 4。前端在 Phase 1 靠轮询 <code>GET /api/tasks/:id</code> 兜住实时性。
+          </p>
+        </article>
+
+        <div class="flow-arrow" aria-hidden="true">WebSocket（只读推送）+ HTTP（审批动作）</div>
+
+        <article class="layer layer-kernel">
+          <header>
+            <h3>编排内核 Orchestrator Kernel</h3>
+            <span class="tag tag-done">Phase 1 已实现</span>
+          </header>
+          <p class="layer-duty">状态推进、调度、决策、装配 prompt、管卡点</p>
+          <p class="layer-constraint"><strong>关键约束：</strong>唯一状态真相持有者。</p>
+          <ul class="mods">
+            <li>状态机 <code>StateMachine</code></li>
+            <li>调度器 <code>Scheduler</code></li>
+            <li>决策器 <code>Decider</code></li>
+            <li>上下文装配器 <code>ContextAssembler</code></li>
+            <li>事件存储 <code>EventStore</code></li>
+            <li>投影器 <code>Projector</code></li>
+            <li>卡点闸门 <code>GateKeeper</code></li>
+            <li>工作区管理器 <code>WorkspaceManager</code></li>
+          </ul>
+        </article>
+
+        <div class="flow-arrow" aria-hidden="true">append-only ↓ &nbsp;|&nbsp; ↑ spawn / cancel</div>
+
+        <div class="layer-row">
+          <article class="layer layer-store">
+            <header><h3>存储</h3></header>
+            <p class="layer-duty">事件真源 + 投影 + 日志文件</p>
+            <p class="layer-constraint"><strong>关键约束：</strong>事件只追加，不修改。</p>
+            <p class="layer-detail">
+              SQLite：<code>events</code>（真源）· <code>projections</code> · <code>logs/</code>（引用）。
+              另含 <code>tasks</code> / <code>work_packages</code> / <code>node_runs</code> /
+              <code>artifacts</code> / <code>gates</code> / <code>leases</code> 数据表。
+            </p>
+          </article>
+          <article class="layer layer-runner">
+            <header><h3>Runner Pool</h3></header>
+            <p class="layer-duty">把角色翻译成 CLI 调用，采集产出</p>
+            <p class="layer-constraint"><strong>关键约束：</strong>引擎无关的归一化事件流。</p>
+            <p class="layer-detail">
+              <code>claude-code</code> adapter（Phase 1 已实现）· <code>codex</code> adapter（Phase 3）·
+              git worktree 池（Phase 2）。内核不认识 CLI，只消费 <code>RunnerEvent</code>。
+            </p>
+          </article>
+        </div>
+      </div>
+
+      <div class="callout callout-warn">
+        <h4>能力不对称是真问题</h4>
+        <p>
+          <code>claude</code> 有 <code>--json-schema</code> 与 <code>--max-budget-usd</code>，
+          <code>codex</code> 都没有。因此 <code>capabilities</code>（structuredOutput / budgetCap /
+          sessionResume / builtinReview）是 Runner 接口的一等成员，内核按能力降级：无结构化输出则用
+          prompt 强约束 + JSON 提取容错 + zod 校验失败即重试一次；无预算上限则由内核记账层兜底、超限主动 cancel。
+        </p>
+      </div>
+
+      <div class="callout callout-warn">
+        <h4>Phase 1 的实现边界（如实说明）</h4>
+        <ul class="tight">
+          <li><strong>串行</strong>：内核单节点推进，<code>AGENTFLOW_GLOBAL_CONCURRENCY</code> 目前无消费者。</li>
+          <li><strong>无路径级强制</strong>：<code>owns</code> 仅作为 prompt 提示；内核层无变更路径核对，
+            <code>artifact.invalidated</code> 在 Phase 1 无生产者，<strong>不得当作安全边界</strong>。</li>
+          <li><strong>无 worktree 隔离</strong>：Phase 1 所有节点 <code>isolate: false</code>（无合并能力，
+            在 worktree 里写代码会在回收后丢失）。</li>
+          <li><strong>可写角色的命令白名单已实质放宽</strong>：<code>Bash(sh:*)</code> / <code>Bash(bash:*)</code>
+            等价于任意命令执行，收窄属 Phase 2 决策。</li>
+          <li>路径级强制、占用检查、worktree 合并、G1–G3 卡点、codex 适配器均为 <strong>Phase 2+</strong>。</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 角色 ============ -->
+  <section class="section" id="roles">
+    <div class="wrap">
+      <h2>角色组织</h2>
+      <p class="section-sub">
+        核心机制是<strong>角色模板 + 实例池</strong>：不是预定义 <code>dev_1..dev_5</code>，
+        而是一个角色模板按工作包数量动态 spawn 并发实例。3 个工作包 → 3 个并发实例，
+        并发度由工作包数量自然决定，无需手工维护个体。角色定义是<strong>声明式 YAML</strong>，不是代码。
+      </p>
+
+      <div class="table-wrap">
+        <table>
+          <caption class="visually-hidden">默认组织架构（完整公司，共 12 个角色）</caption>
+          <thead>
+            <tr><th scope="col">层级</th><th scope="col">角色 id</th><th scope="col">职责</th><th scope="col">激活触发器</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>决策</td><td><code>ceo</code></td><td>立项裁定、范围变更、预算超限、最终验收</td><td>仅 4 处 G3</td></tr>
+            <tr><td>决策</td><td><code>cto</code></td><td>架构裁决、技术选型、跨包冲突仲裁</td><td>架构冻结 / 冲突 / 技术验收</td></tr>
+            <tr><td>产品</td><td><code>pm</code></td><td>需求分析、<strong>工作包拆解</strong>、验收标准</td><td>需求阶段 + 工作包验收</td></tr>
+            <tr><td>产品</td><td><code>ux_designer</code></td><td>交互与视觉规范</td><td>含 UI 的工作包</td></tr>
+            <tr><td>技术</td><td><code>architect</code></td><td>系统设计、<strong>接口契约冻结</strong>、模块划分</td><td>设计阶段 + 契约变更</td></tr>
+            <tr><td>开发</td><td><code>backend_dev</code></td><td>后端实现 + 自测</td><td>后端工作包</td></tr>
+            <tr><td>开发</td><td><code>frontend_dev</code></td><td>前端实现 + 自测</td><td>前端工作包</td></tr>
+            <tr><td>质量</td><td><code>qa_engineer</code></td><td>单测 / 集成 / E2E、缺陷报告</td><td>编码完成 + 集成阶段</td></tr>
+            <tr><td>质量</td><td><code>reviewer_tech</code></td><td>技术维度评审</td><td>工作包提交后</td></tr>
+            <tr><td>质量</td><td><code>reviewer_cross</code></td><td>跨职能视角评审</td><td>工作包提交后</td></tr>
+            <tr><td>交付</td><td><code>integrator</code></td><td>并行分支合并与冲突解决</td><td>每个 join 点</td></tr>
+            <tr><td>交付</td><td><code>devops</code></td><td>CI、构建、部署</td><td>合并后 + 发布</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="table-foot">
+        另有 <code>orchestrator</code>（编排内核本身，非人，以节点形式出现在图里，由规则引擎 + LLM 兜底驱动），
+        不占角色编制。Phase 1 实际注册并跑通的角色只有 <strong>3 个</strong>：<code>pm</code> →
+        <code>backend_dev</code> → <code>qa_engineer</code>；其余角色为 Phase 3 范围。
+      </p>
+
+      <div class="callout">
+        <h4>交叉引擎评审</h4>
+        <p>
+          规则：<strong>评审员使用的引擎必须与产出该代码的实例所用引擎不同</strong>，由内核在调度评审节点时动态分配。
+          同一引擎自评有同源盲区（倾向认为自己的写法对），这是「独立 QA」概念的真实价值；
+          两个 reviewer 之间的引擎也必须不同，否则等于同一视角评两遍。
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 技术栈 ============ -->
+  <section class="section section-alt" id="stack">
+    <div class="wrap">
+      <h2>技术栈</h2>
+      <p class="section-sub">单机零依赖零配置，与前端同栈。</p>
+
+      <div class="grid grid-4">
+        <article class="card tech"><h3>后端</h3><p>Node 22 + TypeScript（ESM）</p></article>
+        <article class="card tech"><h3>HTTP</h3><p>Fastify + <code>@fastify/websocket</code></p></article>
+        <article class="card tech"><h3>存储</h3><p>SQLite（<code>better-sqlite3</code>）</p></article>
+        <article class="card tech"><h3>校验</h3><p>zod + <code>zod-to-json-schema</code></p></article>
+        <article class="card tech"><h3>前端</h3><p>React 18 + Vite + TypeScript</p></article>
+        <article class="card tech"><h3>图渲染</h3><p><code>@xyflow/react</code>（React Flow）</p></article>
+        <article class="card tech"><h3>前端状态 / 样式</h3><p>Zustand / Tailwind CSS</p></article>
+        <article class="card tech"><h3>日志 / 进程</h3><p>pino / <code>node:child_process</code> spawn</p></article>
+      </div>
+
+      <div class="callout">
+        <h4>一条值得记住的工程细节：产物格式下沉到 CLI 层强制</h4>
+        <p>
+          所有 Artifact payload 用 zod 定义并导出 JSON Schema，这份 schema 直接作为
+          <code>claude --json-schema</code> 的参数 —— 把产物格式<strong>下沉到 CLI 层强制</strong>，
+          而不是「求 agent 按格式输出」。内核再用 <code>parseArtifactPayload</code> 把模型给出的
+          <code>status</code> 提升为 Artifact 的独立列并消费，工作流边条件（如
+          <code>all(artifacts.requirement.status == 'ok')</code>）因此真正生效。
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 路线图 ============ -->
+  <section class="section" id="roadmap">
+    <div class="wrap">
+      <h2>Phase 0–5 路线图</h2>
+      <p class="section-sub">
+        每个阶段都是<strong>能跑起来的闭环</strong>，不是半成品。进度如实标注：<strong>Phase 0/1 已完成</strong>，
+        Phase 2 及之后<strong>规划中</strong>。
+      </p>
+
+      <ol class="timeline">
+        <li class="tl done">
+          <div class="tl-head">
+            <span class="tl-phase">Phase 0</span>
+            <span class="badge badge-done">已完成</span>
+          </div>
+          <h3>CLI 行为探针</h3>
+          <p>
+            Runner 适配层的实现完全取决于 CLI 的真实输出行为，不能靠推测写，因此本阶段<strong>阻塞后续、必须最先做</strong>。
+            验证 <code>claude -p --output-format stream-json</code> 的真实事件序列、<code>--json-schema</code>
+            在有工具调用时的可靠性、<code>codex exec</code> 的可解析性、多实例并发安全性、<code>--max-budget-usd</code> 行为。
+          </p>
+          <p class="tl-out"><strong>产出：</strong><code>spikes/cli-probe/</code> 最小脚本 + 结论写回 <code>记录.md</code>；真实成功样本归档为 fixture。</p>
+        </li>
+
+        <li class="tl done">
+          <div class="tl-head">
+            <span class="tl-phase">Phase 1</span>
+            <span class="badge badge-done">已完成</span>
+          </div>
+          <h3>内核骨架（单引擎串行闭环）</h3>
+          <p>
+            <code>EventStore</code> + <code>Projector</code> + <code>StateMachine</code>（规则求值）、
+            <code>RunnerPool</code> + <code>claude-code</code> adapter、三个角色
+            <code>pm</code> → <code>backend_dev</code> → <code>qa_engineer</code>、极简页面（任务列表 + 状态流转）。
+          </p>
+          <p class="tl-accept"><strong>验收：</strong>输入一个需求文本，三个角色自动串行流转完成，事件库能重放出完整过程。</p>
+        </li>
+
+        <li class="tl">
+          <div class="tl-head">
+            <span class="tl-phase">Phase 2</span>
+            <span class="badge badge-todo">规划中</span>
+          </div>
+          <h3>并行</h3>
+          <p>
+            工作包拆解（<code>work_package_plan</code>）+ <code>owns</code> 占用检查、
+            <code>parallel</code> / <code>join</code> 节点类型、<code>WorkspaceManager</code> + worktree 池、
+            <code>integrator</code> 角色 + <code>conflict_report</code>、路径级强制与越界检出。
+          </p>
+          <p class="tl-accept"><strong>验收：</strong>一个需求拆出 3 个工作包，3 条泳道并行跑，自动合并。</p>
+        </li>
+
+        <li class="tl">
+          <div class="tl-head">
+            <span class="tl-phase">Phase 3</span>
+            <span class="badge badge-todo">规划中</span>
+          </div>
+          <h3>完整公司与卡点</h3>
+          <p>
+            全部 12 角色注册表 + 三档 profile、G1 / G2 / G3 卡点 + <code>GateKeeper</code>、
+            <code>codex</code> adapter + 交叉引擎评审（<code>codex review --base</code>）、人工卡点队列页面。
+          </p>
+          <p class="tl-accept"><strong>验收：</strong><code>full</code> profile 跑通完整流程，CEO 只在 4 个 G3 出现。</p>
+        </li>
+
+        <li class="tl">
+          <div class="tl-head">
+            <span class="tl-phase">Phase 4</span>
+            <span class="badge badge-todo">规划中</span>
+          </div>
+          <h3>观测前端完整版</h3>
+          <p>DAG 泳道图 + 实时日志流 + 组织视图 + 成本面板 + 产物浏览器。</p>
+          <p class="tl-accept"><strong>验收：</strong>不读日志文件，仅从页面就能回答「现在谁在干什么、卡在哪、为什么、花了多少钱」。</p>
+        </li>
+
+        <li class="tl">
+          <div class="tl-head">
+            <span class="tl-phase">Phase 5</span>
+            <span class="badge badge-todo">规划中</span>
+          </div>
+          <h3>鲁棒性</h3>
+          <p>Lease / 心跳、幂等重试、反死锁、预算准入、事件重放重建投影、LLM 决策器（受限枚举）。</p>
+          <p class="tl-accept"><strong>验收：</strong>强杀进程后任务能被正确判定失败并重试；预算超限正确挂起。</p>
+        </li>
+      </ol>
+    </div>
+  </section>
+
+  <!-- ============ 快速开始 ============ -->
+  <section class="section section-alt" id="start">
+    <div class="wrap">
+      <h2>快速开始</h2>
+      <p class="section-sub">单机本地运行，HTTP / WebSocket 仅绑定 <code>127.0.0.1</code>，无鉴权需求。</p>
+
+      <div class="start-grid">
+        <div class="start-col">
+          <h3>1. 准备环境</h3>
+          <p>需要 <strong>Node 22+</strong>，并已安装并登录 <code>claude</code> CLI（Phase 1 单引擎依赖它）。</p>
+          <pre class="code"><code>node --version   # 需 >= 22
+claude --version # 需已登录</code></pre>
+
+          <h3>2. 安装依赖并配置</h3>
+          <pre class="code"><code>npm install
+cp .env.example .env   # 按需修改，.env 不提交</code></pre>
+          <p class="hint">
+            所有可变配置走 <code>.env</code>（模板 <code>.env.example</code>），代码内只通过
+            <code>src/config/env.ts</code> 读取；禁止硬编码路径与密钥。
+          </p>
+
+          <h3>3. 启动</h3>
+          <pre class="code"><code>npm run dev    # tsx watch src/main.ts
+# 或
+npm start      # tsx src/main.ts</code></pre>
+          <p class="hint">启动后终端会打印 <code>AgentFlow 已启动：http://127.0.0.1:8787</code>。</p>
+        </div>
+
+        <div class="start-col">
+          <h3>4. 质量门</h3>
+          <pre class="code"><code>npm test        # vitest run
+npm run typecheck  # tsc --noEmit</code></pre>
+
+          <h3>环境变量（.env.example）</h3>
+          <div class="table-wrap">
+            <table class="env-table">
+              <thead>
+                <tr><th scope="col">变量</th><th scope="col">默认值</th></tr>
+              </thead>
+              <tbody>
+                <tr><td><code>AGENTFLOW_DB_PATH</code></td><td><code>./data/agentflow.sqlite</code></td></tr>
+                <tr><td><code>AGENTFLOW_LOG_DIR</code></td><td><code>./logs</code></td></tr>
+                <tr><td><code>AGENTFLOW_WORKSPACE_DIR</code></td><td><code>./workspaces</code></td></tr>
+                <tr><td><code>AGENTFLOW_CONFIG_DIR</code></td><td><code>./config</code></td></tr>
+                <tr><td><code>AGENTFLOW_HOST</code></td><td><code>127.0.0.1</code></td></tr>
+                <tr><td><code>AGENTFLOW_PORT</code></td><td><code>8787</code></td></tr>
+                <tr><td><code>AGENTFLOW_MAX_PROMPT_TOKENS</code></td><td><code>30000</code></td></tr>
+                <tr><td><code>AGENTFLOW_GLOBAL_CONCURRENCY</code></td><td><code>4</code>（Phase 1 尚无消费者）</td></tr>
+                <tr><td><code>AGENTFLOW_NODE_STALL_TIMEOUT_MS</code></td><td><code>600000</code>（节点连续无输出即自动终止；0 = 关闭）</td></tr>
+                <tr><td><code>AGENTFLOW_CLAUDE_BIN</code> / <code>AGENTFLOW_CODEX_BIN</code></td><td><code>claude</code> / <code>codex</code></td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>目录速览</h3>
+          <pre class="code"><code>config/   roles / workflows / prompts（声明式，非代码）
+src/      kernel / runner / server / config / shared
+web/      观测前端（独立 package.json）
+docs/     设计文档与实现计划
+spikes/   一次性 CLI 探针
+data/ workspaces/ logs/   运行时数据（gitignore）</code></pre>
+        </div>
+      </div>
+
+      <div class="callout">
+        <h4>端到端闭环长什么样</h4>
+        <p>
+          输入一个需求文本 → <code>pm</code> 产出 <code>requirement</code> 与
+          <code>work_package_plan</code> → <code>backend_dev</code> 产出 <code>code_diff</code> →
+          <code>qa_engineer</code> 产出 <code>test_report</code> → 状态机按边条件判定下一跳，
+          全程事件可重放。Phase 1 实现的 Artifact 类型只有 4 种：
+          <code>requirement</code> / <code>work_package_plan</code> / <code>code_diff</code> / <code>test_report</code>。
+        </p>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="footer">
+  <div class="wrap footer-inner">
+    <div>
+      <p class="footer-brand">AgentFlow</p>
+      <p class="footer-desc">多 Agent 开发流程编排平台 · 单页中文官网</p>
+    </div>
+    <div>
+      <p class="footer-title">内容溯源</p>
+      <ul class="footer-list">
+        <li><code>docs/superpowers/specs/2026-09-18-multi-agent-dev-orchestration-design.md</code></li>
+        <li><code>docs/superpowers/plans/2026-09-18-agentflow-phase0-phase1.md</code></li>
+        <li><code>记录.md</code></li>
+      </ul>
+    </div>
+    <div>
+      <p class="footer-title">站点说明</p>
+      <ul class="footer-list">
+        <li>纯静态、零依赖、零构建，断网可直接打开</li>
+        <li>不使用任何 npm 依赖与 CDN 资源</li>
+        <li>进度如实标注：Phase 0/1 已完成，Phase 2+ 规划中</li>
+      </ul>
+    </div>
+  </div>
+  <div class="wrap footer-base">
+    <p>本页为项目对外第一阅读入口；观测面板与文档站分别由 <code>web/</code> 与 <code>docs/</code> 承担。</p>
+  </div>
+</footer>
+
+<script src="assets/app.js" defer></script>
+</body>
+</html>

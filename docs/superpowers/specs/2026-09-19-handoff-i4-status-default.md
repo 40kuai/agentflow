@@ -156,5 +156,5 @@
 ### 10.5 遗留
 
 - `tests/fixtures/**` 4 个 blob SHA **逐字未变**（已取证）
-- 全量：`tsc --noEmit` exit 0；`vitest run` **308 passed / 3 failed**，3 条失败**全部**在他人并发的 `tests/website/website.test.ts`（站点落 `src/website/` 而非 `website/`），与本改动无关
+- 全量：`tsc --noEmit` exit 0；`vitest run` **308 passed / 3 failed**，3 条失败**全部**在他人并发的 `tests/website/website.test.ts`（站点目录当时未落在需求指定的仓库根位置），与本改动无关
 - **本次改动尚未过独立评审**（项目标准要求引擎契约类改动过第三方评审）。改动小且双向变异已验证，但 §10.1 的"反编译结论"属强主张，建议复审时优先核实该主张的可靠性与其版本绑定风险
